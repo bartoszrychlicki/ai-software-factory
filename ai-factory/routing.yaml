@@ -1,0 +1,5 @@
+# etap[.domena] -> silnik; override na tickecie labelem engine:<nazwa>
+plan: claude-code
+build: codex
+build.frontend: codex   # faza 2: kimi-code
+verify: claude-code
