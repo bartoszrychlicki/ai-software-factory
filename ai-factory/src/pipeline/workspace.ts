@@ -1,0 +1,39 @@
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { homedir } from "node:os";
+import { join, basename } from "node:path";
+import { rm } from "node:fs/promises";
+
+const exec = promisify(execFile);
+
+export interface Workspace {
+  ticketId: string;
+  branch: string;
+  dir: string;
+  repoPath: string;
+}
+
+// worktrees trzymamy POZA repo — zero śmieci w projekcie, łatwe sprzątanie
+const ROOT = process.env.FACTORY_WORKTREES ?? join(homedir(), ".ai-factory", "worktrees");
+
+export async function createWorkspace(
+  repoPath: string,
+  ticketId: string,
+  slug: string
+): Promise<Workspace> {
+  const branch = `agent/${ticketId}-${slug}`;
+  const dir = join(ROOT, basename(repoPath), ticketId);
+
+  // świeży start każdej próby: sprzątnij pozostałości poprzedniej
+  await exec("git", ["-C", repoPath, "worktree", "remove", "--force", dir]).catch(() => {});
+  await rm(dir, { recursive: true, force: true });
+  await exec("git", ["-C", repoPath, "branch", "-D", branch]).catch(() => {});
+
+  await exec("git", ["-C", repoPath, "worktree", "add", "-b", branch, dir, "main"]);
+  return { ticketId, branch, dir, repoPath };
+}
+
+export async function removeWorkspace(ws: Workspace): Promise<void> {
+  await exec("git", ["-C", ws.repoPath, "worktree", "remove", "--force", ws.dir]).catch(() => {});
+  await exec("git", ["-C", ws.repoPath, "branch", "-D", ws.branch]).catch(() => {});
+}
