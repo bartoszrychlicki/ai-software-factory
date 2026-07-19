@@ -6,6 +6,7 @@ export interface EngineRunInput {
   workspace: string;      // ścieżka worktree
   context: string;        // handoff od poprzedniego etapu
   budget: { minutes: number };
+  model?: string;          // np. claude-2.0, codex-002, lmstudio-13b
 }
 
 export interface EngineRunResult {
