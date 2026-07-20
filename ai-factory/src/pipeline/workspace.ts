@@ -37,3 +37,24 @@ export async function removeWorkspace(ws: Workspace): Promise<void> {
   await exec("git", ["-C", ws.repoPath, "worktree", "remove", "--force", ws.dir]).catch(() => {});
   await exec("git", ["-C", ws.repoPath, "branch", "-D", ws.branch]).catch(() => {});
 }
+
+/**
+ * Świeży, oddzielny checkout konkretnego SHA (detached) — dla verifiera.
+ * Weryfikujemy dokładny commit, nie brudny katalog buildera.
+ */
+export async function createCheckout(
+  repoPath: string,
+  ref: string,
+  name: string
+): Promise<{ dir: string }> {
+  const dir = join(ROOT, basename(repoPath), name);
+  await exec("git", ["-C", repoPath, "worktree", "remove", "--force", dir]).catch(() => {});
+  await rm(dir, { recursive: true, force: true });
+  await exec("git", ["-C", repoPath, "worktree", "add", "--detach", dir, ref]);
+  return { dir };
+}
+
+export async function removeCheckout(repoPath: string, dir: string): Promise<void> {
+  await exec("git", ["-C", repoPath, "worktree", "remove", "--force", dir]).catch(() => {});
+  await rm(dir, { recursive: true, force: true }).catch(() => {});
+}

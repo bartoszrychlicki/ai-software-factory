@@ -8,6 +8,7 @@ export interface ProjectConfig {
   github?: string;
   default_branch?: string;
   routing?: Record<string, string>; // per-projektowe nadpisania silników/modeli
+  checks?: string[]; // komendy weryfikacyjne projektu (uruchamiane na świeżym checkoutcie)
 }
 
 /** mastra dev uruchamia kod z .mastra/output — szukamy projects.yaml w górę drzewa */
