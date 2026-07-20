@@ -104,6 +104,23 @@ export class LinearSource implements TicketSource {
     );
   }
 
+  /** Issues projektu w danym stanie, z komentarzami — dla merge-watchera i adopcji sierot. */
+  async listWithComments(
+    stateName: string
+  ): Promise<{ id: string; comments: { body: string; createdAt: string }[] }[]> {
+    const data = await this.gql<{
+      issues: { nodes: { identifier: string; comments: { nodes: { body: string; createdAt: string }[] } }[] };
+    }>(
+      `query($filter: IssueFilter) { issues(filter: $filter, first: 50) {
+        nodes { identifier comments { nodes { body createdAt } } } } }`,
+      { filter: { project: { name: { eq: this.project } }, state: { name: { eq: stateName } } } }
+    );
+    return data.issues.nodes.map((i) => ({
+      id: i.identifier,
+      comments: i.comments.nodes.sort((a, b) => a.createdAt.localeCompare(b.createdAt)),
+    }));
+  }
+
   /** Komentarze issue rosnąco po dacie — do nasłuchiwania decyzji człowieka. */
   async listComments(id: string): Promise<{ body: string; createdAt: string }[]> {
     const data = await this.gql<{ issue: { comments: { nodes: { body: string; createdAt: string }[] } } }>(

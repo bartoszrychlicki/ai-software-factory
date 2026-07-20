@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.ai-factory.server</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/senioraiconsultant/.local/bin/npx</string>
+    <string>mastra</string>
+    <string>dev</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/senioraiconsultant/Development/Edu/ai-sdlc/ai-factory</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/Users/senioraiconsultant/.local/bin:/Users/senioraiconsultant/.kimi-code/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>FACTORY_ROOT</key>
+    <string>/Users/senioraiconsultant/Development/Edu/ai-sdlc/ai-factory</string>
+    <key>CLAUDE_BIN</key>
+    <string>/Users/senioraiconsultant/.local/bin/claude</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>15</integer>
+
+  <key>StandardOutPath</key>
+  <string>/Users/senioraiconsultant/.ai-factory/logs/server.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/senioraiconsultant/.ai-factory/logs/server.err.log</string>
+</dict>
+</plist>

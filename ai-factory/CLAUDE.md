@@ -22,7 +22,8 @@ Fabryka software: ticket → intake → plan (+gate niejasności) → human gate
 ## Komendy
 
 - Typecheck: `npx tsc --noEmit` — **obowiązkowo po każdej zmianie** (mastra dev/tsx nie sprawdzają typów).
-- Dev: `FACTORY_ROOT=$(pwd) CLAUDE_BIN=~/.local/bin/claude npm run dev` → Studio `localhost:4111`.
+- **Produkcyjnie: usługi launchd** (`com.ai-factory.server` = mastra dev, `com.ai-factory.poller`): instalacja/reload `bash ops/install-launchd.sh`; logi `~/.ai-factory/logs/`; stop `launchctl bootout gui/501/com.ai-factory.<server|poller>`. Auto-start przy logowaniu, auto-restart po padzie. UWAGA: ręczny `mastra dev` gryzie się z usługą (port + lock DuckDB) — najpierw bootout.
+- Dev ręcznie (gdy usługa zatrzymana): `FACTORY_ROOT=$(pwd) CLAUDE_BIN=~/.local/bin/claude npm run dev` → Studio `localhost:4111`.
 - Run bez Studio: API Mastry (`localhost:4111/api`, endpointy create-run/start/resume — lista w Studio → API endpoints). Human gate `approve-plan` wymaga resume z `{"approved": true}`.
 - Smoke adapterów: `CLAUDE_BIN=~/.local/bin/claude npx tsx src/engines/smoke.ts`.
 - Raport metryk: `npx tsx src/metrics/report.ts` (czyta `runs/metrics.jsonl` — wiersz per wywołanie silnika, zapisywany przez `src/pipeline/metrics.ts`; koszt/czas/first-pass rate per etap×silnik).
@@ -54,7 +55,7 @@ Co działa (wszystko potwierdzone runami):
 
 ## Backlog (kolejność uzgodniona z Bartoszem)
 
-1. **Operacjonalizacja** (NASTĘPNE, zaakceptowane kierunkowo 2026-07-20): launchd dla pollera i `mastra dev` (auto-start, auto-restart, logi); **merge PR → ticket na Done** + sprzątnięcie worktree/gałęzi + `git pull` lokalnego main (dziś ticket wisi w „In Review" na zawsze, a lokalny main zostaje w tyle — to nas już raz ugryzło przy TEST-4); adopcja sieroconych runów po restarcie pollera.
+1. ~~Operacjonalizacja~~ ✓ zrobione 2026-07-20: usługi launchd (ops/), merge-watcher (PR MERGED → Done + sprzątanie worktree/gałęzi + ff-pull lokalnego main; PR CLOSED → Todo z komentarzem), adopcja sierot na starcie pollera (runId z komentarza z planem), health-check API przed claimem. Poller w `--once` nadal działa do testów.
 2. **Budżety + circuit breaker** (z Fazy 3, ale konieczne z chwilą trybu ciągłego): limity prób/kosztów per ticket i dzienny bezpiecznik — seria nieudanych runów nie może przez noc zjeść limitów subskrypcji.
 3. **Dual-plan z fuzją** (zaprojektowany, wchodzi przy pierwszych grubszych ticketach): dwa NIEZALEŻNE plany RÓŻNYMI silnikami (`.parallel()`; ten sam model 2× = skorelowane ślepe plamy) → arbiter „fusion" (read-only) jawnie wyszukuje rozbieżności, skleja JEDEN plan z sekcją „Rozstrzygnięcia"; spór nierozstrzygalny = `PLAN: BLOCKED` z opcjami A/B dla człowieka. Per ticket labelem `plan:duo`. Routing `plan.a`/`plan.b`/`plan.fusion`. Artefakty `plan-a.md`/`plan-b.md`/`plan.md`. Debata iteracyjna odrzucona (malejące zyski). Metryki rozstrzygną: czy `plan:duo` daje mniej FAIL-i w verify i mniej rund review→fix.
 4. **Dekompozycja fullstack** (plan v2 §4, poziom 1): planner dzieli plan na subtaski z kontraktem, fabryka wykonuje sekwencyjnie w jednym worktree różnymi silnikami (`build.backend`/`build.frontend`), jeden PR, jeden verify. Czeka na projekt z prawdziwym backendem — pilot-app jest czysto frontendowy.
