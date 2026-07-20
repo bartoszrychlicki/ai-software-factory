@@ -737,18 +737,22 @@ reviewFixCycle.commit();
 
 const finalizeReviewStep = createStep({
   id: "finalize-review",
-  description: "Zamknięcie pętli review: nierozwiązane uwagi jawnie odnotowane w PR (decyzja przy merge ludzka)",
+  description: "Zamknięcie pętli review: LGTM → PR ready for review; nierozwiązane uwagi → zostaje draft z ⚠️",
   inputSchema: reviewCycleSchema,
   outputSchema: reviewCycleSchema,
   execute: async ({ inputData }) => {
-    if (inputData.reviewVerdict === "fix") {
+    if (inputData.reviewVerdict === "lgtm") {
+      // czysta recenzja = koniec pracy maszyn; draft → ready, merge nadal ludzki
+      await exec("gh", ["pr", "ready", inputData.branch], { cwd: inputData.workspaceDir }).catch(() => {});
+    } else if (inputData.reviewVerdict === "fix") {
       await exec(
         "gh",
         ["pr", "comment", inputData.branch, "--body",
-         `⚠️ AI review: uwagi pozostały nierozwiązane po ${inputData.reviewRound}/${inputData.maxReviewRounds} rundach review→fix. Oceń je przy merge.`],
+         `⚠️ AI review: uwagi pozostały nierozwiązane po ${inputData.reviewRound}/${inputData.maxReviewRounds} rundach review→fix. PR zostaje draftem — oceń uwagi przy merge.`],
         { cwd: inputData.workspaceDir }
       ).catch(() => {});
     }
+    // "skipped" (recenzja się nie odbyła) → też zostaje draft: brak czystej recenzji = brak awansu
     return inputData;
   },
 });

@@ -104,13 +104,13 @@ async function handleTicket(id: string, title: string, description: string, labe
       // werdykt z result runa — findString by tu zawiódł (bierze najdłuższy string, a "pending" > "lgtm")
       const verdict = (run as { result?: { reviewVerdict?: string } }).result?.reviewVerdict;
       const reviewLine =
-        verdict === "lgtm" ? "AI review: LGTM (pętla review→fix zakończona czysto)."
-        : verdict === "fix" ? "⚠️ AI review: uwagi pozostały po wyczerpaniu rund review→fix — oceń przy merge."
-        : "AI review (doradczo):";
+        verdict === "lgtm" ? "AI review: LGTM — PR oznaczony jako **ready for review**."
+        : verdict === "fix" ? "⚠️ AI review: uwagi pozostały po wyczerpaniu rund review→fix — PR zostaje draftem, oceń przy merge."
+        : "AI review (doradczo); PR zostaje draftem:";
       const screenshotMd = await uploadScreenshot(id, runId);
       await source.comment(
         id,
-        `✅ Zbudowane i zweryfikowane ${marker}. Draft PR: ${prUrl}\n\n` +
+        `✅ Zbudowane i zweryfikowane ${marker}. PR: ${prUrl}\n\n` +
           `${reviewLine}\n\n${clip(review, 4000)}${screenshotMd}\n\nMerge = decyzja człowieka.`
       );
       await source.setStatus(id, "human_review");
