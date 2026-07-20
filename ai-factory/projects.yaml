@@ -19,3 +19,7 @@ br-budget:
     - npm run build
     - npm run test
   # bez screenshot: next dev/start wymaga env i bazy — do włączenia świadomie później
+  # premium modele (fable/opus/sol@xhigh): pełny cykl kosztuje ~$5-6 ekwiwalentu — default $3 ubił BAR-92 po zielonym buildzie
+  budget:
+    maxUsd: 8
+    maxMinutes: 60
