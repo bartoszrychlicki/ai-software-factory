@@ -8,7 +8,9 @@ Fabryka software: ticket → intake → plan → human gate → pętla build→v
 - `src/engines/claude-code.ts` — `claude -p --output-format json`; role ≠ build dostają tylko `Read,Glob,Grep`.
 - `src/engines/codex.ts` — `codex exec`, sandbox `read-only`/`workspace-write` wg roli; **musi mieć `child.stdin.end()`**.
 - `src/engines/index.ts` — rejestr silników (nowy silnik = adapter + wpis + linijka w routing.yaml).
-- `src/sources/types.ts` — kontrakt `TicketSource` (BEZ implementacji — Linear to następny duży krok).
+- `src/sources/types.ts` — kontrakt `TicketSource`.
+- `src/sources/linear.ts` — `LinearSource` (GraphQL API; klucz w `.env` jako `LINEAR_API_KEY`, projekt `LINEAR_PROJECT`). Nazwa projektu w Linear == klucz w projects.yaml.
+- `src/sources/poll-linear.ts` — poller: co 60 s bierze issues z labelem `agent:ready` (stan backlog/todo), claimuje (zdejmuje label + In Progress), startuje run przez API Mastry i raportuje komentarzami (przyjęcie → plan czekający na aprobatę w Studio → PR albo BLOCKED; stany: In Review / Todo). Uruchomienie: `npx tsx src/sources/poll-linear.ts [--once]`. Aprobata planu NADAL w Studio — Linear tylko zleca i raportuje.
 - `src/pipeline/ticket-pipeline.ts` — cały workflow, w tym pętla `dountil` na `build-verify-cycle`.
 - `src/pipeline/workspace.ts` — worktree per ticket w `~/.ai-factory/worktrees/<repo>/<ticket>`; `createCheckout` = świeży detached checkout SHA dla verify.
 - `src/pipeline/projects.ts` — rejestr projektów (`projects.yaml`); `findUpFile` szuka configów w górę drzewa (mastra dev ma cwd w `src/mastra/public`!).
@@ -47,7 +49,7 @@ Fabryka software: ticket → intake → plan → human gate → pętla build→v
 
 1. ~~Gate na niejasności planu~~ ✓ zrobione (krok `assert-plan-clear`).
 1a. ~~Idempotentne workspace.ts~~ ✓ zrobione (prune przed branch -D).
-2. **TicketSource: Linear** — adapter + polling 60 s (label `agent:ready`), idempotencja `linear:<issue>:v1`, raporty komentarzem; wymaga od Bartosza klucza API Linear i wyboru teamu.
+2. ~~TicketSource: Linear~~ ✓ zrobione (space bartoszrychlicki, team BAR, projekt pilot-app; label `agent:ready` utworzony w Linear).
 3. **Artefakty `runs/<ticket>/`** — plan, handoffy, raporty, koszty, próby (trwały audit trail poza Studio).
 4. **Kimi Code adapter** + routing `build.frontend`.
 5. **Izolacja profili CLI** — czysty `CODEX_HOME`/config per run (agent nie dziedziczy prywatnych MCP i skilli Bartosza).
