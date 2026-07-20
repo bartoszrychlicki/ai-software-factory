@@ -43,6 +43,8 @@ Fabryka software: ticket → intake → plan (+gate niejasności) → human gate
 - **launchd ma minimalny PATH** — każde CLI wołane przez fabrykę (gh! kimi, codex, claude) musi być w `EnvironmentVariables.PATH` w plistach ops/. Objaw: `spawn gh ENOENT` w publish (BAR-92) mimo verify PASS.
 - Budżety kroków kalibrować pod najwolniejszy model: plan 5 min ubił Fable@high na produkcyjnym repo (BAR-91, kill w 301 s) → podniesiony do 12 min.
 - Routing `build.frontend` działa TYLKO z labelem `domain:frontend` na tickecie — bez labela idzie default build (BAR-92 poszedł w codex zamiast Opusa).
+- **Prompt do CLI przez argv ma limit (~1 MB): spawn E2BIG** — feedback z nieudanej próby zawierał echo komendy z całym promptem i rozdął prompt próby 2 (BAR-91). Codex dostaje prompt przez STDIN (`-`), feedback jest clipowany, raporty błędów bez error.message (echo komendy).
+- **Kalibracja pod premium modele (fable/opus/sol@xhigh)**: budżety kroków plan 12 min / build 25 min; budżet ticketu br-budget $8/60min (plan ~$1-2.3 + build ~$1.7+); pełny cykl ~$5-6 ekwiwalentu — godzinowy limit breakera $10/h łatwo przebić przy retry (nocna zmiana 2026-07-21 przebiła po 5 runach).
 - Nieudany/przerwany run zostawia w repo pilotowym gałąź `agent/<ticket>-…` i worktree'y — kolejny run tego samego ticketu pada na `branch already exists`. Sprzątanie: `git worktree prune`, `rm -rf` martwego katalogu verify, `git branch -D`. (Docelowo: idempotentne workspace.ts — patrz backlog.)
 
 ## Stan na 2026-07-21 (koniec sesji 2026-07-20)
@@ -66,7 +68,8 @@ Co działa (wszystko potwierdzone runami):
 5. **Izolacja profili CLI** — ŚWIADOMIE ODŁOŻONE (decyzja Bartosza 2026-07-20): na tym etapie agenci MAJĄ mieć dostęp do jego skilli i serwerów MCP. Nie wdrażać bez jego wyraźnej zgody.
 6. **Powiadomienia dla Bartosza** (decyzja 2026-07-21): moduł `notify.ts` z kanałami — start: macOS notification center (osascript, zero zależności); docelowo: Telegram bot (token+chat_id w .env, działa na telefonie). Zdarzenia = „agent czegoś potrzebuje" + finały: plan czeka na aprobatę, BLOCKED, PR ready, breaker otwarty, review z nierozwiązanymi uwagami. Kanał do decyzji Bartosza; wołane z pollera obok komentarzy do Linear.
 7. **Proces i kontrakt planowania** (decyzja 2026-07-21): wypracować konkretny, ustrukturyzowany prompt plannera + zdefiniowany format outputu planu (stałe sekcje, kontrakt z builderem/verify/gate'ami) — projektować RAZEM z dual-plan mode, bo plany dwóch silników muszą być porównywalne i skladalne przez arbitra. Dziś prompt to ~10 luźnych linijek w planStep; Fable wyciąga z nich dużo, ale to zasługa modelu, nie procesu. Case'y do uwzględnienia: tickety analityczne (BAR-91 — „sprawdź na danych produkcyjnych", planner jest read-only na kodzie!) vs implementacyjne.
-8. Webhooki Lineara zamiast pollingu (dziś opóźnienia do 60 s na podjęcie / 20 s na aprobatę — wystarcza; wraca przy skali).
+8. **Prompt caching / optymalizacja tokenów per projekt** (idea Bartosza 2026-07-21, eksploracja): agent nie powinien co run mielić od zera tego samego codebase'u. Kierunki: reużycie sesji CLI per projekt (claude --session/-c, codex resume, kimi -S — caching Anthropic działa w sesji); „context pack" per projekt (predigestowane streszczenie architektury odświeżane po merge'ach, doklejane do promptów zamiast zimnej eksploracji); higiena CLAUDE.md/AGENTS.md w repo docelowych (br-budget ma — planner cytował „lekcję z BAR-85"); pomiar metrykami przed/po.
+9. Webhooki Lineara zamiast pollingu (dziś opóźnienia do 60 s na podjęcie / 20 s na aprobatę — wystarcza; wraca przy skali).
 
 Dalsze fazy (br-crm adapter, kontenery, wersja kliencka): `../docs/ai-software-factory-plan-v2.md` §5.
 

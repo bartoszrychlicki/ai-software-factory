@@ -19,10 +19,12 @@ export const codex: EngineAdapter = {
     // mapowanie ról na wbudowany sandbox Codexa
     const sandbox = input.role === "build" ? "workspace-write" : "read-only";
 
+    // prompt przez STDIN, nie argv — argv ma limit (~1 MB) i spawn E2BIG ubił BAR-91,
+    // gdy feedback z poprzedniej próby rozdął prompt
     const args = ["exec", "--sandbox", sandbox, "--output-last-message", lastMsg];
     if (input.model) args.push("--model", input.model);
     if (input.effort) args.push("-c", `model_reasoning_effort="${input.effort}"`);
-    args.push(prompt);
+    args.push("-"); // czytaj prompt ze stdin
 
     return new Promise((resolve) => {
       const child = execFile(
@@ -41,19 +43,21 @@ export const codex: EngineAdapter = {
           await rm(outDir, { recursive: true, force: true });
 
           if (error) {
+            // BEZ error.message — zawiera echo całej komendy z promptem (megabajty w raporcie)
+            const code = (error as NodeJS.ErrnoException).code ?? (error as { signal?: string }).signal ?? "?";
             resolve({
               ok: false,
-              report: report || `Proces zakończył się błędem: ${error.message}\n${stderr}`,
-              raw: { stdout, stderr },
+              report: report || `Proces codex zakończył się błędem (${code}). stderr:\n${stderr.slice(-2000)}`,
+              raw: { stderr: stderr.slice(-5000) },
             });
             return;
           }
-          resolve({ ok: report.trim().length > 0, report, raw: { stdout } });
+          resolve({ ok: report.trim().length > 0, report, raw: { stdout: stdout.slice(-5000) } });
         }
       );
 
-      // codex exec czyta stdin, gdy jest pipe — bez EOF czekałby aż ubije go timeout
-      child.stdin?.end();
+      child.stdin?.write(prompt);
+      child.stdin?.end(); // EOF obowiązkowy — codex czeka na stdin
     });
   },
 };

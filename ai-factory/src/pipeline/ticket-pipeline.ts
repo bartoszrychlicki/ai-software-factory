@@ -225,8 +225,9 @@ const buildStep = createStep({
     // świeży worktree per próba — retry to nowa próba, nie grzebanie w brudzie
     const ws = await createWorkspace(ticket.repoPath, ticket.id, slug);
 
+    // clip: raporty błędów bywają ogromne (echo komend) — nieprzycięte rozdęły prompt próby 2 do spawn E2BIG (BAR-91)
     const feedbackBlock = inputData.feedback
-      ? `\n\n# FEEDBACK Z ODRZUCONEJ PRÓBY #${inputData.attempt}\nPoprzednia implementacja została odrzucona. Napraw wskazane problemy:\n${inputData.feedback}`
+      ? `\n\n# FEEDBACK Z ODRZUCONEJ PRÓBY #${inputData.attempt}\nPoprzednia implementacja została odrzucona. Napraw wskazane problemy:\n${inputData.feedback.slice(0, 12_000)}`
       : "";
 
     const route = await resolveRoute("build", ticket, ticketDomain(ticket));
@@ -245,7 +246,8 @@ const buildStep = createStep({
       ].join("\n"),
       context: `# Ticket ${ticket.id}: ${ticket.title}\n\n${ticket.description}\n\n# Plan\n\n${plan}${feedbackBlock}`,
       workspace: ws.dir,
-      budget: { minutes: 15 },
+      // 15 min ubiło Sol@xhigh na BAR-91 (Krok 0 + duża implementacja) — premium modele na złożonych ticketach potrzebują więcej
+      budget: { minutes: 25 },
     });
 
     if (!result.ok) {
