@@ -8,6 +8,7 @@ import { join } from "node:path";
 import { createWorkspace, createCheckout, removeCheckout } from "./workspace";
 import { getProject } from "./projects";
 import { resolveRoute } from "./routing";
+import { saveArtifact, artifactHeader } from "./artifacts";
 
 const exec = promisify(execFile);
 
@@ -80,7 +81,7 @@ const planStep = createStep({
   description: "Planner: zamienia ticket w implementowalny plan",
   inputSchema: ticketSchema,
   outputSchema: planOutputSchema,
-  execute: async ({ inputData }) => {
+  execute: async ({ inputData, runId }) => {
     const route = await resolveRoute("plan", inputData);
     const result = await route.engine.run({
       role: "plan",
@@ -101,6 +102,12 @@ const planStep = createStep({
       budget: { minutes: 5 },
     });
 
+    await saveArtifact(
+      inputData.id,
+      runId,
+      "plan.md",
+      artifactHeader({ step: "plan", engine: route.spec, costUsd: result.costUsd, ok: String(result.ok) }) + result.report
+    );
     if (!result.ok) throw new Error(`Planner (${route.spec}) nie dostarczył planu: ${result.report}`);
 
     return { ticket: inputData, plan: result.report, planCostUsd: result.costUsd };
@@ -138,11 +145,17 @@ const approvePlanStep = createStep({
     approved: z.boolean(),
     feedback: z.string().optional(),
   }),
-  execute: async ({ inputData, resumeData, suspend }) => {
+  execute: async ({ inputData, resumeData, suspend, runId }) => {
     if (!resumeData) {
       await suspend({ plan: inputData.plan });
       return inputData;
     }
+    await saveArtifact(
+      inputData.ticket.id,
+      runId,
+      "approval.json",
+      JSON.stringify({ approved: resumeData.approved, feedback: resumeData.feedback ?? null, at: new Date().toISOString() }, null, 2)
+    );
     if (!resumeData.approved) {
       throw new Error(`Plan odrzucony przez człowieka: ${resumeData.feedback ?? "bez uzasadnienia"}`);
     }
@@ -176,9 +189,11 @@ const buildStep = createStep({
   description: "Builder: implementuje plan w izolowanym worktree (z feedbackiem poprzedniej próby)",
   inputSchema: cycleSchema,
   outputSchema: cycleSchema,
-  execute: async ({ inputData }) => {
+  execute: async ({ inputData, runId }) => {
     const { ticket, plan } = inputData;
     const attempt = inputData.attempt + 1;
+    const saveBuild = (meta: Record<string, string | number | undefined>, body: string) =>
+      saveArtifact(ticket.id, runId, `build-attempt-${attempt}.md`, artifactHeader({ step: "build", attempt, ...meta }) + body);
 
     const slug = ticket.title
       .toLowerCase()
@@ -208,6 +223,7 @@ const buildStep = createStep({
     });
 
     if (!result.ok) {
+      await saveBuild({ engine: route.spec, costUsd: result.costUsd, outcome: "engine-fail" }, result.report);
       return {
         ...inputData,
         attempt,
@@ -220,6 +236,7 @@ const buildStep = createStep({
     const { stdout: status } = await exec("git", ["-C", ws.dir, "status", "--porcelain"]);
     const changedFiles = status.split("\n").filter(Boolean).map((l) => l.slice(3));
     if (changedFiles.length === 0) {
+      await saveBuild({ engine: route.spec, costUsd: result.costUsd, outcome: "no-changes" }, result.report);
       return {
         ...inputData,
         attempt,
@@ -232,6 +249,10 @@ const buildStep = createStep({
     await exec("git", ["-C", ws.dir, "commit", "-m",
       `feat(${ticket.id}): ${ticket.title} (próba ${attempt})\n\n[ai-factory build]`]);
     const { stdout: sha } = await exec("git", ["-C", ws.dir, "rev-parse", "HEAD"]);
+    await saveBuild(
+      { engine: route.spec, costUsd: result.costUsd, outcome: "committed", sha: sha.trim(), files: changedFiles.join(", ") },
+      result.report
+    );
 
     return {
       ...inputData,
@@ -252,11 +273,14 @@ const verifyStep = createStep({
   description: "Verifier: świeży checkout SHA + checks projektu + niezależny werdykt",
   inputSchema: cycleSchema,
   outputSchema: cycleSchema,
-  execute: async ({ inputData }) => {
+  execute: async ({ inputData, runId }) => {
     // build padł — nie ma czego weryfikować, pętla zdecyduje o kolejnej próbie
     if (inputData.verdict === "fail") return inputData;
 
     const { ticket, sha } = inputData;
+    const saveVerify = (meta: Record<string, string | number | undefined>, body: string) =>
+      saveArtifact(ticket.id, runId, `verify-attempt-${inputData.attempt}.md`,
+        artifactHeader({ step: "verify", attempt: inputData.attempt, sha, ...meta }) + body);
     const co = await createCheckout(ticket.repoPath, sha, `${ticket.id}-verify`);
 
     try {
@@ -280,6 +304,7 @@ const verifyStep = createStep({
         } catch (err) {
           const e = err as Error & { stdout?: string; stderr?: string };
           const tail = [e.stdout, e.stderr].filter(Boolean).join("\n").slice(-3000);
+          await saveVerify({ outcome: "check-fail", check: cmd }, `${e.message}\n\n${tail}`);
           return {
             ...inputData,
             verdict: "fail" as const,
@@ -329,6 +354,7 @@ const verifyStep = createStep({
       });
 
       if (!result.ok) {
+        await saveVerify({ engine: route.spec, costUsd: result.costUsd, outcome: "engine-fail" }, result.report);
         return {
           ...inputData,
           verdict: "fail" as const,
@@ -336,7 +362,12 @@ const verifyStep = createStep({
         };
       }
 
-      if (!/^VERDICT:\s*PASS/m.test(result.report)) {
+      const pass = /^VERDICT:\s*PASS/m.test(result.report);
+      await saveVerify(
+        { engine: route.spec, costUsd: result.costUsd, outcome: pass ? "pass" : "fail", checks: checksSummary.replace(/\n/g, "; ") },
+        result.report
+      );
+      if (!pass) {
         return {
           ...inputData,
           verdict: "fail" as const,
@@ -390,7 +421,7 @@ const publishStep = createStep({
   description: "Publish: push brancha + draft PR (deterministyczny kod)",
   inputSchema: cycleSchema,
   outputSchema: publishOutputSchema,
-  execute: async ({ inputData }) => {
+  execute: async ({ inputData, runId }) => {
     const { ticket, branch, workspaceDir } = inputData;
     if (!ticket.github) {
       throw new Error("Projekt nie ma repo GitHub w rejestrze — publish niemożliwy");
@@ -439,6 +470,15 @@ const publishStep = createStep({
       prUrl = stdout.trim();
     }
 
+    await saveArtifact(ticket.id, runId, "result.json", JSON.stringify({
+      prUrl,
+      branch,
+      sha: inputData.sha,
+      attempt: inputData.attempt,
+      maxAttempts: inputData.maxAttempts,
+      changedFiles: inputData.changedFiles,
+      at: new Date().toISOString(),
+    }, null, 2));
     return { ...inputData, prUrl };
   },
 });
@@ -450,7 +490,7 @@ const reviewStep = createStep({
   description: "Code review: doradcza recenzja jakości dopisywana do PR (nie blokuje)",
   inputSchema: publishOutputSchema,
   outputSchema: reviewOutputSchema,
-  execute: async ({ inputData }) => {
+  execute: async ({ inputData, runId }) => {
     const { ticket, workspaceDir, branch, sha } = inputData;
 
     try {
@@ -488,6 +528,8 @@ const reviewStep = createStep({
         { cwd: workspaceDir }
       ).catch(() => {}); // brak review w PR nie może wywalić pipeline'u
 
+      await saveArtifact(ticket.id, runId, "review.md",
+        artifactHeader({ step: "review", engine: route.spec, costUsd: result.costUsd }) + result.report);
       return { ...inputData, reviewSummary: result.report };
     } catch (err) {
       // review jest doradcze — każdy błąd degraduje się do notki, nie porażki

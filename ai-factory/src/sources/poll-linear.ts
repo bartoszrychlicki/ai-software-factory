@@ -71,22 +71,31 @@ async function handleTicket(id: string, title: string, description: string, labe
   fireStart(runId, { id, title, description, project: PROJECT, labels });
   console.log(`[${id}] run ${runId} wystartowany`);
 
-  let planCommented = false;
+  let planCommentedAt: string | undefined;
+  let decisionSent = false;
   const deadline = Date.now() + RUN_WATCH_MAX_MS;
   while (Date.now() < deadline) {
     await sleep(RUN_WATCH_INTERVAL_MS);
     const run = await getRun(runId);
     const status = runStatus(run);
 
-    if (status === "suspended" && !planCommented) {
-      planCommented = true;
+    if (status === "suspended" && !planCommentedAt) {
+      planCommentedAt = new Date().toISOString();
       const plan = findString(run, "plan") ?? "(nie udało się odczytać planu z runa)";
       await source.comment(
         id,
-        `📋 Plan gotowy ${marker} — czeka na ludzką aprobatę w Studio ` +
-          `(${FACTORY_API.replace(/\/api$/, "")}, workflow ticket-pipeline, run \`${runId}\`).\n\n---\n\n${clip(plan, 8000)}`
+        `📋 Plan gotowy ${marker} — czeka na Twoją decyzję.\n\n` +
+          `**Odpowiedz komentarzem:** \`zatwierdzam\` — buduję, albo \`odrzuć: <powód>\` — przerywam.\n` +
+          `(Aprobata w Studio też nadal działa: run \`${runId}\`.)\n\n---\n\n${clip(plan, 8000)}`
       );
-      console.log(`[${id}] plan czeka na aprobatę`);
+      console.log(`[${id}] plan czeka na decyzję w Linear`);
+    } else if (status === "suspended" && planCommentedAt && !decisionSent) {
+      const decision = await readDecision(id, planCommentedAt, marker);
+      if (decision) {
+        decisionSent = true;
+        fireResume(runId, decision);
+        console.log(`[${id}] decyzja z Linear: ${decision.approved ? "ZATWIERDZONO" : "ODRZUCONO"}`);
+      }
     }
 
     if (status === "success") {
@@ -137,6 +146,36 @@ function fireStart(runId: string, inputData: Record<string, unknown>) {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ inputData }),
+  }).catch(() => {});
+}
+
+/**
+ * Decyzja człowieka w komentarzach Lineara: `zatwierdzam` / `odrzuć: powód`.
+ * Bramka pozostaje LUDZKA — fabryka tylko czyta komentarz napisany ręcznie w Linear.
+ * Komentarze fabryki niosą marker i są pomijane; liczą się tylko nowsze niż komentarz z planem.
+ */
+async function readDecision(
+  id: string,
+  sinceIso: string,
+  marker: string
+): Promise<{ approved: boolean; feedback?: string } | undefined> {
+  const comments = await source.listComments(id).catch(() => []);
+  for (const c of comments) {
+    if (c.createdAt <= sinceIso || c.body.includes(marker)) continue;
+    const body = c.body.trim();
+    if (/^(zatwierdzam|approve|ok)\b/i.test(body)) return { approved: true };
+    const reject = body.match(/^(odrzuć|odrzucam|reject)\b[:\s]*([\s\S]*)/i);
+    if (reject) return { approved: false, feedback: reject[2].trim() || "odrzucone w Linear bez powodu" };
+  }
+  return undefined;
+}
+
+/** resume-async jak start-async: 504-odporny fire-and-forget, stan śledzimy pollingiem. */
+function fireResume(runId: string, resumeData: { approved: boolean; feedback?: string }) {
+  fetch(`${FACTORY_API}/workflows/${WORKFLOW}/resume-async?runId=${runId}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ step: "approve-plan", resumeData }),
   }).catch(() => {});
 }
 

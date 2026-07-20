@@ -104,6 +104,15 @@ export class LinearSource implements TicketSource {
     );
   }
 
+  /** Komentarze issue rosnąco po dacie — do nasłuchiwania decyzji człowieka. */
+  async listComments(id: string): Promise<{ body: string; createdAt: string }[]> {
+    const data = await this.gql<{ issue: { comments: { nodes: { body: string; createdAt: string }[] } } }>(
+      `query($id: String!) { issue(id: $id) { comments { nodes { body createdAt } } } }`,
+      { id }
+    );
+    return data.issue.comments.nodes.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  }
+
   async comment(id: string, body: string): Promise<void> {
     const issue = await this.fetchIssue(id);
     await this.gql(
