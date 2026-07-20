@@ -98,6 +98,7 @@ const planStep = createStep({
         "- plan testów",
         "Decyzje kosmetyczne (separator, nazewnictwo, drobny format) podejmij SAM i odnotuj w planie — nie są niejasnością.",
         "Jeśli ticketu NIE DA SIĘ bezpiecznie zaimplementować bez odpowiedzi człowieka (sprzeczne wymagania, brakujący precondition w kodzie, niejednoznaczny zakres), wypisz pytania w sekcji `## Niejasności blokujące`.",
+        "Jeśli stan opisany w tickecie JUŻ ISTNIEJE w kodzie (ticket spełniony), to też jest blokujące — napisz to wprost zamiast planować pustą pracę.",
         "PIERWSZA linia odpowiedzi: `PLAN: OK` albo `PLAN: BLOCKED` (gdy są niejasności blokujące).",
       ].join("\n"),
       context: `# Ticket ${inputData.id}: ${inputData.title}\n\n${inputData.description}`,
