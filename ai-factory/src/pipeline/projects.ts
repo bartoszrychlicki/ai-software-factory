@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { existsSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { parse } from "yaml";
 
 export interface ProjectConfig {
@@ -9,10 +10,23 @@ export interface ProjectConfig {
   routing?: Record<string, string>; // per-projektowe nadpisania silników/modeli
 }
 
-const ROOT = process.env.FACTORY_ROOT ?? process.cwd();
+/** mastra dev uruchamia kod z .mastra/output — szukamy projects.yaml w górę drzewa */
+function findConfigPath(): string {
+  if (process.env.FACTORY_ROOT) return join(process.env.FACTORY_ROOT, "projects.yaml");
+  let dir = process.cwd();
+  while (true) {
+    const candidate = join(dir, "projects.yaml");
+    if (existsSync(candidate)) return candidate;
+    const parent = dirname(dir);
+    if (parent === dir) {
+      throw new Error("Nie znaleziono projects.yaml — ustaw FACTORY_ROOT albo uruchamiaj z katalogu ai-factory");
+    }
+    dir = parent;
+  }
+}
 
 export async function getProject(key: string): Promise<ProjectConfig> {
-  const raw = await readFile(join(ROOT, "projects.yaml"), "utf8");
+  const raw = await readFile(findConfigPath(), "utf8");
   const all = parse(raw) as Record<string, ProjectConfig>;
   const project = all[key];
   if (!project) throw new Error(`Nieznany projekt "${key}" — brak wpisu w projects.yaml`);

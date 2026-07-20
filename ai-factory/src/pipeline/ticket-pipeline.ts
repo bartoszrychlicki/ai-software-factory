@@ -2,6 +2,9 @@ import { createStep, createWorkflow } from "@mastra/core/workflows";
 import { z } from "zod";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { claudeCode } from "../engines/claude-code";
 import { codex } from "../engines/codex";
 import { createWorkspace } from "./workspace";
@@ -14,6 +17,7 @@ const ticketSchema = z.object({
   title: z.string(),
   description: z.string(),
   repoPath: z.string(),
+  github: z.string().optional(), // owner/repo z rejestru projektów
 });
 
 // ticket płynie przez cały pipeline (passthrough) — każdy krok go dokleja do outputu
@@ -51,6 +55,7 @@ const intakeStep = createStep({
       title: inputData.title,
       description: inputData.description,
       repoPath: project.repo,
+      github: project.github,
     };
   },
 });
@@ -159,13 +164,58 @@ const buildStep = createStep({
   },
 });
 
+const publishOutputSchema = buildOutputSchema.extend({ prUrl: z.string() });
+
+const publishStep = createStep({
+  id: "publish",
+  description: "Publish: push brancha + draft PR (deterministyczny kod)",
+  inputSchema: buildOutputSchema,
+  outputSchema: publishOutputSchema,
+  execute: async ({ inputData }) => {
+    const { ticket, branch, workspaceDir } = inputData;
+    if (!ticket.github) {
+      throw new Error("Projekt nie ma repo GitHub w rejestrze — publish niemożliwy");
+    }
+
+    await exec("git", ["-C", workspaceDir, "push", "-u", "origin", branch]);
+
+    // opis PR przez plik — omijamy limity długości i escapowanie argumentów
+    const bodyFile = join(tmpdir(), `pr-${ticket.id}.md`);
+    await writeFile(bodyFile, [
+      `Ticket: ${ticket.id} — ${ticket.title}`,
+      "",
+      "## Plan",
+      inputData.plan,
+      "",
+      "## Raport buildera",
+      inputData.buildReport,
+      "",
+      "## Zmienione pliki",
+      ...inputData.changedFiles.map((f) => `- ${f}`),
+      "",
+      "_Wygenerowane przez ai-factory._",
+    ].join("\n"));
+
+    const { stdout } = await exec(
+      "gh",
+      ["pr", "create", "--draft", "--head", branch,
+       "--title", `feat(${ticket.id}): ${ticket.title}`,
+       "--body-file", bodyFile],
+      { cwd: workspaceDir } // gh pozna repo po remote origin worktree
+    );
+
+    return { ...inputData, prUrl: stdout.trim() };
+  },
+});
+
 export const ticketPipeline = createWorkflow({
   id: "ticket-pipeline",
   inputSchema: intakeInputSchema,   // <- już bez repoPath
-  outputSchema: buildOutputSchema,
+  outputSchema: publishOutputSchema,
 })
   .then(intakeStep)
   .then(planStep)
   .then(approvePlanStep)
-  .then(buildStep);
+  .then(buildStep)
+  .then(publishStep);
 ticketPipeline.commit();
