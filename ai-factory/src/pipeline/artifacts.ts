@@ -10,7 +10,7 @@ export async function saveArtifact(
   ticketId: string,
   runId: string,
   name: string,
-  content: string
+  content: string | Buffer
 ): Promise<void> {
   try {
     const root = dirname(findUpFile("package.json"));

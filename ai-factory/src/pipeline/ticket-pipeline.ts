@@ -9,6 +9,7 @@ import { createWorkspace, createCheckout, removeCheckout } from "./workspace";
 import { getProject } from "./projects";
 import { resolveRoute } from "./routing";
 import { saveArtifact, artifactHeader } from "./artifacts";
+import { takeScreenshot } from "./screenshot";
 
 const exec = promisify(execFile);
 
@@ -20,6 +21,7 @@ const ticketSchema = z.object({
   repoPath: z.string(),
   github: z.string().optional(),
   checks: z.array(z.string()).optional(),
+  screenshot: z.object({ start: z.string(), url: z.string() }).optional(),
   labels: z.array(z.string()).optional(), // m.in. override engine:*
 });
 
@@ -71,6 +73,7 @@ const intakeStep = createStep({
       repoPath: project.repo,
       github: project.github,
       checks: project.checks,
+      screenshot: project.screenshot,
       labels: inputData.labels,
     };
   },
@@ -376,6 +379,12 @@ const verifyStep = createStep({
         };
       }
 
+      // podgląd wyniku dla człowieka — doradczy, nie blokuje (checkout ma już node_modules po npm ci)
+      if (ticket.screenshot) {
+        const png = await takeScreenshot(co.dir, ticket.screenshot, cleanEnv);
+        if (png) await saveArtifact(ticket.id, runId, "screenshot.png", png);
+      }
+
       await removeCheckout(ticket.repoPath, co.dir);
       return { ...inputData, verdict: "pass" as const, verifyReport: result.report };
     } catch (err) {
@@ -483,15 +492,41 @@ const publishStep = createStep({
   },
 });
 
-const reviewOutputSchema = publishOutputSchema.extend({ reviewSummary: z.string() });
+/**
+ * Pętla review→fix: recenzja PR z werdyktem; przy uwagach builder poprawia
+ * w tym samym worktree, checks pilnują regresji, push aktualizuje PR — aż do
+ * REVIEW: LGTM albo wyczerpania rund. Werdykt doradczy: po rundach z uwagami
+ * PR zostaje, decyzja przy merge jest ludzka.
+ */
+const reviewCycleSchema = publishOutputSchema.extend({
+  reviewRound: z.number(),
+  maxReviewRounds: z.number(),
+  reviewVerdict: z.enum(["pending", "lgtm", "fix", "skipped"]),
+  reviewSummary: z.string(),
+});
 
-const reviewStep = createStep({
-  id: "review",
-  description: "Code review: doradcza recenzja jakości dopisywana do PR (nie blokuje)",
+const initReviewCycleStep = createStep({
+  id: "init-review-cycle",
+  description: "Inicjalizacja pętli review→fix (deterministyczny kod)",
   inputSchema: publishOutputSchema,
-  outputSchema: reviewOutputSchema,
+  outputSchema: reviewCycleSchema,
+  execute: async ({ inputData }) => ({
+    ...inputData,
+    reviewRound: 0,
+    maxReviewRounds: 3,
+    reviewVerdict: "pending" as const,
+    reviewSummary: "",
+  }),
+});
+
+const prReviewStep = createStep({
+  id: "pr-review",
+  description: "Code review PR-a z werdyktem REVIEW: LGTM / REVIEW: FIX",
+  inputSchema: reviewCycleSchema,
+  outputSchema: reviewCycleSchema,
   execute: async ({ inputData, runId }) => {
     const { ticket, workspaceDir, branch, sha } = inputData;
+    const round = inputData.reviewRound + 1;
 
     try {
       const route = await resolveRoute("review", ticket);
@@ -507,42 +542,174 @@ const reviewStep = createStep({
           "NIE oceniaj zgodności z ticketem ani kryteriów akceptacji — to zrobił już niezależny verifier.",
           "Skup się wyłącznie na jakości: czytelność, nazewnictwo, struktura, bezpieczeństwo,",
           "wydajność, obsługa błędów, brakujące testy, przyszła utrzymywalność.",
-          "Format: zwięzłe punkty `plik:linia — uwaga`, posortowane od najważniejszej.",
-          "Maksymalnie 8 uwag. Jeśli kod jest w porządku, napisz tylko `LGTM` z jednym zdaniem.",
+          "PIERWSZA linia odpowiedzi: `REVIEW: LGTM` (kod w porządku) albo `REVIEW: FIX` (są uwagi do poprawy).",
+          "Po REVIEW: FIX wypisz uwagi: zwięzłe punkty `plik:linia — uwaga`, od najważniejszej, max 8.",
+          "Po REVIEW: LGTM jedno zdanie podsumowania. Zgłaszaj FIX tylko dla uwag wartych iteracji buildera.",
         ].join("\n"),
-        context: `# Diff (git show ${sha.slice(0, 8)})\n${diff.slice(0, 60_000)}`,
+        context: `# Diff (git show ${sha.slice(0, 8)}, runda review ${round}/${inputData.maxReviewRounds})\n${diff.slice(0, 60_000)}`,
         workspace: workspaceDir,
         budget: { minutes: 5 },
       });
 
       if (!result.ok) {
-        return { ...inputData, reviewSummary: `(review pominięte: ${result.report.slice(0, 300)})` };
+        return {
+          ...inputData,
+          reviewRound: round,
+          reviewVerdict: "skipped" as const,
+          reviewSummary: `(review pominięte: ${result.report.slice(0, 300)})`,
+        };
       }
 
+      const fix = /^REVIEW:\s*FIX/m.test(result.report);
+      // fail-open na brak markera: recenzja bez werdyktu nie może zapętlić fabryki — traktujemy jak LGTM z notką
+      const verdict = fix ? ("fix" as const) : ("lgtm" as const);
+
+      await saveArtifact(ticket.id, runId, `review-round-${round}.md`,
+        artifactHeader({ step: "review", round, engine: route.spec, costUsd: result.costUsd, verdict }) + result.report);
+
       // recenzja trafia tam, gdzie czyta ją człowiek: do PR-a (comment, nie approve/reject)
-      const reviewFile = join(tmpdir(), `review-${ticket.id}.md`);
-      await writeFile(reviewFile, `## AI code review (${route.spec} — doradczo)\n\n${result.report}`);
+      const reviewFile = join(tmpdir(), `review-${ticket.id}-${round}.md`);
+      await writeFile(reviewFile,
+        `## AI code review — runda ${round}/${inputData.maxReviewRounds} (${route.spec} — doradczo)\n\n${result.report}`);
       await exec(
         "gh",
         ["pr", "review", branch, "--comment", "--body-file", reviewFile],
         { cwd: workspaceDir }
       ).catch(() => {}); // brak review w PR nie może wywalić pipeline'u
 
-      await saveArtifact(ticket.id, runId, "review.md",
-        artifactHeader({ step: "review", engine: route.spec, costUsd: result.costUsd }) + result.report);
-      return { ...inputData, reviewSummary: result.report };
+      return { ...inputData, reviewRound: round, reviewVerdict: verdict, reviewSummary: result.report };
     } catch (err) {
       // review jest doradcze — każdy błąd degraduje się do notki, nie porażki
       const msg = err instanceof Error ? err.message : String(err);
-      return { ...inputData, reviewSummary: `(review pominięte: ${msg.slice(0, 300)})` };
+      return {
+        ...inputData,
+        reviewRound: round,
+        reviewVerdict: "skipped" as const,
+        reviewSummary: `(review pominięte: ${msg.slice(0, 300)})`,
+      };
     }
+  },
+});
+
+const remediateStep = createStep({
+  id: "remediate",
+  description: "Builder poprawia kod po uwagach review; checks pilnują regresji; push aktualizuje PR",
+  inputSchema: reviewCycleSchema,
+  outputSchema: reviewCycleSchema,
+  execute: async ({ inputData, runId }) => {
+    // poprawiamy tylko przy REVIEW: FIX i dopóki są rundy
+    if (inputData.reviewVerdict !== "fix" || inputData.reviewRound >= inputData.maxReviewRounds) {
+      return inputData;
+    }
+    const { ticket, workspaceDir, branch } = inputData;
+    const round = inputData.reviewRound;
+    const saveFix = (meta: Record<string, string | number | undefined>, body: string) =>
+      saveArtifact(ticket.id, runId, `fix-round-${round}.md`, artifactHeader({ step: "fix", round, ...meta }) + body);
+
+    try {
+      const route = await resolveRoute("build", ticket);
+      const result = await route.engine.run({
+        role: "build",
+        model: route.model,
+        instructions: [
+          "Jesteś builderem. Kod w bieżącym katalogu przeszedł werdykt zgodności z ticketem,",
+          "ale code review zgłosiło uwagi jakościowe. Zaadresuj WYŁĄCZNIE poniższe uwagi.",
+          "Nie zmieniaj zachowania funkcjonalności, nie wykraczaj poza uwagi.",
+          "NIE commituj zmian — commit wykonuje fabryka.",
+        ].join("\n"),
+        context: `# Ticket ${ticket.id}: ${ticket.title}\n\n# Uwagi z code review (runda ${round})\n\n${inputData.reviewSummary}`,
+        workspace: workspaceDir,
+        budget: { minutes: 10 },
+      });
+
+      if (!result.ok) {
+        await saveFix({ engine: route.spec, outcome: "engine-fail" }, result.report);
+        return inputData; // następna runda zrecenzuje ten sam SHA — rundy i tak są policzalne
+      }
+
+      const { stdout: status } = await exec("git", ["-C", workspaceDir, "status", "--porcelain"]);
+      const changed = status.split("\n").filter(Boolean).map((l) => l.slice(3));
+      if (changed.length === 0) {
+        await saveFix({ engine: route.spec, costUsd: result.costUsd, outcome: "no-changes" }, result.report);
+        return inputData;
+      }
+
+      await exec("git", ["-C", workspaceDir, "add", "-A"]);
+      await exec("git", ["-C", workspaceDir, "commit", "-m",
+        `fix(${ticket.id}): poprawki po code review (runda ${round})\n\n[ai-factory review-fix]`]);
+      const { stdout: newShaRaw } = await exec("git", ["-C", workspaceDir, "rev-parse", "HEAD"]);
+      const newSha = newShaRaw.trim();
+
+      // fail-closed na regresję: checks projektu na świeżym checkoutcie poprawki
+      const co = await createCheckout(ticket.repoPath, newSha, `${ticket.id}-fixcheck`);
+      const cleanEnv = Object.fromEntries(
+        Object.entries(process.env).filter(([k]) => !k.startsWith("npm_") && k !== "NODE_ENV")
+      ) as NodeJS.ProcessEnv;
+      try {
+        for (const cmd of ticket.checks ?? []) {
+          await exec("bash", ["-c", cmd], { cwd: co.dir, env: cleanEnv, timeout: 10 * 60_000, maxBuffer: 50 * 1024 * 1024 });
+        }
+      } catch (err) {
+        const e = err as Error & { stdout?: string; stderr?: string };
+        const tail = [e.stdout, e.stderr].filter(Boolean).join("\n").slice(-3000);
+        await exec("git", ["-C", workspaceDir, "reset", "--hard", "HEAD~1"]); // poprawka psuje build → wycofujemy
+        await removeCheckout(ticket.repoPath, co.dir);
+        await saveFix({ engine: route.spec, costUsd: result.costUsd, outcome: "checks-fail-reverted", sha: newSha },
+          `${e.message}\n\n${tail}`);
+        return inputData;
+      }
+      await removeCheckout(ticket.repoPath, co.dir);
+
+      await exec("git", ["-C", workspaceDir, "push", "--force", "origin", branch]);
+      await saveFix(
+        { engine: route.spec, costUsd: result.costUsd, outcome: "pushed", sha: newSha, files: changed.join(", ") },
+        result.report
+      );
+      return {
+        ...inputData,
+        sha: newSha,
+        changedFiles: Array.from(new Set([...inputData.changedFiles, ...changed])),
+        reviewVerdict: "pending" as const, // nowy SHA → potrzebna świeża recenzja
+      };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      await saveFix({ outcome: "infra-error" }, msg);
+      return inputData;
+    }
+  },
+});
+
+const reviewFixCycle = createWorkflow({
+  id: "review-fix-cycle",
+  inputSchema: reviewCycleSchema,
+  outputSchema: reviewCycleSchema,
+})
+  .then(prReviewStep)
+  .then(remediateStep);
+reviewFixCycle.commit();
+
+const finalizeReviewStep = createStep({
+  id: "finalize-review",
+  description: "Zamknięcie pętli review: nierozwiązane uwagi jawnie odnotowane w PR (decyzja przy merge ludzka)",
+  inputSchema: reviewCycleSchema,
+  outputSchema: reviewCycleSchema,
+  execute: async ({ inputData }) => {
+    if (inputData.reviewVerdict === "fix") {
+      await exec(
+        "gh",
+        ["pr", "comment", inputData.branch, "--body",
+         `⚠️ AI review: uwagi pozostały nierozwiązane po ${inputData.reviewRound}/${inputData.maxReviewRounds} rundach review→fix. Oceń je przy merge.`],
+        { cwd: inputData.workspaceDir }
+      ).catch(() => {});
+    }
+    return inputData;
   },
 });
 
 export const ticketPipeline = createWorkflow({
   id: "ticket-pipeline",
   inputSchema: intakeInputSchema,
-  outputSchema: reviewOutputSchema,
+  outputSchema: reviewCycleSchema,
 })
   .then(intakeStep)
   .then(planStep)
@@ -556,5 +723,12 @@ export const ticketPipeline = createWorkflow({
   )
   .then(assertVerifiedStep)
   .then(publishStep)
-  .then(reviewStep);
+  .then(initReviewCycleStep)
+  .dountil(
+    reviewFixCycle,
+    async ({ inputData }) =>
+      inputData.reviewVerdict !== "pending" &&
+      (inputData.reviewVerdict !== "fix" || inputData.reviewRound >= inputData.maxReviewRounds)
+  )
+  .then(finalizeReviewStep);
 ticketPipeline.commit();

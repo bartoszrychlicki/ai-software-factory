@@ -1,6 +1,6 @@
 # ai-factory — kontekst dla Claude Code (handoff 2026-07-20)
 
-Fabryka software: ticket → intake → plan → human gate → pętla build→verify (max 2 próby, feedback) → assert → publish (draft PR) → review (doradcze). Orkiestracja: Mastra 1.19 (workflow `ticket-pipeline`). Agenci to **zewnętrzne CLI w trybie headless na subskrypcjach** (Claude Code, Codex), wołane przez wspólny kontrakt `EngineAdapter` — Mastra sama NIE wykonuje żadnych wywołań modeli. Pełny plan i decyzje: `../docs/ai-software-factory-plan-v2.md`.
+Fabryka software: ticket → intake → plan (+gate niejasności) → human gate → pętla build→verify (max 2 próby, feedback) → assert → publish (draft PR) → pętla review→fix (max 3 rundy: recenzja z werdyktem `REVIEW: LGTM/FIX`, builder poprawia, checks pilnują regresji, push aktualizuje PR) → finalize. Verify robi też screenshot podglądu (projekty z `screenshot:` w projects.yaml), który poller wrzuca do ticketa w Linear. Orkiestracja: Mastra 1.19 (workflow `ticket-pipeline`). Agenci to **zewnętrzne CLI w trybie headless na subskrypcjach** (Claude Code, Codex), wołane przez wspólny kontrakt `EngineAdapter` — Mastra sama NIE wykonuje żadnych wywołań modeli. Pełny plan i decyzje: `../docs/ai-software-factory-plan-v2.md`.
 
 ## Mapa kodu
 
@@ -38,7 +38,15 @@ Fabryka software: ticket → intake → plan → human gate → pętla build→v
 - Node przy `spawn` z nieistniejącym `cwd` zgłasza **mylące `ENOENT` na binarce** — jeśli adapter mówi „claude ENOENT", najpierw sprawdź, czy katalog roboczy (repoPath z projects.yaml!) istnieje.
 - Nieudany/przerwany run zostawia w repo pilotowym gałąź `agent/<ticket>-…` i worktree'y — kolejny run tego samego ticketu pada na `branch already exists`. Sprzątanie: `git worktree prune`, `rm -rf` martwego katalogu verify, `git branch -D`. (Docelowo: idempotentne workspace.ts — patrz backlog.)
 
-## Stan na 2026-07-20 noc
+## Stan na 2026-07-20 noc (v2)
+
+- **Aprobata planu w Linear działa E2E**: BAR-96 (© w stopce) zatwierdzony komentarzem `zatwierdzam` → [PR #5](https://github.com/bartoszrychlicki/pilot-app/pull/5); artefakty runs/BAR-96/<runId>/ komplet (plan, approval, build, verify, result, review).
+- **Nowe (zaimplementowane, typy czyste, screenshot przetestowany standalone; pętla review→fix czeka na pierwszy run E2E):**
+  - Pętla review→fix: `init-review-cycle` → dountil(`pr-review` → `remediate`) → `finalize-review`. Recenzent werdyktuje `REVIEW: LGTM/FIX` (brak markera = LGTM fail-open, żeby nie zapętlić); builder poprawia w tym samym worktree, checks na świeżym checkoutcie (fail → `reset --hard HEAD~1`), push aktualizuje PR; po wyczerpaniu rund komentarz ⚠️ w PR.
+  - Screenshot: `takeScreenshot` (playwright/chromium, dep w package.json) w verify po PASS — artefakt `screenshot.png`; poller uploaduje do CDN Lineara (`fileUpload`) i osadza w komentarzu wyniku.
+- PR #4 (BAR-95) i #5 (BAR-96) czekają na ludzki merge.
+
+## Stan wcześniejszy (2026-07-20 noc)
 
 - **Linear działa E2E na żywym tickecie**: BAR-95 (welcome screen) — label `agent:ready` → poller claim + komentarz → plan (`PLAN: OK`, gate przepuścił) → ludzka aprobata → build (codex, 1 próba) → verify PASS → [PR #4](https://github.com/bartoszrychlicki/pilot-app/pull/4) → review z 4 sensownymi uwagami → komentarz wyniku w Linear + ticket „In Review". PR #4 czeka na ludzki merge.
 - Pułapka: `start-async`/`resume-async` przez HTTP dostaje **504 po 180 s** (gateway timeout Mastry) — run i tak leci; stan czytać pollingiem `GET runs/<id>` (snapshot odświeża się na granicach kroków). Poller już to robi.

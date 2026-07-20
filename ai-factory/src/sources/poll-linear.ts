@@ -101,10 +101,16 @@ async function handleTicket(id: string, title: string, description: string, labe
     if (status === "success") {
       const prUrl = findString(run, "prUrl") ?? "(brak URL PR)";
       const review = findString(run, "reviewSummary") ?? "";
+      const verdict = findString(run, "reviewVerdict");
+      const reviewLine =
+        verdict === "lgtm" ? "AI review: LGTM (pętla review→fix zakończona czysto)."
+        : verdict === "fix" ? "⚠️ AI review: uwagi pozostały po wyczerpaniu rund review→fix — oceń przy merge."
+        : "AI review (doradczo):";
+      const screenshotMd = await uploadScreenshot(id, runId);
       await source.comment(
         id,
         `✅ Zbudowane i zweryfikowane ${marker}. Draft PR: ${prUrl}\n\n` +
-          `AI review (doradczo):\n\n${clip(review, 4000)}\n\nMerge = decyzja człowieka.`
+          `${reviewLine}\n\n${clip(review, 4000)}${screenshotMd}\n\nMerge = decyzja człowieka.`
       );
       await source.setStatus(id, "human_review");
       console.log(`[${id}] SUKCES → ${prUrl}`);
@@ -168,6 +174,17 @@ async function readDecision(
     if (reject) return { approved: false, feedback: reject[2].trim() || "odrzucone w Linear bez powodu" };
   }
   return undefined;
+}
+
+/** Screenshot z verify (runs/<ticket>/<runId>/screenshot.png) → CDN Lineara → markdown do komentarza. */
+async function uploadScreenshot(ticketId: string, runId: string): Promise<string> {
+  try {
+    const png = readFileSync(join(process.cwd(), "runs", ticketId, runId, "screenshot.png"));
+    const assetUrl = await source.uploadFile(`${ticketId}-screenshot.png`, "image/png", png);
+    return `\n\n**Podgląd:**\n![screenshot ${ticketId}](${assetUrl})`;
+  } catch {
+    return ""; // brak screenshota (projekt bez configu / screenshot się nie udał) — komentarz bez podglądu
+  }
 }
 
 /** resume-async jak start-async: 504-odporny fire-and-forget, stan śledzimy pollingiem. */

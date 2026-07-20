@@ -120,6 +120,35 @@ export class LinearSource implements TicketSource {
       { input: { issueId: issue.id, body } }
     );
   }
+
+  /** Upload pliku do CDN Lineara; zwrócony assetUrl można osadzić w markdownie komentarza. */
+  async uploadFile(filename: string, contentType: string, data: Buffer): Promise<string> {
+    const res = await this.gql<{
+      fileUpload: {
+        success: boolean;
+        uploadFile: { uploadUrl: string; assetUrl: string; headers: { key: string; value: string }[] };
+      };
+    }>(
+      `mutation($contentType: String!, $filename: String!, $size: Int!) {
+        fileUpload(contentType: $contentType, filename: $filename, size: $size) {
+          success uploadFile { uploadUrl assetUrl headers { key value } }
+        }
+      }`,
+      { contentType, filename, size: data.byteLength }
+    );
+    const { uploadUrl, assetUrl, headers } = res.fileUpload.uploadFile;
+    const put = await fetch(uploadUrl, {
+      method: "PUT",
+      headers: {
+        "Content-Type": contentType,
+        "Cache-Control": "public, max-age=31536000",
+        ...Object.fromEntries(headers.map((h) => [h.key, h.value])),
+      },
+      body: new Uint8Array(data),
+    });
+    if (!put.ok) throw new Error(`Upload do Lineara nieudany: HTTP ${put.status}`);
+    return assetUrl;
+  }
 }
 
 function pickState(

@@ -9,6 +9,8 @@ export interface ProjectConfig {
   default_branch?: string;
   routing?: Record<string, string>; // per-projektowe nadpisania silników/modeli
   checks?: string[]; // komendy weryfikacyjne projektu (uruchamiane na świeżym checkoutcie)
+  /** Opcjonalny podgląd wyniku: fabryka stawia serwer, robi screenshot i dołącza do raportu. */
+  screenshot?: { start: string; url: string };
 }
 
 /** mastra dev uruchamia kod z .mastra/output — szukamy pliku konfiguracyjnego w górę drzewa */
