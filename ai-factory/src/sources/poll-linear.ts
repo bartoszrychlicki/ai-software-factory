@@ -39,7 +39,11 @@ if (!API_KEY) {
   console.error("Brak LINEAR_API_KEY (env lub ai-factory/.env)");
   process.exit(1);
 }
-const PROJECT = process.env.LINEAR_PROJECT ?? "pilot-app";
+// lista projektów: LINEAR_PROJECTS=pilot-app,br-budget (nazwa w Linear == klucz w projects.yaml)
+const PROJECTS = (process.env.LINEAR_PROJECTS ?? process.env.LINEAR_PROJECT ?? "pilot-app")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
 const FACTORY_API = process.env.FACTORY_API ?? "http://localhost:4111/api";
 const WORKFLOW = "ticketPipeline";
 const WORKTREES_ROOT = process.env.FACTORY_WORKTREES ?? join(homedir(), ".ai-factory", "worktrees");
@@ -47,7 +51,7 @@ const POLL_INTERVAL_MS = 60_000;
 const RUN_WATCH_INTERVAL_MS = 20_000;
 const RUN_WATCH_MAX_MS = 24 * 60 * 60_000; // human gate może czekać długo
 
-const source = new LinearSource(API_KEY, PROJECT);
+const sources = PROJECTS.map((project) => ({ project, src: new LinearSource(API_KEY!, project) }));
 const active = new Set<string>(); // tickety z opiekunem w tym procesie
 const mergeHandled = new Set<string>(); // merge obsłużony w tym procesie (stan trwały i tak jest w Linear)
 let breakerLogged = false; // log otwarcia bezpiecznika raz na zmianę stanu, nie co cykl
@@ -75,15 +79,20 @@ async function main() {
           }
         } else {
           breakerLogged = false;
-          const tickets = await source.listReady();
-          for (const t of tickets) {
-            if (active.has(t.id)) continue;
-            active.add(t.id);
-            // fire-and-forget: każdy ticket żyje własnym cyklem, pętla polluje dalej
-            handleTicket(t.id, t.title, t.description, t.labels).catch((err) => {
-              console.error(`[${t.id}] nieobsłużony błąd:`, err);
-              active.delete(t.id);
+          for (const { project, src } of sources) {
+            const tickets = await src.listReady().catch((err) => {
+              console.error(`[${project}] listReady nieudane:`, err instanceof Error ? err.message : err);
+              return [];
             });
+            for (const t of tickets) {
+              if (active.has(t.id)) continue;
+              active.add(t.id);
+              // fire-and-forget: każdy ticket żyje własnym cyklem, pętla polluje dalej
+              handleTicket(project, src, t.id, t.title, t.description, t.labels).catch((err) => {
+                console.error(`[${t.id}] nieobsłużony błąd:`, err);
+                active.delete(t.id);
+              });
+            }
           }
         }
         // merge-watcher i adopcja działają też przy otwartym bezpieczniku — one nie zużywają silników
@@ -99,15 +108,22 @@ async function main() {
   while (active.size > 0) await sleep(5_000);
 }
 
-async function handleTicket(id: string, title: string, description: string, labels: string[]) {
-  console.log(`[${id}] claim: ${title}`);
-  await source.claim(id);
-  await source.comment(id, `🤖 ai-factory przyjęła ticket ${marker(id)}. Planner startuje.`);
+async function handleTicket(
+  project: string,
+  src: LinearSource,
+  id: string,
+  title: string,
+  description: string,
+  labels: string[]
+) {
+  console.log(`[${id}] claim (${project}): ${title}`);
+  await src.claim(id);
+  await src.comment(id, `🤖 ai-factory przyjęła ticket ${marker(id)}. Planner startuje.`);
 
   const runId = await createRun();
-  fireStart(runId, { id, title, description, project: PROJECT, labels });
+  fireStart(runId, { id, title, description, project, labels });
   console.log(`[${id}] run ${runId} wystartowany`);
-  await watchRun(id, runId);
+  await watchRun(src, id, runId);
 }
 
 /**
@@ -115,7 +131,7 @@ async function handleTicket(id: string, title: string, description: string, labe
  * raportuje finał. planCommentedAtInit ≠ undefined = adopcja (plan już
  * skomentowany przed restartem pollera).
  */
-async function watchRun(id: string, runId: string, planCommentedAtInit?: string) {
+async function watchRun(src: LinearSource, id: string, runId: string, planCommentedAtInit?: string) {
   let planCommentedAt = planCommentedAtInit;
   let decisionSent = false;
   const deadline = Date.now() + RUN_WATCH_MAX_MS;
@@ -130,7 +146,7 @@ async function watchRun(id: string, runId: string, planCommentedAtInit?: string)
       if (status === "suspended" && !planCommentedAt) {
         planCommentedAt = new Date().toISOString();
         const plan = findString(run, "plan") ?? "(nie udało się odczytać planu z runa)";
-        await source.comment(
+        await src.comment(
           id,
           `📋 Plan gotowy ${marker(id)} — czeka na Twoją decyzję.\n\n` +
             `**Odpowiedz komentarzem:** \`zatwierdzam\` — buduję, albo \`odrzuć: <powód>\` — przerywam.\n` +
@@ -138,7 +154,7 @@ async function watchRun(id: string, runId: string, planCommentedAtInit?: string)
         );
         console.log(`[${id}] plan czeka na decyzję w Linear`);
       } else if (status === "suspended" && planCommentedAt && !decisionSent) {
-        const decision = await readDecision(id, planCommentedAt);
+        const decision = await readDecision(src, id, planCommentedAt);
         if (decision) {
           decisionSent = true;
           fireResume(runId, decision);
@@ -155,13 +171,13 @@ async function watchRun(id: string, runId: string, planCommentedAtInit?: string)
           verdict === "lgtm" ? "AI review: LGTM — PR oznaczony jako **ready for review**."
           : verdict === "fix" ? "⚠️ AI review: uwagi pozostały po wyczerpaniu rund review→fix — PR zostaje draftem, oceń przy merge."
           : "AI review (doradczo); PR zostaje draftem:";
-        const screenshotMd = await uploadScreenshot(id, runId);
-        await source.comment(
+        const screenshotMd = await uploadScreenshot(src, id, runId);
+        await src.comment(
           id,
           `✅ Zbudowane i zweryfikowane ${marker(id)}. PR: ${prUrl}\n\n` +
             `${reviewLine}\n\n${clip(review, 4000)}${screenshotMd}\n\nMerge = decyzja człowieka.`
         );
-        await source.setStatus(id, "human_review");
+        await src.setStatus(id, "human_review");
         await recordRunOutcome(true).catch(() => {});
         console.log(`[${id}] SUKCES → ${prUrl}`);
         break;
@@ -170,12 +186,12 @@ async function watchRun(id: string, runId: string, planCommentedAtInit?: string)
       if (status === "failed") {
         const msg = errorMessage(run);
         const blocked = /BLOCKED|odrzucony/i.test(msg);
-        await source.comment(
+        await src.comment(
           id,
           `${blocked ? "🛑 BLOCKED" : "❌ Run nieudany"} ${marker(id)}\n\n${clip(msg, 6000)}\n\n` +
             `Uzupełnij ticket i nadaj ponownie label \`agent:ready\`, żeby fabryka spróbowała jeszcze raz.`
         );
-        await source.setStatus(id, blocked ? "needs_clarification" : "blocked");
+        await src.setStatus(id, blocked ? "needs_clarification" : "blocked");
         // odrzucenie planu przez człowieka to nie porażka fabryki — nie nabija serii bezpiecznika
         if (!/odrzucony przez człowieka/i.test(msg)) await recordRunOutcome(false).catch(() => {});
         console.log(`[${id}] FAILED${blocked ? " (BLOCKED)" : ""}`);
@@ -190,7 +206,8 @@ async function watchRun(id: string, runId: string, planCommentedAtInit?: string)
 // --- adopcja sierot po restarcie pollera ----------------------------------
 
 async function adoptOrphans() {
-  const issues = await source.listWithComments("In Progress");
+  for (const { src } of sources) {
+  const issues = await src.listWithComments("In Progress");
   for (const issue of issues) {
     if (active.has(issue.id)) continue;
     const mine = issue.comments.filter((c) => c.body.includes(marker(issue.id)));
@@ -204,17 +221,19 @@ async function adoptOrphans() {
     const planComment = mine.filter((c) => c.body.includes("Plan gotowy")).pop();
     active.add(issue.id);
     console.log(`[${issue.id}] ADOPCJA sieroconego runa ${runId}`);
-    watchRun(issue.id, runId, planComment?.createdAt).catch((err) => {
+    watchRun(src, issue.id, runId, planComment?.createdAt).catch((err) => {
       console.error(`[${issue.id}] adopcja padła:`, err);
       active.delete(issue.id);
     });
+  }
   }
 }
 
 // --- merge-watcher: domknięcie cyklu ticketu ------------------------------
 
 async function watchMerges() {
-  const issues = await source.listWithComments("In Review");
+  for (const { project, src } of sources) {
+  const issues = await src.listWithComments("In Review");
   for (const issue of issues) {
     if (mergeHandled.has(issue.id)) continue;
     const mine = issue.comments.filter((c) => c.body.includes(marker(issue.id)));
@@ -234,28 +253,29 @@ async function watchMerges() {
 
     if (pr.state === "MERGED") {
       mergeHandled.add(issue.id);
-      await cleanupAfterMerge(issue.id, pr.headRefName);
-      await source.comment(issue.id, `🎉 PR zmergowany ${marker(issue.id)} — ticket zamknięty, workspace posprzątany.`);
-      await source.setStatus(issue.id, "done");
+      await cleanupAfterMerge(project, issue.id, pr.headRefName);
+      await src.comment(issue.id, `🎉 PR zmergowany ${marker(issue.id)} — ticket zamknięty, workspace posprzątany.`);
+      await src.setStatus(issue.id, "done");
       console.log(`[${issue.id}] MERGED → Done`);
     } else if (pr.state === "CLOSED") {
       mergeHandled.add(issue.id);
-      await cleanupAfterMerge(issue.id, pr.headRefName);
-      await source.comment(
+      await cleanupAfterMerge(project, issue.id, pr.headRefName);
+      await src.comment(
         issue.id,
         `↩️ PR zamknięty bez merge'a ${marker(issue.id)} — ticket wraca do Todo. ` +
           `Uzupełnij wymagania i nadaj label \`agent:ready\`, żeby spróbować ponownie.`
       );
-      await source.setStatus(issue.id, "needs_clarification");
+      await src.setStatus(issue.id, "needs_clarification");
       console.log(`[${issue.id}] PR CLOSED → Todo`);
     }
+  }
   }
 }
 
 /** Worktree + lokalna gałąź po zmergowanym/zamkniętym PR + ff-pull maina (lekcja z TEST-4). */
-async function cleanupAfterMerge(ticketId: string, branch: string) {
+async function cleanupAfterMerge(projectKey: string, ticketId: string, branch: string) {
   try {
-    const project = await getProject(PROJECT);
+    const project = await getProject(projectKey);
     const repo = project.repo;
     const wt = join(WORKTREES_ROOT, basename(repo), ticketId);
     await exec("git", ["-C", repo, "worktree", "remove", "--force", wt]).catch(() => {});
@@ -287,10 +307,11 @@ async function cleanupAfterMerge(ticketId: string, branch: string) {
  * niosą marker i są pomijane; liczą się tylko nowsze niż komentarz z planem.
  */
 async function readDecision(
+  src: LinearSource,
   id: string,
   sinceIso: string
 ): Promise<{ approved: boolean; feedback?: string } | undefined> {
-  const comments = await source.listComments(id).catch(() => []);
+  const comments = await src.listComments(id).catch(() => []);
   for (const c of comments) {
     if (c.createdAt <= sinceIso || c.body.includes(marker(id))) continue;
     const body = c.body.trim();
@@ -381,10 +402,10 @@ function findString(
 // --- media / drobnica -----------------------------------------------------
 
 /** Screenshot z verify (runs/<ticket>/<runId>/screenshot.png) → CDN Lineara → markdown do komentarza. */
-async function uploadScreenshot(ticketId: string, runId: string): Promise<string> {
+async function uploadScreenshot(src: LinearSource, ticketId: string, runId: string): Promise<string> {
   try {
     const png = readFileSync(join(process.cwd(), "runs", ticketId, runId, "screenshot.png"));
-    const assetUrl = await source.uploadFile(`${ticketId}-screenshot.png`, "image/png", png);
+    const assetUrl = await src.uploadFile(`${ticketId}-screenshot.png`, "image/png", png);
     return `\n\n**Podgląd:**\n![screenshot ${ticketId}](${assetUrl})`;
   } catch {
     return ""; // brak screenshota (projekt bez configu / screenshot się nie udał) — komentarz bez podglądu

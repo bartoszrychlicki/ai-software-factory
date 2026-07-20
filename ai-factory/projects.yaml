@@ -8,3 +8,14 @@ pilot-app:
   screenshot:
     start: npx vite preview --port 4173 --strictPort
     url: http://localhost:4173/
+
+br-budget:
+  repo: /Users/senioraiconsultant/Development/Clients/Bartosz/br-budget
+  github: bartoszrychlicki/br-budget
+  default_branch: main
+  checks:
+    - npm ci
+    - npm run lint
+    - npm run build
+    - npm run test
+  # bez screenshot: next dev/start wymaga env i bazy — do włączenia świadomie później
