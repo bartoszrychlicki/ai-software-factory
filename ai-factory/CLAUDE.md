@@ -11,7 +11,7 @@ Fabryka software: ticket → intake → plan (+gate niejasności) → human gate
 - `src/engines/index.ts` — rejestr silników (nowy silnik = adapter + wpis + linijka w routing.yaml).
 - `src/sources/types.ts` — kontrakt `TicketSource`.
 - `src/sources/linear.ts` — `LinearSource` (GraphQL API; klucz w `.env` jako `LINEAR_API_KEY`, projekt `LINEAR_PROJECT`). Nazwa projektu w Linear == klucz w projects.yaml.
-- `src/sources/poll-linear.ts` — poller: co 60 s bierze issues z labelem `agent:ready` (stan backlog/todo), claimuje (zdejmuje label + In Progress), startuje run przez API Mastry i raportuje komentarzami (przyjęcie → plan czekający na aprobatę w Studio → PR albo BLOCKED; stany: In Review / Todo). Uruchomienie: `npx tsx src/sources/poll-linear.ts [--once]`. Aprobata planu NADAL w Studio — Linear tylko zleca i raportuje.
+- `src/sources/poll-linear.ts` — poller: co 60 s bierze issues z labelem `agent:ready` (stan backlog/todo), claimuje (zdejmuje label + In Progress), startuje run przez API Mastry i raportuje komentarzami. **Aprobata planu w Linear**: komentarz `zatwierdzam` / `odrzuć: powód` pod planem (nowszy niż komentarz z planem, bez markera fabryki; polling co 20 s → resume-async); Studio działa równolegle jako fallback. Przy sukcesie uploaduje screenshot do CDN Lineara i osadza w komentarzu. Uruchomienie: `npx tsx src/sources/poll-linear.ts [--once]` — RĘCZNIE, nie jest jeszcze usługą (patrz backlog: operacjonalizacja).
 - `src/pipeline/ticket-pipeline.ts` — cały workflow, w tym pętla `dountil` na `build-verify-cycle`.
 - `src/pipeline/workspace.ts` — worktree per ticket w `~/.ai-factory/worktrees/<repo>/<ticket>`; `createCheckout` = świeży detached checkout SHA dla verify.
 - `src/pipeline/projects.ts` — rejestr projektów (`projects.yaml`); `findUpFile` szuka configów w górę drzewa (mastra dev ma cwd w `src/mastra/public`!).
@@ -40,36 +40,26 @@ Fabryka software: ticket → intake → plan (+gate niejasności) → human gate
 - Node przy `spawn` z nieistniejącym `cwd` zgłasza **mylące `ENOENT` na binarce** — jeśli adapter mówi „claude ENOENT", najpierw sprawdź, czy katalog roboczy (repoPath z projects.yaml!) istnieje.
 - Nieudany/przerwany run zostawia w repo pilotowym gałąź `agent/<ticket>-…` i worktree'y — kolejny run tego samego ticketu pada na `branch already exists`. Sprzątanie: `git worktree prune`, `rm -rf` martwego katalogu verify, `git branch -D`. (Docelowo: idempotentne workspace.ts — patrz backlog.)
 
-## Stan na 2026-07-20 noc (v2)
+## Stan na 2026-07-21 (koniec sesji 2026-07-20)
 
-- **Aprobata planu w Linear działa E2E**: BAR-96 (© w stopce) zatwierdzony komentarzem `zatwierdzam` → [PR #5](https://github.com/bartoszrychlicki/pilot-app/pull/5); artefakty runs/BAR-96/<runId>/ komplet (plan, approval, build, verify, result, review).
-- **Nowe (zaimplementowane, typy czyste, screenshot przetestowany standalone; pętla review→fix czeka na pierwszy run E2E):**
-  - Pętla review→fix: `init-review-cycle` → dountil(`pr-review` → `remediate`) → `finalize-review`. Recenzent werdyktuje `REVIEW: LGTM/FIX` (brak markera = LGTM fail-open, żeby nie zapętlić); builder poprawia w tym samym worktree, checks na świeżym checkoutcie (fail → `reset --hard HEAD~1`), push aktualizuje PR; po wyczerpaniu rund komentarz ⚠️ w PR.
-  - Screenshot: `takeScreenshot` (playwright/chromium, dep w package.json) w verify po PASS — artefakt `screenshot.png`; poller uploaduje do CDN Lineara (`fileUpload`) i osadza w komentarzu wyniku.
-- PR #4 (BAR-95) i #5 (BAR-96) czekają na ludzki merge.
+**Fabryka jest funkcjonalnie kompletna dla pilota — cały uzgodniony backlog #1–#6 zrealizowany i zweryfikowany E2E na żywych ticketach.** Jedyny brak do trybu bezobsługowego: poller i `mastra dev` to ręcznie odpalane procesy (patrz backlog: operacjonalizacja).
 
-## Stan wcześniejszy (2026-07-20 noc)
+Co działa (wszystko potwierdzone runami):
 
-- **Linear działa E2E na żywym tickecie**: BAR-95 (welcome screen) — label `agent:ready` → poller claim + komentarz → plan (`PLAN: OK`, gate przepuścił) → ludzka aprobata → build (codex, 1 próba) → verify PASS → [PR #4](https://github.com/bartoszrychlicki/pilot-app/pull/4) → review z 4 sensownymi uwagami → komentarz wyniku w Linear + ticket „In Review". PR #4 czeka na ludzki merge.
-- Pułapka: `start-async`/`resume-async` przez HTTP dostaje **504 po 180 s** (gateway timeout Mastry) — run i tak leci; stan czytać pollingiem `GET runs/<id>` (snapshot odświeża się na granicach kroków). Poller już to robi.
+- **Pełny cykl Linear→Done-bez-Done**: label `agent:ready` → claim → plan (gate niejasności: `PLAN: OK/BLOCKED`, spełniony-w-kodzie też blokuje) → **aprobata komentarzem w Linear** (`zatwierdzam`/`odrzuć: powód`) → build→verify (max 2, świeży checkout + checks) → screenshot → draft PR → **pętla review→fix (max 3 rundy, `REVIEW: LGTM/FIX`)** → LGTM = `gh pr ready` / uwagi = zostaje draft z ⚠️ → komentarz wyniku ze screenshotem w Linear, ticket „In Review". Merge ludzki; po merge'u ticket NIE przechodzi sam na Done (luka → backlog).
+- **Multi-engine**: claude-code (plan/verify/review), codex (build default), **kimi-code (build-only!)** przez label `domain:frontend` → `build.frontend`. Kimi nie ma read-only w headless — adapter odmawia ról ≠ build, label `engine:*` działa tylko na build.
+- **Artefakty** `runs/<ticket>/<runId>/` (plan, approval, build/verify/fix/review per próba/runda, screenshot, result) + **metryki** `runs/metrics.jsonl` (raport: `npx tsx src/metrics/report.ts`).
+- Zrealizowane tickety: TEST-2/3/4 (PR #1–#3, zmergowane), BAR-95 welcome screen (PR #4), BAR-96 © w stopce (PR #5), BAR-98 polska etykieta licznika (PR #6), BAR-99 lang=pl+meta — **pierwszy build Kimi i pierwsza iteracja review→fix** (PR #7, ready). BAR-97 = poprawny BLOCKED (ticket już spełniony; builder próbował pozorować zmianę, verify zabił). PR #4–#6 draft (stara recenzja bez werdyktu), #7 ready — wszystkie czekają na merge Bartosza.
+- Znane słabości: raport `claude -p` = ostatnia wiadomość agenta (meta-komentarz po planie gubi marker → fail-closed BLOCKED, ale raport nieczytelny); 504 po 180 s na start/resume-async (run leci dalej — czytać stan pollingiem); sierocony run po restarcie pollera traci opiekuna (nikt nie skomentuje wyniku).
 
-## Stan wcześniejszy (2026-07-20 późny wieczór)
+## Backlog (kolejność uzgodniona z Bartoszem)
 
-- **Pełny cykl E2E ze wszystkimi krokami działa.** TEST-2 → PR #1, TEST-3 → PR #2, TEST-4 → PR #3 — wszystkie zmergowane na main przez Bartosza.
-- **Gate na niejasności planu (backlog #1) wdrożony i przetestowany.** Nowy krok `assert-plan-clear` między `plan` a `approve-plan`: planner musi zacząć raport od `PLAN: OK` albo `PLAN: BLOCKED` + sekcja `## Niejasności blokujące`; kosmetykę rozstrzyga sam. Fail-closed: brak markera = BLOCKED. Testy: TEST-5 (mętny ticket) → BLOCKED przed bramką ✓; TEST-6 (jasny ticket) → `PLAN: OK`, gate przepuścił, run zakończony odrzuceniem na bramce (test, nie realizacja) ✓.
-- **Idempotentne workspace (backlog 1a) wdrożone**: `worktree prune` przed `branch -D` w `createWorkspace` — martwa rejestracja worktree trzymała gałąź jako checked-out i sprzątanie cicho padało.
-- Znana słabość: raport z `claude -p` = OSTATNIA wiadomość agenta. Gdy planner po planie dopisze meta-komentarz (tak było w TEST-5), plan i marker nie trafiają do raportu — gate wtedy blokuje fail-closed (dobrze), ale raport bywa nieczytelny. Ewentualna poprawka: wymusić w prompcie, by finalna wiadomość była kompletnym planem.
-
-## Backlog (uzgodniona kolejność)
-
-1. ~~Gate na niejasności planu~~ ✓ zrobione (krok `assert-plan-clear`).
-1a. ~~Idempotentne workspace.ts~~ ✓ zrobione (prune przed branch -D).
-2. ~~TicketSource: Linear~~ ✓ zrobione (space bartoszrychlicki, team BAR, projekt pilot-app; label `agent:ready` utworzony w Linear).
-3. **Artefakty `runs/<ticket>/`** — plan, handoffy, raporty, koszty, próby (trwały audit trail poza Studio).
-4. ~~Kimi Code adapter + routing `build.frontend`~~ ✓ zrobione (label Linear `domain:frontend` → `resolveRoute("build", ticket, domena)` → `build.frontend: kimi-code` w routing.yaml; smoke przeszedł, pierwszy pełny run E2E jeszcze przed nami).
-5. **Izolacja profili CLI** — czysty `CODEX_HOME`/config per run. ŚWIADOMIE ODŁOŻONE (decyzja Bartosza 2026-07-20): na tym etapie agenci MAJĄ mieć dostęp do jego skilli i serwerów MCP. Nie wdrażać bez jego wyraźnej zgody.
-6. ~~Metryki~~ ✓ zrobione (`runs/metrics.jsonl` + `src/metrics/report.ts`; zbierane od 2026-07-20 wieczór — wcześniejsze runy nie są w danych).
-7. **Dual-plan z fuzją** (decyzja Bartosza 2026-07-20, po metrykach): dwa NIEZALEŻNE plany RÓŻNYMI silnikami (`.parallel()` w Mastrze; ten sam model 2× = skorelowane ślepe plamy) → agent-arbiter „fusion" (read-only) jawnie wyszukuje rozbieżności i skleja JEDEN finalny plan z sekcją „Rozstrzygnięcia"; rozbieżność nierozstrzygalna = `PLAN: BLOCKED` z opcjami A/B — rozstrzyga człowiek na bramce (fail-closed bez zmian). Włączane per ticket labelem `plan:duo` (dla one-linerów to strata — anty-bloat). Routing: warianty `plan.a`/`plan.b`/`plan.fusion` w routing.yaml. Artefakty: `plan-a.md`, `plan-b.md`, `plan.md`. Debata iteracyjna ODRZUCONA na start (malejące zyski); wraca tylko, jeśli metryki pokażą, że fuzja przepuszcza słabe plany. Metryki mają odpowiedzieć: czy tickety `plan:duo` mają mniej FAIL-i w verify i mniej rund review→fix.
+1. **Operacjonalizacja** (NASTĘPNE, zaakceptowane kierunkowo 2026-07-20): launchd dla pollera i `mastra dev` (auto-start, auto-restart, logi); **merge PR → ticket na Done** + sprzątnięcie worktree/gałęzi + `git pull` lokalnego main (dziś ticket wisi w „In Review" na zawsze, a lokalny main zostaje w tyle — to nas już raz ugryzło przy TEST-4); adopcja sieroconych runów po restarcie pollera.
+2. **Budżety + circuit breaker** (z Fazy 3, ale konieczne z chwilą trybu ciągłego): limity prób/kosztów per ticket i dzienny bezpiecznik — seria nieudanych runów nie może przez noc zjeść limitów subskrypcji.
+3. **Dual-plan z fuzją** (zaprojektowany, wchodzi przy pierwszych grubszych ticketach): dwa NIEZALEŻNE plany RÓŻNYMI silnikami (`.parallel()`; ten sam model 2× = skorelowane ślepe plamy) → arbiter „fusion" (read-only) jawnie wyszukuje rozbieżności, skleja JEDEN plan z sekcją „Rozstrzygnięcia"; spór nierozstrzygalny = `PLAN: BLOCKED` z opcjami A/B dla człowieka. Per ticket labelem `plan:duo`. Routing `plan.a`/`plan.b`/`plan.fusion`. Artefakty `plan-a.md`/`plan-b.md`/`plan.md`. Debata iteracyjna odrzucona (malejące zyski). Metryki rozstrzygną: czy `plan:duo` daje mniej FAIL-i w verify i mniej rund review→fix.
+4. **Dekompozycja fullstack** (plan v2 §4, poziom 1): planner dzieli plan na subtaski z kontraktem, fabryka wykonuje sekwencyjnie w jednym worktree różnymi silnikami (`build.backend`/`build.frontend`), jeden PR, jeden verify. Czeka na projekt z prawdziwym backendem — pilot-app jest czysto frontendowy.
+5. **Izolacja profili CLI** — ŚWIADOMIE ODŁOŻONE (decyzja Bartosza 2026-07-20): na tym etapie agenci MAJĄ mieć dostęp do jego skilli i serwerów MCP. Nie wdrażać bez jego wyraźnej zgody.
+6. Webhooki Lineara zamiast pollingu (dziś opóźnienia do 60 s na podjęcie / 20 s na aprobatę — wystarcza; wraca przy skali).
 
 Dalsze fazy (br-crm adapter, kontenery, wersja kliencka): `../docs/ai-software-factory-plan-v2.md` §5.
 
