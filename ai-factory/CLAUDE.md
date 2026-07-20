@@ -11,12 +11,13 @@ Fabryka software: ticket → intake → plan (+gate niejasności) → human gate
 - `src/engines/index.ts` — rejestr silników (nowy silnik = adapter + wpis + linijka w routing.yaml).
 - `src/sources/types.ts` — kontrakt `TicketSource`.
 - `src/sources/linear.ts` — `LinearSource` (GraphQL API; klucz w `.env` jako `LINEAR_API_KEY`, projekt `LINEAR_PROJECT`). Nazwa projektu w Linear == klucz w projects.yaml.
-- `src/sources/poll-linear.ts` — poller: co 60 s bierze issues z labelem `agent:ready` (stan backlog/todo), claimuje (zdejmuje label + In Progress), startuje run przez API Mastry i raportuje komentarzami. **Aprobata planu w Linear**: komentarz `zatwierdzam` / `odrzuć: powód` pod planem (nowszy niż komentarz z planem, bez markera fabryki; polling co 20 s → resume-async); Studio działa równolegle jako fallback. Przy sukcesie uploaduje screenshot do CDN Lineara i osadza w komentarzu. Uruchomienie: `npx tsx src/sources/poll-linear.ts [--once]` — RĘCZNIE, nie jest jeszcze usługą (patrz backlog: operacjonalizacja).
+- `src/sources/poll-linear.ts` — poller: co 60 s bierze issues z labelem `agent:ready` (stan backlog/todo), claimuje (zdejmuje label + In Progress), startuje run przez API Mastry i raportuje komentarzami. **Aprobata planu w Linear**: komentarz `zatwierdzam` / `odrzuć: powód` pod planem (nowszy niż komentarz z planem, bez markera fabryki; polling co 20 s → resume-async); Studio działa równolegle jako fallback. Przy sukcesie uploaduje screenshot do CDN Lineara i osadza w komentarzu. Multi-projekt: `LINEAR_PROJECTS=pilot-app,br-budget` w .env (nazwa projektu w Linear == klucz projects.yaml). Produkcyjnie działa jako usługa launchd; ręcznie: `npx tsx src/sources/poll-linear.ts [--once]`.
 - `src/pipeline/ticket-pipeline.ts` — cały workflow, w tym pętla `dountil` na `build-verify-cycle`.
 - `src/pipeline/workspace.ts` — worktree per ticket w `~/.ai-factory/worktrees/<repo>/<ticket>`; `createCheckout` = świeży detached checkout SHA dla verify.
 - `src/pipeline/projects.ts` — rejestr projektów (`projects.yaml`); `findUpFile` szuka configów w górę drzewa (mastra dev ma cwd w `src/mastra/public`!).
 - `src/pipeline/routing.ts` — `resolveRoute(etap, ticket, domena?)`; kolejność: label `engine:*` > `projects.<p>.<etap[.domena]>` > `defaults.<etap.domena>` > `defaults.<etap>`; spec = `silnik[/model]`.
 - `routing.yaml`, `projects.yaml` — konfiguracja (checks weryfikacyjne są per projekt w projects.yaml).
+- Projekty fabryki: pilot-app (`~/Development/Edu/ai-sdlc/pilot-app`, publiczny, main chroniony) i **br-budget** (`~/Development/Clients/Bartosz/br-budget`, Next.js, PRYWATNY — bez branch protection na free planie, checks: ci+lint+build+test, bez screenshotu bo next wymaga env/bazy).
 - Repo pilotowe: `~/Development/Edu/ai-sdlc/pilot-app` (przeniesione do wnętrza ai-sdlc, w `.gitignore`; GitHub `bartoszrychlicki/pilot-app`, `main` chroniony: wymagany PR, enforce_admins, bez force-push).
 
 ## Komendy
