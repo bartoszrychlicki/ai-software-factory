@@ -188,14 +188,25 @@ const verifyStep = createStep({
       //    Realne wykonanie na świeżym checkoutcie — nie opinia agenta.
       const checks = ticket.checks ?? [];
       const checkResults: string[] = [];
+      // czyste środowisko: fabryka działa pod `npm run dev`, a dziedziczone
+      // npm_config_* / NODE_ENV potrafią przestawić npm ci na tryb production
+      // (= brak devDependencies = brak vite/tsc w projekcie frontendowym)
+      const cleanEnv = Object.fromEntries(
+        Object.entries(process.env).filter(
+          ([k]) => !k.startsWith("npm_") && k !== "NODE_ENV"
+        )
+      ) as NodeJS.ProcessEnv;
       for (const cmd of checks) {
         // komendy pochodzą z NASZEGO projects.yaml (zaufane), więc shell jest OK
-        await exec("bash", ["-lc", cmd], {
+        await exec("bash", ["-c", cmd], {
           cwd: co.dir,
+          env: cleanEnv,
           timeout: 10 * 60_000,
           maxBuffer: 50 * 1024 * 1024,
         }).catch((err) => {
-          throw new Error(`Check "${cmd}" nie przeszedł na świeżym checkoutcie:\n${err.message}`);
+          const e = err as Error & { stdout?: string; stderr?: string };
+          const tail = [e.stdout, e.stderr].filter(Boolean).join("\n").slice(-3000);
+          throw new Error(`Check "${cmd}" nie przeszedł na świeżym checkoutcie:\n${e.message}\n${tail}`);
         });
         checkResults.push(`- \`${cmd}\` → OK`);
       }
@@ -241,12 +252,12 @@ const verifyStep = createStep({
         throw new Error(`Verify FAIL:\n${result.report}`);
       }
 
+      await removeCheckout(ticket.repoPath, co.dir);
       return { ...inputData, verifyReport: result.report };
     } catch (err) {
-      // build/testy na świeżym checkoutcie nie przeszły albo werdykt FAIL
-      throw err instanceof Error ? err : new Error(String(err));
-    } finally {
-      await removeCheckout(ticket.repoPath, co.dir);
+      // przy porażce checkout ZOSTAJE do inspekcji — następna próba i tak zacznie od czysta
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new Error(`${msg}\n\n(checkout do inspekcji: ${co.dir})`);
     }
   },
 });

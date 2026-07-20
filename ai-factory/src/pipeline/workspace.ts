@@ -50,6 +50,8 @@ export async function createCheckout(
   const dir = join(ROOT, basename(repoPath), name);
   await exec("git", ["-C", repoPath, "worktree", "remove", "--force", dir]).catch(() => {});
   await rm(dir, { recursive: true, force: true });
+  // sprzątnij martwe rejestracje (katalog skasowany, wpis w .git został)
+  await exec("git", ["-C", repoPath, "worktree", "prune"]).catch(() => {});
   await exec("git", ["-C", repoPath, "worktree", "add", "--detach", dir, ref]);
   return { dir };
 }
