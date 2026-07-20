@@ -5,7 +5,7 @@ defaults:
   build: codex              # bez modelu = default CLI
   verify: claude-code/sonnet
   review: claude-code/sonnet   # doradcze; niezależny od buildera (codex)
-  # build.frontend: kimi-code/k2.7   # faza 2
+  build.frontend: kimi-code    # domena z labela domain:frontend na tickecie; bez modelu = default CLI
 
 projects: {}
 # przykład nadpisań per projekt:

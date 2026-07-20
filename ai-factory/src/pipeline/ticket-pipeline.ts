@@ -59,6 +59,10 @@ const cycleSchema = z.object({
   verifyReport: z.string(),
 });
 
+/** Domena buildu z labela ticketu (`domain:frontend` → routing `build.frontend`). */
+const ticketDomain = (ticket: { labels?: string[] }): string | undefined =>
+  ticket.labels?.find((l) => l.startsWith("domain:"))?.slice("domain:".length);
+
 const intakeStep = createStep({
   id: "intake",
   description: "Intake: rozwiązanie projektu z rejestru (deterministyczny kod)",
@@ -218,7 +222,7 @@ const buildStep = createStep({
       ? `\n\n# FEEDBACK Z ODRZUCONEJ PRÓBY #${inputData.attempt}\nPoprzednia implementacja została odrzucona. Napraw wskazane problemy:\n${inputData.feedback}`
       : "";
 
-    const route = await resolveRoute("build", ticket);
+    const route = await resolveRoute("build", ticket, ticketDomain(ticket));
     const t0 = Date.now();
     const buildMetric = (ok: boolean, outcome: string, costUsd?: number) =>
       recordMetric({ ticket: ticket.id, runId, stage: "build", engine: route.spec, attempt, ok, outcome, costUsd, durationMs: Date.now() - t0 });
@@ -643,7 +647,7 @@ const remediateStep = createStep({
       saveArtifact(ticket.id, runId, `fix-round-${round}.md`, artifactHeader({ step: "fix", round, ...meta }) + body);
 
     try {
-      const route = await resolveRoute("build", ticket);
+      const route = await resolveRoute("build", ticket, ticketDomain(ticket));
       const t0 = Date.now();
       const fixMetric = (ok: boolean, outcome: string, costUsd?: number) =>
         recordMetric({ ticket: ticket.id, runId, stage: "fix", engine: route.spec, round, ok, outcome, costUsd, durationMs: Date.now() - t0 });

@@ -38,7 +38,9 @@ export async function resolveRoute(
   const raw = await readFile(findUpFile("routing.yaml"), "utf8");
   const cfg = parse(raw) as RoutingFile;
 
-  const label = (ticket.labels ?? []).find((l) => l.startsWith("engine:"));
+  // label wybiera BUILDERA; role read-only (plan/verify/review) idą wg configu —
+  // nie każdy silnik ma read-only (kimi-code), a override "wszystkiego" nie ma sensownego użycia
+  const label = stage === "build" ? (ticket.labels ?? []).find((l) => l.startsWith("engine:")) : undefined;
   const projectCfg = cfg.projects?.[ticket.project];
 
   const spec =

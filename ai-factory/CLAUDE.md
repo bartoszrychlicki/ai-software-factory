@@ -7,6 +7,7 @@ Fabryka software: ticket → intake → plan (+gate niejasności) → human gate
 - `src/engines/types.ts` — kontrakt `EngineAdapter.run({role, instructions, context, workspace, budget, model?}) → {ok, report, costUsd?, raw}`. **Adapter nigdy nie rzuca** — błąd = `ok:false`; decyzje podejmują kroki pipeline'u.
 - `src/engines/claude-code.ts` — `claude -p --output-format json`; role ≠ build dostają tylko `Read,Glob,Grep`.
 - `src/engines/codex.ts` — `codex exec`, sandbox `read-only`/`workspace-write` wg roli; **musi mieć `child.stdin.end()`**.
+- `src/engines/kimi-code.ts` — `kimi -p` (headless). **TYLKO rola build**: tryb -p zawsze auto-zatwierdza zapisy i nie ma read-only (`--plan`/`--yolo`/`--auto` nie łączą się z `-p`) — inne role dostają odmowę fail-closed. Label `engine:*` działa przez to wyłącznie na build (routing.ts). Bez raportu kosztów.
 - `src/engines/index.ts` — rejestr silników (nowy silnik = adapter + wpis + linijka w routing.yaml).
 - `src/sources/types.ts` — kontrakt `TicketSource`.
 - `src/sources/linear.ts` — `LinearSource` (GraphQL API; klucz w `.env` jako `LINEAR_API_KEY`, projekt `LINEAR_PROJECT`). Nazwa projektu w Linear == klucz w projects.yaml.
@@ -65,7 +66,7 @@ Fabryka software: ticket → intake → plan (+gate niejasności) → human gate
 1a. ~~Idempotentne workspace.ts~~ ✓ zrobione (prune przed branch -D).
 2. ~~TicketSource: Linear~~ ✓ zrobione (space bartoszrychlicki, team BAR, projekt pilot-app; label `agent:ready` utworzony w Linear).
 3. **Artefakty `runs/<ticket>/`** — plan, handoffy, raporty, koszty, próby (trwały audit trail poza Studio).
-4. **Kimi Code adapter** + routing `build.frontend`.
+4. ~~Kimi Code adapter + routing `build.frontend`~~ ✓ zrobione (label Linear `domain:frontend` → `resolveRoute("build", ticket, domena)` → `build.frontend: kimi-code` w routing.yaml; smoke przeszedł, pierwszy pełny run E2E jeszcze przed nami).
 5. **Izolacja profili CLI** — czysty `CODEX_HOME`/config per run. ŚWIADOMIE ODŁOŻONE (decyzja Bartosza 2026-07-20): na tym etapie agenci MAJĄ mieć dostęp do jego skilli i serwerów MCP. Nie wdrażać bez jego wyraźnej zgody.
 6. ~~Metryki~~ ✓ zrobione (`runs/metrics.jsonl` + `src/metrics/report.ts`; zbierane od 2026-07-20 wieczór — wcześniejsze runy nie są w danych).
 7. **Dual-plan z fuzją** (decyzja Bartosza 2026-07-20, po metrykach): dwa NIEZALEŻNE plany RÓŻNYMI silnikami (`.parallel()` w Mastrze; ten sam model 2× = skorelowane ślepe plamy) → agent-arbiter „fusion" (read-only) jawnie wyszukuje rozbieżności i skleja JEDEN finalny plan z sekcją „Rozstrzygnięcia"; rozbieżność nierozstrzygalna = `PLAN: BLOCKED` z opcjami A/B — rozstrzyga człowiek na bramce (fail-closed bez zmian). Włączane per ticket labelem `plan:duo` (dla one-linerów to strata — anty-bloat). Routing: warianty `plan.a`/`plan.b`/`plan.fusion` w routing.yaml. Artefakty: `plan-a.md`, `plan-b.md`, `plan.md`. Debata iteracyjna ODRZUCONA na start (malejące zyski); wraca tylko, jeśli metryki pokażą, że fuzja przepuszcza słabe plany. Metryki mają odpowiedzieć: czy tickety `plan:duo` mają mniej FAIL-i w verify i mniej rund review→fix.
