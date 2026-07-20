@@ -24,6 +24,7 @@ Fabryka software: ticket → intake → plan (+gate niejasności) → human gate
 - Dev: `FACTORY_ROOT=$(pwd) CLAUDE_BIN=~/.local/bin/claude npm run dev` → Studio `localhost:4111`.
 - Run bez Studio: API Mastry (`localhost:4111/api`, endpointy create-run/start/resume — lista w Studio → API endpoints). Human gate `approve-plan` wymaga resume z `{"approved": true}`.
 - Smoke adapterów: `CLAUDE_BIN=~/.local/bin/claude npx tsx src/engines/smoke.ts`.
+- Raport metryk: `npx tsx src/metrics/report.ts` (czyta `runs/metrics.jsonl` — wiersz per wywołanie silnika, zapisywany przez `src/pipeline/metrics.ts`; koszt/czas/first-pass rate per etap×silnik).
 
 ## Pułapki (opłacone tokenami — nie odkrywać ponownie)
 
@@ -65,8 +66,9 @@ Fabryka software: ticket → intake → plan (+gate niejasności) → human gate
 2. ~~TicketSource: Linear~~ ✓ zrobione (space bartoszrychlicki, team BAR, projekt pilot-app; label `agent:ready` utworzony w Linear).
 3. **Artefakty `runs/<ticket>/`** — plan, handoffy, raporty, koszty, próby (trwały audit trail poza Studio).
 4. **Kimi Code adapter** + routing `build.frontend`.
-5. **Izolacja profili CLI** — czysty `CODEX_HOME`/config per run (agent nie dziedziczy prywatnych MCP i skilli Bartosza).
-6. **Metryki** — koszt/czas/first-pass rate per etap i silnik (podstawa pod data-driven routing).
+5. **Izolacja profili CLI** — czysty `CODEX_HOME`/config per run. ŚWIADOMIE ODŁOŻONE (decyzja Bartosza 2026-07-20): na tym etapie agenci MAJĄ mieć dostęp do jego skilli i serwerów MCP. Nie wdrażać bez jego wyraźnej zgody.
+6. ~~Metryki~~ ✓ zrobione (`runs/metrics.jsonl` + `src/metrics/report.ts`; zbierane od 2026-07-20 wieczór — wcześniejsze runy nie są w danych).
+7. **Dual-plan z fuzją** (decyzja Bartosza 2026-07-20, po metrykach): dwa NIEZALEŻNE plany RÓŻNYMI silnikami (`.parallel()` w Mastrze; ten sam model 2× = skorelowane ślepe plamy) → agent-arbiter „fusion" (read-only) jawnie wyszukuje rozbieżności i skleja JEDEN finalny plan z sekcją „Rozstrzygnięcia"; rozbieżność nierozstrzygalna = `PLAN: BLOCKED` z opcjami A/B — rozstrzyga człowiek na bramce (fail-closed bez zmian). Włączane per ticket labelem `plan:duo` (dla one-linerów to strata — anty-bloat). Routing: warianty `plan.a`/`plan.b`/`plan.fusion` w routing.yaml. Artefakty: `plan-a.md`, `plan-b.md`, `plan.md`. Debata iteracyjna ODRZUCONA na start (malejące zyski); wraca tylko, jeśli metryki pokażą, że fuzja przepuszcza słabe plany. Metryki mają odpowiedzieć: czy tickety `plan:duo` mają mniej FAIL-i w verify i mniej rund review→fix.
 
 Dalsze fazy (br-crm adapter, kontenery, wersja kliencka): `../docs/ai-software-factory-plan-v2.md` §5.
 

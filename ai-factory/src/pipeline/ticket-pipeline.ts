@@ -10,6 +10,7 @@ import { getProject } from "./projects";
 import { resolveRoute } from "./routing";
 import { saveArtifact, artifactHeader } from "./artifacts";
 import { takeScreenshot } from "./screenshot";
+import { recordMetric } from "./metrics";
 
 const exec = promisify(execFile);
 
@@ -86,6 +87,7 @@ const planStep = createStep({
   outputSchema: planOutputSchema,
   execute: async ({ inputData, runId }) => {
     const route = await resolveRoute("plan", inputData);
+    const t0 = Date.now();
     const result = await route.engine.run({
       role: "plan",
       model: route.model,
@@ -106,6 +108,11 @@ const planStep = createStep({
       budget: { minutes: 5 },
     });
 
+    await recordMetric({
+      ticket: inputData.id, runId, stage: "plan", engine: route.spec,
+      ok: result.ok, outcome: result.ok ? (/^PLAN:\s*OK/m.test(result.report) ? "ok" : "blocked") : "engine-fail",
+      costUsd: result.costUsd, durationMs: Date.now() - t0,
+    });
     await saveArtifact(
       inputData.id,
       runId,
@@ -212,6 +219,9 @@ const buildStep = createStep({
       : "";
 
     const route = await resolveRoute("build", ticket);
+    const t0 = Date.now();
+    const buildMetric = (ok: boolean, outcome: string, costUsd?: number) =>
+      recordMetric({ ticket: ticket.id, runId, stage: "build", engine: route.spec, attempt, ok, outcome, costUsd, durationMs: Date.now() - t0 });
     const result = await route.engine.run({
       role: "build",
       model: route.model,
@@ -227,6 +237,7 @@ const buildStep = createStep({
     });
 
     if (!result.ok) {
+      await buildMetric(false, "engine-fail", result.costUsd);
       await saveBuild({ engine: route.spec, costUsd: result.costUsd, outcome: "engine-fail" }, result.report);
       return {
         ...inputData,
@@ -240,6 +251,7 @@ const buildStep = createStep({
     const { stdout: status } = await exec("git", ["-C", ws.dir, "status", "--porcelain"]);
     const changedFiles = status.split("\n").filter(Boolean).map((l) => l.slice(3));
     if (changedFiles.length === 0) {
+      await buildMetric(false, "no-changes", result.costUsd);
       await saveBuild({ engine: route.spec, costUsd: result.costUsd, outcome: "no-changes" }, result.report);
       return {
         ...inputData,
@@ -253,6 +265,7 @@ const buildStep = createStep({
     await exec("git", ["-C", ws.dir, "commit", "-m",
       `feat(${ticket.id}): ${ticket.title} (próba ${attempt})\n\n[ai-factory build]`]);
     const { stdout: sha } = await exec("git", ["-C", ws.dir, "rev-parse", "HEAD"]);
+    await buildMetric(true, "committed", result.costUsd);
     await saveBuild(
       { engine: route.spec, costUsd: result.costUsd, outcome: "committed", sha: sha.trim(), files: changedFiles.join(", ") },
       result.report
@@ -308,6 +321,10 @@ const verifyStep = createStep({
         } catch (err) {
           const e = err as Error & { stdout?: string; stderr?: string };
           const tail = [e.stdout, e.stderr].filter(Boolean).join("\n").slice(-3000);
+          await recordMetric({
+            ticket: ticket.id, runId, stage: "verify-checks", attempt: inputData.attempt,
+            ok: false, outcome: `check-fail: ${cmd}`,
+          });
           await saveVerify({ outcome: "check-fail", check: cmd }, `${e.message}\n\n${tail}`);
           return {
             ...inputData,
@@ -328,6 +345,7 @@ const verifyStep = createStep({
 
       // 3) Niezależny werdykt: osobny run, read-only, czysty katalog
       const route = await resolveRoute("verify", ticket);
+      const t0 = Date.now();
       const result = await route.engine.run({
         role: "verify",
         model: route.model,
@@ -358,6 +376,10 @@ const verifyStep = createStep({
       });
 
       if (!result.ok) {
+        await recordMetric({
+          ticket: ticket.id, runId, stage: "verify", engine: route.spec, attempt: inputData.attempt,
+          ok: false, outcome: "engine-fail", costUsd: result.costUsd, durationMs: Date.now() - t0,
+        });
         await saveVerify({ engine: route.spec, costUsd: result.costUsd, outcome: "engine-fail" }, result.report);
         return {
           ...inputData,
@@ -367,6 +389,10 @@ const verifyStep = createStep({
       }
 
       const pass = /^VERDICT:\s*PASS/m.test(result.report);
+      await recordMetric({
+        ticket: ticket.id, runId, stage: "verify", engine: route.spec, attempt: inputData.attempt,
+        ok: true, outcome: pass ? "pass" : "fail", costUsd: result.costUsd, durationMs: Date.now() - t0,
+      });
       await saveVerify(
         { engine: route.spec, costUsd: result.costUsd, outcome: pass ? "pass" : "fail", checks: checksSummary.replace(/\n/g, "; ") },
         result.report
@@ -535,6 +561,7 @@ const prReviewStep = createStep({
         maxBuffer: 10 * 1024 * 1024,
       });
 
+      const t0 = Date.now();
       const result = await route.engine.run({
         role: "review", // read-only w obu adapterach
         model: route.model,
@@ -553,6 +580,10 @@ const prReviewStep = createStep({
       });
 
       if (!result.ok) {
+        await recordMetric({
+          ticket: ticket.id, runId, stage: "review", engine: route.spec, round,
+          ok: false, outcome: "engine-fail", costUsd: result.costUsd, durationMs: Date.now() - t0,
+        });
         return {
           ...inputData,
           reviewRound: round,
@@ -564,6 +595,10 @@ const prReviewStep = createStep({
       const fix = /^REVIEW:\s*FIX/m.test(result.report);
       // fail-open na brak markera: recenzja bez werdyktu nie może zapętlić fabryki — traktujemy jak LGTM z notką
       const verdict = fix ? ("fix" as const) : ("lgtm" as const);
+      await recordMetric({
+        ticket: ticket.id, runId, stage: "review", engine: route.spec, round,
+        ok: true, outcome: verdict, costUsd: result.costUsd, durationMs: Date.now() - t0,
+      });
 
       await saveArtifact(ticket.id, runId, `review-round-${round}.md`,
         artifactHeader({ step: "review", round, engine: route.spec, costUsd: result.costUsd, verdict }) + result.report);
@@ -609,6 +644,9 @@ const remediateStep = createStep({
 
     try {
       const route = await resolveRoute("build", ticket);
+      const t0 = Date.now();
+      const fixMetric = (ok: boolean, outcome: string, costUsd?: number) =>
+        recordMetric({ ticket: ticket.id, runId, stage: "fix", engine: route.spec, round, ok, outcome, costUsd, durationMs: Date.now() - t0 });
       const result = await route.engine.run({
         role: "build",
         model: route.model,
@@ -624,6 +662,7 @@ const remediateStep = createStep({
       });
 
       if (!result.ok) {
+        await fixMetric(false, "engine-fail", result.costUsd);
         await saveFix({ engine: route.spec, outcome: "engine-fail" }, result.report);
         return inputData; // następna runda zrecenzuje ten sam SHA — rundy i tak są policzalne
       }
@@ -631,6 +670,7 @@ const remediateStep = createStep({
       const { stdout: status } = await exec("git", ["-C", workspaceDir, "status", "--porcelain"]);
       const changed = status.split("\n").filter(Boolean).map((l) => l.slice(3));
       if (changed.length === 0) {
+        await fixMetric(false, "no-changes", result.costUsd);
         await saveFix({ engine: route.spec, costUsd: result.costUsd, outcome: "no-changes" }, result.report);
         return inputData;
       }
@@ -655,6 +695,7 @@ const remediateStep = createStep({
         const tail = [e.stdout, e.stderr].filter(Boolean).join("\n").slice(-3000);
         await exec("git", ["-C", workspaceDir, "reset", "--hard", "HEAD~1"]); // poprawka psuje build → wycofujemy
         await removeCheckout(ticket.repoPath, co.dir);
+        await fixMetric(false, "checks-fail-reverted", result.costUsd);
         await saveFix({ engine: route.spec, costUsd: result.costUsd, outcome: "checks-fail-reverted", sha: newSha },
           `${e.message}\n\n${tail}`);
         return inputData;
@@ -662,6 +703,7 @@ const remediateStep = createStep({
       await removeCheckout(ticket.repoPath, co.dir);
 
       await exec("git", ["-C", workspaceDir, "push", "--force", "origin", branch]);
+      await fixMetric(true, "pushed", result.costUsd);
       await saveFix(
         { engine: route.spec, costUsd: result.costUsd, outcome: "pushed", sha: newSha, files: changed.join(", ") },
         result.report

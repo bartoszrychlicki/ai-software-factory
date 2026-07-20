@@ -101,7 +101,8 @@ async function handleTicket(id: string, title: string, description: string, labe
     if (status === "success") {
       const prUrl = findString(run, "prUrl") ?? "(brak URL PR)";
       const review = findString(run, "reviewSummary") ?? "";
-      const verdict = findString(run, "reviewVerdict");
+      // werdykt z result runa — findString by tu zawiódł (bierze najdłuższy string, a "pending" > "lgtm")
+      const verdict = (run as { result?: { reviewVerdict?: string } }).result?.reviewVerdict;
       const reviewLine =
         verdict === "lgtm" ? "AI review: LGTM (pętla review→fix zakończona czysto)."
         : verdict === "fix" ? "⚠️ AI review: uwagi pozostały po wyczerpaniu rund review→fix — oceń przy merge."
