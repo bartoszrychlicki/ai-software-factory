@@ -92,7 +92,9 @@ const planStep = createStep({
         "- kryteria akceptacji i sposób weryfikacji każdego",
         "- plan zmian plik po pliku",
         "- plan testów",
-        "- niejasności (jeśli są, wypisz jawnie)",
+        "Decyzje kosmetyczne (separator, nazewnictwo, drobny format) podejmij SAM i odnotuj w planie — nie są niejasnością.",
+        "Jeśli ticketu NIE DA SIĘ bezpiecznie zaimplementować bez odpowiedzi człowieka (sprzeczne wymagania, brakujący precondition w kodzie, niejednoznaczny zakres), wypisz pytania w sekcji `## Niejasności blokujące`.",
+        "PIERWSZA linia odpowiedzi: `PLAN: OK` albo `PLAN: BLOCKED` (gdy są niejasności blokujące).",
       ].join("\n"),
       context: `# Ticket ${inputData.id}: ${inputData.title}\n\n${inputData.description}`,
       workspace: inputData.repoPath,
@@ -102,6 +104,25 @@ const planStep = createStep({
     if (!result.ok) throw new Error(`Planner (${route.spec}) nie dostarczył planu: ${result.report}`);
 
     return { ticket: inputData, plan: result.report, planCostUsd: result.costUsd };
+  },
+});
+
+const assertPlanClearStep = createStep({
+  id: "assert-plan-clear",
+  description: "Bramka: niejasności blokujące w planie = BLOCKED przed ludzką aprobatą (fail-closed)",
+  inputSchema: planOutputSchema,
+  outputSchema: planOutputSchema,
+  execute: async ({ inputData }) => {
+    if (!/^PLAN:\s*OK\b/m.test(inputData.plan)) {
+      const questions =
+        inputData.plan.match(/^##\s*Niejasności blokujące[\s\S]*?(?=\n##\s|$)/m)?.[0] ??
+        inputData.plan.slice(0, 2000);
+      throw new Error(
+        `BLOCKED: plan zawiera niejasności blokujące (lub brak markera \`PLAN: OK\`). ` +
+          `Odpowiedz na pytania w tickecie i uruchom ponownie.\n\n${questions}`
+      );
+    }
+    return inputData;
   },
 });
 
@@ -483,6 +504,7 @@ export const ticketPipeline = createWorkflow({
 })
   .then(intakeStep)
   .then(planStep)
+  .then(assertPlanClearStep)
   .then(approvePlanStep)
   .then(initCycleStep)
   .dountil(

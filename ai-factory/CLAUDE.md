@@ -38,14 +38,15 @@ Fabryka software: ticket → intake → plan → human gate → pętla build→v
 
 ## Stan na 2026-07-20 późny wieczór
 
-- **Pełny cykl E2E ze wszystkimi krokami działa.** TEST-2 → PR #1 i TEST-3 → PR #2 zmergowane na main. TEST-4 → [PR #3](https://github.com/bartoszrychlicki/pilot-app/pull/3) (draft): plan → ludzka aprobata → build (1 próba) → verify PASS na świeżym checkoutcie → draft PR → **review step uruchomiony po raz pierwszy** — komentarz „LGTM" z sensowną uwagą o czystości `renderFooter` wisi na PR.
-- Review step zacommitowany (`eb4bca0`), poprawka repoPath w projects.yaml po przeniesieniu repo pilotowego — osobny commit.
-- PR #3 czeka na ludzki merge (human gate — decyzja Bartosza).
+- **Pełny cykl E2E ze wszystkimi krokami działa.** TEST-2 → PR #1, TEST-3 → PR #2, TEST-4 → PR #3 — wszystkie zmergowane na main przez Bartosza.
+- **Gate na niejasności planu (backlog #1) wdrożony i przetestowany.** Nowy krok `assert-plan-clear` między `plan` a `approve-plan`: planner musi zacząć raport od `PLAN: OK` albo `PLAN: BLOCKED` + sekcja `## Niejasności blokujące`; kosmetykę rozstrzyga sam. Fail-closed: brak markera = BLOCKED. Testy: TEST-5 (mętny ticket) → BLOCKED przed bramką ✓; TEST-6 (jasny ticket) → `PLAN: OK`, gate przepuścił, run zakończony odrzuceniem na bramce (test, nie realizacja) ✓.
+- **Idempotentne workspace (backlog 1a) wdrożone**: `worktree prune` przed `branch -D` w `createWorkspace` — martwa rejestracja worktree trzymała gałąź jako checked-out i sprzątanie cicho padało.
+- Znana słabość: raport z `claude -p` = OSTATNIA wiadomość agenta. Gdy planner po planie dopisze meta-komentarz (tak było w TEST-5), plan i marker nie trafiają do raportu — gate wtedy blokuje fail-closed (dobrze), ale raport bywa nieczytelny. Ewentualna poprawka: wymusić w prompcie, by finalna wiadomość była kompletnym planem.
 
 ## Backlog (uzgodniona kolejność)
 
-1. **Gate na niejasności planu** — niepusta sekcja niejasności w planie → BLOCKED przed bramką aprobaty (TEST-4 pokazał, że człowiek klika nie czytając; builder ignoruje).
-1a. **Idempotentne workspace.ts** — przed `worktree add -b` sprzątać pozostałości po poprzednim runie ticketu (prune + usunięcie starej gałęzi/worktree), zamiast padać na `branch already exists`.
+1. ~~Gate na niejasności planu~~ ✓ zrobione (krok `assert-plan-clear`).
+1a. ~~Idempotentne workspace.ts~~ ✓ zrobione (prune przed branch -D).
 2. **TicketSource: Linear** — adapter + polling 60 s (label `agent:ready`), idempotencja `linear:<issue>:v1`, raporty komentarzem; wymaga od Bartosza klucza API Linear i wyboru teamu.
 3. **Artefakty `runs/<ticket>/`** — plan, handoffy, raporty, koszty, próby (trwały audit trail poza Studio).
 4. **Kimi Code adapter** + routing `build.frontend`.

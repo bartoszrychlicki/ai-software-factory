@@ -27,6 +27,10 @@ export async function createWorkspace(
   // świeży start każdej próby: sprzątnij pozostałości poprzedniej
   await exec("git", ["-C", repoPath, "worktree", "remove", "--force", dir]).catch(() => {});
   await rm(dir, { recursive: true, force: true });
+  // prune PRZED branch -D: martwa rejestracja worktree trzyma gałąź jako
+  // "checked out" i branch -D cicho pada → worktree add -b wywala się na
+  // "branch already exists"
+  await exec("git", ["-C", repoPath, "worktree", "prune"]).catch(() => {});
   await exec("git", ["-C", repoPath, "branch", "-D", branch]).catch(() => {});
 
   await exec("git", ["-C", repoPath, "worktree", "add", "-b", branch, dir, "main"]);
