@@ -4,7 +4,7 @@ import { engines } from "../engines";
 import type { EngineAdapter } from "../engines/types";
 import { findUpFile } from "./projects";
 
-export type Stage = "plan" | "build" | "verify";
+export type Stage = "plan" | "build" | "verify" | "review";
 
 interface RoutingFile {
   defaults?: Record<string, string>;

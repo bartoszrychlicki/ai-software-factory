@@ -1,4 +1,4 @@
-export type Role = "plan" | "build" | "verify";
+export type Role = "plan" | "build" | "verify" | "review";
 
 export interface EngineRunInput {
   role: Role;

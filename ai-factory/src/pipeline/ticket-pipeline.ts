@@ -422,10 +422,64 @@ const publishStep = createStep({
   },
 });
 
+const reviewOutputSchema = publishOutputSchema.extend({ reviewSummary: z.string() });
+
+const reviewStep = createStep({
+  id: "review",
+  description: "Code review: doradcza recenzja jakości dopisywana do PR (nie blokuje)",
+  inputSchema: publishOutputSchema,
+  outputSchema: reviewOutputSchema,
+  execute: async ({ inputData }) => {
+    const { ticket, workspaceDir, branch, sha } = inputData;
+
+    try {
+      const route = await resolveRoute("review", ticket);
+      const { stdout: diff } = await exec("git", ["-C", workspaceDir, "show", sha], {
+        maxBuffer: 10 * 1024 * 1024,
+      });
+
+      const result = await route.engine.run({
+        role: "review", // read-only w obu adapterach
+        model: route.model,
+        instructions: [
+          "Jesteś recenzentem kodu w fabryce software.",
+          "NIE oceniaj zgodności z ticketem ani kryteriów akceptacji — to zrobił już niezależny verifier.",
+          "Skup się wyłącznie na jakości: czytelność, nazewnictwo, struktura, bezpieczeństwo,",
+          "wydajność, obsługa błędów, brakujące testy, przyszła utrzymywalność.",
+          "Format: zwięzłe punkty `plik:linia — uwaga`, posortowane od najważniejszej.",
+          "Maksymalnie 8 uwag. Jeśli kod jest w porządku, napisz tylko `LGTM` z jednym zdaniem.",
+        ].join("\n"),
+        context: `# Diff (git show ${sha.slice(0, 8)})\n${diff.slice(0, 60_000)}`,
+        workspace: workspaceDir,
+        budget: { minutes: 5 },
+      });
+
+      if (!result.ok) {
+        return { ...inputData, reviewSummary: `(review pominięte: ${result.report.slice(0, 300)})` };
+      }
+
+      // recenzja trafia tam, gdzie czyta ją człowiek: do PR-a (comment, nie approve/reject)
+      const reviewFile = join(tmpdir(), `review-${ticket.id}.md`);
+      await writeFile(reviewFile, `## AI code review (${route.spec} — doradczo)\n\n${result.report}`);
+      await exec(
+        "gh",
+        ["pr", "review", branch, "--comment", "--body-file", reviewFile],
+        { cwd: workspaceDir }
+      ).catch(() => {}); // brak review w PR nie może wywalić pipeline'u
+
+      return { ...inputData, reviewSummary: result.report };
+    } catch (err) {
+      // review jest doradcze — każdy błąd degraduje się do notki, nie porażki
+      const msg = err instanceof Error ? err.message : String(err);
+      return { ...inputData, reviewSummary: `(review pominięte: ${msg.slice(0, 300)})` };
+    }
+  },
+});
+
 export const ticketPipeline = createWorkflow({
   id: "ticket-pipeline",
   inputSchema: intakeInputSchema,
-  outputSchema: publishOutputSchema,
+  outputSchema: reviewOutputSchema,
 })
   .then(intakeStep)
   .then(planStep)
@@ -437,5 +491,6 @@ export const ticketPipeline = createWorkflow({
       inputData.verdict === "pass" || inputData.attempt >= inputData.maxAttempts
   )
   .then(assertVerifiedStep)
-  .then(publishStep);
+  .then(publishStep)
+  .then(reviewStep);
 ticketPipeline.commit();
