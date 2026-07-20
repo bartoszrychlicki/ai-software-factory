@@ -6,7 +6,8 @@ export interface EngineRunInput {
   workspace: string;      // ścieżka worktree
   context: string;        // handoff od poprzedniego etapu
   budget: { minutes: number };
-  model?: string;          // np. claude-2.0, codex-002, lmstudio-13b
+  model?: string;          // np. claude-fable-5, gpt-5.6-sol
+  effort?: string;         // reasoning effort: low/medium/high/xhigh (mapowany per CLI)
 }
 
 export interface EngineRunResult {

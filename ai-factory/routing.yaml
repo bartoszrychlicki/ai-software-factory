@@ -7,7 +7,12 @@ defaults:
   review: claude-code/sonnet   # doradcze; niezależny od buildera (codex)
   build.frontend: kimi-code    # domena z labela domain:frontend na tickecie; bez modelu = default CLI
 
-projects: {}
-# przykład nadpisań per projekt:
-#  pilot-app:
-#    plan: claude-code/opus
+# spec: silnik[/model[@effort]]; effort: low/medium/high/xhigh (claude --effort, codex -c model_reasoning_effort)
+projects:
+  br-budget:
+    plan: claude-code/claude-fable-5@high
+    build: codex/gpt-5.6-sol@xhigh
+    build.frontend: claude-code/claude-opus-4-8@high   # kimi poza br-budget do czasu dual-planowania (decyzja 2026-07-20)
+    verify: claude-code/claude-opus-4-8@high
+    review: claude-code/claude-fable-5@medium
+    # fix idzie trasą build (ta sama reguła co w pipeline)

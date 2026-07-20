@@ -14,13 +14,17 @@ interface RoutingFile {
 export interface Route {
   engine: EngineAdapter;
   model?: string;
-  spec: string; // np. "claude-code/sonnet" — do logów/raportów
+  effort?: string;
+  spec: string; // np. "claude-code/claude-fable-5@high" — do logów/raportów
 }
 
-/** "claude-code/sonnet" -> { engineName: "claude-code", model: "sonnet" } */
-function parseSpec(spec: string): { engineName: string; model?: string } {
+/** "claude-code/claude-fable-5@high" -> { engineName, model: "claude-fable-5", effort: "high" } */
+function parseSpec(spec: string): { engineName: string; model?: string; effort?: string } {
   const [engineName, ...rest] = spec.split("/");
-  return { engineName, model: rest.length ? rest.join("/") : undefined };
+  const modelPart = rest.length ? rest.join("/") : undefined;
+  if (!modelPart) return { engineName };
+  const [model, effort] = modelPart.split("@");
+  return { engineName, model: model || undefined, effort: effort || undefined };
 }
 
 /**
@@ -54,12 +58,12 @@ export async function resolveRoute(
     throw new Error(`Brak routingu dla etapu "${stage}" (projekt: ${ticket.project}) w routing.yaml`);
   }
 
-  const { engineName, model } = parseSpec(spec);
+  const { engineName, model, effort } = parseSpec(spec);
   const engine = engines[engineName];
   if (!engine) {
     throw new Error(
       `Nieznany silnik "${engineName}" w routingu (dostępne: ${Object.keys(engines).join(", ")})`
     );
   }
-  return { engine, model, spec };
+  return { engine, model, effort, spec };
 }

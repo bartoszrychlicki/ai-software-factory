@@ -22,6 +22,9 @@ export const claudeCode: EngineAdapter = {
     if (input.model) {
       args.push("--model", input.model);
     }
+    if (input.effort) {
+      args.push("--effort", input.effort);
+    }
 
     return new Promise((resolve) => {
       execFile(

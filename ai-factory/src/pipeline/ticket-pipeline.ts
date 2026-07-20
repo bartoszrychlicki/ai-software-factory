@@ -96,6 +96,7 @@ const planStep = createStep({
     const result = await route.engine.run({
       role: "plan",
       model: route.model,
+      effort: route.effort,
       instructions: [
         "Jesteś plannerem w fabryce software.",
         "Przygotuj implementowalny plan dla poniższego ticketu:",
@@ -234,6 +235,7 @@ const buildStep = createStep({
     const result = await route.engine.run({
       role: "build",
       model: route.model,
+      effort: route.effort,
       instructions: [
         "Jesteś builderem. Zaimplementuj DOKŁADNIE poniższy plan w bieżącym katalogu.",
         "Nie wykraczaj poza zakres planu.",
@@ -360,6 +362,7 @@ const verifyStep = createStep({
       const result = await route.engine.run({
         role: "verify",
         model: route.model,
+      effort: route.effort,
         instructions: [
           "Jesteś niezależnym weryfikatorem w fabryce software.",
           "Oceń, czy diff realizuje ticket zgodnie z planem:",
@@ -587,6 +590,7 @@ const prReviewStep = createStep({
       const result = await route.engine.run({
         role: "review", // read-only w obu adapterach
         model: route.model,
+      effort: route.effort,
         instructions: [
           "Jesteś recenzentem kodu w fabryce software.",
           "NIE oceniaj zgodności z ticketem ani kryteriów akceptacji — to zrobił już niezależny verifier.",
@@ -682,6 +686,7 @@ const remediateStep = createStep({
       const result = await route.engine.run({
         role: "build",
         model: route.model,
+      effort: route.effort,
         instructions: [
           "Jesteś builderem. Kod w bieżącym katalogu przeszedł werdykt zgodności z ticketem,",
           "ale code review zgłosiło uwagi jakościowe. Zaadresuj WYŁĄCZNIE poniższe uwagi.",

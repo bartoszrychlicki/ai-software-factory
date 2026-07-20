@@ -21,6 +21,7 @@ export const codex: EngineAdapter = {
 
     const args = ["exec", "--sandbox", sandbox, "--output-last-message", lastMsg];
     if (input.model) args.push("--model", input.model);
+    if (input.effort) args.push("-c", `model_reasoning_effort="${input.effort}"`);
     args.push(prompt);
 
     return new Promise((resolve) => {
