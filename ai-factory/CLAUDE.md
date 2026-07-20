@@ -38,7 +38,12 @@ Fabryka software: ticket → intake → plan → human gate → pętla build→v
 - Node przy `spawn` z nieistniejącym `cwd` zgłasza **mylące `ENOENT` na binarce** — jeśli adapter mówi „claude ENOENT", najpierw sprawdź, czy katalog roboczy (repoPath z projects.yaml!) istnieje.
 - Nieudany/przerwany run zostawia w repo pilotowym gałąź `agent/<ticket>-…` i worktree'y — kolejny run tego samego ticketu pada na `branch already exists`. Sprzątanie: `git worktree prune`, `rm -rf` martwego katalogu verify, `git branch -D`. (Docelowo: idempotentne workspace.ts — patrz backlog.)
 
-## Stan na 2026-07-20 późny wieczór
+## Stan na 2026-07-20 noc
+
+- **Linear działa E2E na żywym tickecie**: BAR-95 (welcome screen) — label `agent:ready` → poller claim + komentarz → plan (`PLAN: OK`, gate przepuścił) → ludzka aprobata → build (codex, 1 próba) → verify PASS → [PR #4](https://github.com/bartoszrychlicki/pilot-app/pull/4) → review z 4 sensownymi uwagami → komentarz wyniku w Linear + ticket „In Review". PR #4 czeka na ludzki merge.
+- Pułapka: `start-async`/`resume-async` przez HTTP dostaje **504 po 180 s** (gateway timeout Mastry) — run i tak leci; stan czytać pollingiem `GET runs/<id>` (snapshot odświeża się na granicach kroków). Poller już to robi.
+
+## Stan wcześniejszy (2026-07-20 późny wieczór)
 
 - **Pełny cykl E2E ze wszystkimi krokami działa.** TEST-2 → PR #1, TEST-3 → PR #2, TEST-4 → PR #3 — wszystkie zmergowane na main przez Bartosza.
 - **Gate na niejasności planu (backlog #1) wdrożony i przetestowany.** Nowy krok `assert-plan-clear` między `plan` a `approve-plan`: planner musi zacząć raport od `PLAN: OK` albo `PLAN: BLOCKED` + sekcja `## Niejasności blokujące`; kosmetykę rozstrzyga sam. Fail-closed: brak markera = BLOCKED. Testy: TEST-5 (mętny ticket) → BLOCKED przed bramką ✓; TEST-6 (jasny ticket) → `PLAN: OK`, gate przepuścił, run zakończony odrzuceniem na bramce (test, nie realizacja) ✓.
