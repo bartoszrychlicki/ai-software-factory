@@ -11,6 +11,7 @@ import { resolveRoute } from "./routing";
 import { saveArtifact, artifactHeader } from "./artifacts";
 import { takeScreenshot } from "./screenshot";
 import { recordMetric } from "./metrics";
+import { budgetExceeded } from "./budget";
 
 const exec = promisify(execFile);
 
@@ -207,6 +208,10 @@ const buildStep = createStep({
   execute: async ({ inputData, runId }) => {
     const { ticket, plan } = inputData;
     const attempt = inputData.attempt + 1;
+
+    // twardy budżet ticketu — deterministyczny kod, nie agent (fail-closed = BLOCKED)
+    const overBudget = await budgetExceeded(ticket, runId);
+    if (overBudget) throw new Error(`BLOCKED: budżet ticketu wyczerpany przed próbą ${attempt} builda — ${overBudget}`);
     const saveBuild = (meta: Record<string, string | number | undefined>, body: string) =>
       saveArtifact(ticket.id, runId, `build-attempt-${attempt}.md`, artifactHeader({ step: "build", attempt, ...meta }) + body);
 
@@ -348,6 +353,8 @@ const verifyStep = createStep({
       });
 
       // 3) Niezależny werdykt: osobny run, read-only, czysty katalog
+      const overBudget = await budgetExceeded(ticket, runId);
+      if (overBudget) throw new Error(`BLOCKED: budżet ticketu wyczerpany przed werdyktem verify — ${overBudget}`);
       const route = await resolveRoute("verify", ticket);
       const t0 = Date.now();
       const result = await route.engine.run({
@@ -559,6 +566,17 @@ const prReviewStep = createStep({
     const { ticket, workspaceDir, branch, sha } = inputData;
     const round = inputData.reviewRound + 1;
 
+    // review jest doradcze — brak budżetu nie wywala runu, tylko kończy pętlę (PR zostaje draftem)
+    const overBudget = await budgetExceeded(ticket, runId);
+    if (overBudget) {
+      return {
+        ...inputData,
+        reviewRound: round,
+        reviewVerdict: "skipped" as const,
+        reviewSummary: `(review pominięte: budżet ticketu wyczerpany — ${overBudget})`,
+      };
+    }
+
     try {
       const route = await resolveRoute("review", ticket);
       const { stdout: diff } = await exec("git", ["-C", workspaceDir, "show", sha], {
@@ -643,6 +661,16 @@ const remediateStep = createStep({
     }
     const { ticket, workspaceDir, branch } = inputData;
     const round = inputData.reviewRound;
+
+    // brak budżetu = koniec iteracji naprawczych; uwagi zostają jawnie nierozwiązane (draft + ⚠️)
+    const overBudgetFix = await budgetExceeded(ticket, runId);
+    if (overBudgetFix) {
+      return {
+        ...inputData,
+        reviewRound: inputData.maxReviewRounds, // wymusza wyjście z pętli z werdyktem "fix"
+        reviewSummary: `${inputData.reviewSummary}\n\n(iteracje naprawcze przerwane: budżet ticketu wyczerpany — ${overBudgetFix})`,
+      };
+    }
     const saveFix = (meta: Record<string, string | number | undefined>, body: string) =>
       saveArtifact(ticket.id, runId, `fix-round-${round}.md`, artifactHeader({ step: "fix", round, ...meta }) + body);
 

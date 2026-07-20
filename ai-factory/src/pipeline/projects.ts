@@ -11,6 +11,8 @@ export interface ProjectConfig {
   checks?: string[]; // komendy weryfikacyjne projektu (uruchamiane na świeżym checkoutcie)
   /** Opcjonalny podgląd wyniku: fabryka stawia serwer, robi screenshot i dołącza do raportu. */
   screenshot?: { start: string; url: string };
+  /** Budżet per ticket-run (nadpisuje globalne defaulty FACTORY_BUDGET_*). */
+  budget?: { maxMinutes?: number; maxUsd?: number };
 }
 
 /** mastra dev uruchamia kod z .mastra/output — szukamy pliku konfiguracyjnego w górę drzewa */

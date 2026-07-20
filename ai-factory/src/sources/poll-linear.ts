@@ -27,6 +27,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { LinearSource } from "./linear";
 import { getProject } from "../pipeline/projects";
+import { breakerOpen, recordRunOutcome, checkHourlySpend } from "../pipeline/breaker";
 
 const exec = promisify(execFile);
 
@@ -49,6 +50,7 @@ const RUN_WATCH_MAX_MS = 24 * 60 * 60_000; // human gate może czekać długo
 const source = new LinearSource(API_KEY, PROJECT);
 const active = new Set<string>(); // tickety z opiekunem w tym procesie
 const mergeHandled = new Set<string>(); // merge obsłużony w tym procesie (stan trwały i tak jest w Linear)
+let breakerLogged = false; // log otwarcia bezpiecznika raz na zmianę stanu, nie co cykl
 
 const marker = (id: string) => `[linear:${id}:v1]`;
 
@@ -64,16 +66,27 @@ async function main() {
       if (!(await serverUp())) {
         console.error("API Mastry nie odpowiada — pomijam cykl (tickety poczekają z labelem)");
       } else {
-        const tickets = await source.listReady();
-        for (const t of tickets) {
-          if (active.has(t.id)) continue;
-          active.add(t.id);
-          // fire-and-forget: każdy ticket żyje własnym cyklem, pętla polluje dalej
-          handleTicket(t.id, t.title, t.description, t.labels).catch((err) => {
-            console.error(`[${t.id}] nieobsłużony błąd:`, err);
-            active.delete(t.id);
-          });
+        await checkHourlySpend().catch(() => {});
+        const breakerReason = await breakerOpen().catch(() => null);
+        if (breakerReason) {
+          if (!breakerLogged) {
+            console.error(`🔌 CIRCUIT BREAKER OTWARTY — nie podejmuję nowych ticketów: ${breakerReason}`);
+            breakerLogged = true;
+          }
+        } else {
+          breakerLogged = false;
+          const tickets = await source.listReady();
+          for (const t of tickets) {
+            if (active.has(t.id)) continue;
+            active.add(t.id);
+            // fire-and-forget: każdy ticket żyje własnym cyklem, pętla polluje dalej
+            handleTicket(t.id, t.title, t.description, t.labels).catch((err) => {
+              console.error(`[${t.id}] nieobsłużony błąd:`, err);
+              active.delete(t.id);
+            });
+          }
         }
+        // merge-watcher i adopcja działają też przy otwartym bezpieczniku — one nie zużywają silników
         await watchMerges().catch((err) => console.error("Merge-watcher nieudany:", err));
       }
     } catch (err) {
@@ -149,6 +162,7 @@ async function watchRun(id: string, runId: string, planCommentedAtInit?: string)
             `${reviewLine}\n\n${clip(review, 4000)}${screenshotMd}\n\nMerge = decyzja człowieka.`
         );
         await source.setStatus(id, "human_review");
+        await recordRunOutcome(true).catch(() => {});
         console.log(`[${id}] SUKCES → ${prUrl}`);
         break;
       }
@@ -162,6 +176,8 @@ async function watchRun(id: string, runId: string, planCommentedAtInit?: string)
             `Uzupełnij ticket i nadaj ponownie label \`agent:ready\`, żeby fabryka spróbowała jeszcze raz.`
         );
         await source.setStatus(id, blocked ? "needs_clarification" : "blocked");
+        // odrzucenie planu przez człowieka to nie porażka fabryki — nie nabija serii bezpiecznika
+        if (!/odrzucony przez człowieka/i.test(msg)) await recordRunOutcome(false).catch(() => {});
         console.log(`[${id}] FAILED${blocked ? " (BLOCKED)" : ""}`);
         break;
       }
