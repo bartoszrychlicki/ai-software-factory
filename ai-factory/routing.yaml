@@ -1,5 +1,12 @@
-# etap[.domena] -> silnik; override na tickecie labelem engine:<nazwa>
-plan: claude-code
-build: codex
-build.frontend: codex   # faza 2: kimi-code
-verify: claude-code
+# Routing: etap[.domena] -> silnik[/model]
+# Rozstrzyganie: label engine:* na tickecie > projects.<projekt> > defaults.<etap.domena> > defaults.<etap>
+defaults:
+  plan: claude-code/sonnet
+  build: codex              # bez modelu = default CLI
+  verify: claude-code/sonnet
+  # build.frontend: kimi-code/k2.7   # faza 2
+
+projects: {}
+# przykład nadpisań per projekt:
+#  pilot-app:
+#    plan: claude-code/opus
