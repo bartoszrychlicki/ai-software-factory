@@ -18,7 +18,7 @@
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
-    <string>/Users/senioraiconsultant/.local/bin:/Users/senioraiconsultant/.kimi-code/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <string>/Users/senioraiconsultant/.local/bin:/Users/senioraiconsultant/.kimi-code/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     <key>FACTORY_ROOT</key>
     <string>/Users/senioraiconsultant/Development/Edu/ai-sdlc/ai-factory</string>
     <key>CLAUDE_BIN</key>

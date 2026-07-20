@@ -150,7 +150,7 @@ async function watchRun(src: LinearSource, id: string, runId: string, planCommen
           id,
           `📋 Plan gotowy ${marker(id)} — czeka na Twoją decyzję.\n\n` +
             `**Odpowiedz komentarzem:** \`zatwierdzam\` — buduję, albo \`odrzuć: <powód>\` — przerywam.\n` +
-            `(Aprobata w Studio też nadal działa: run \`${runId}\`.)\n\n---\n\n${clip(plan, 8000)}`
+            `(Aprobata w Studio też nadal działa: run \`${runId}\`.)\n\n---\n\n${clip(plan, 16000)}`
         );
         console.log(`[${id}] plan czeka na decyzję w Linear`);
       } else if (status === "suspended" && planCommentedAt && !decisionSent) {
@@ -315,7 +315,7 @@ async function readDecision(
   for (const c of comments) {
     if (c.createdAt <= sinceIso || c.body.includes(marker(id))) continue;
     const body = c.body.trim();
-    if (/^(zatwierdzam|approve|ok)\b/i.test(body)) return { approved: true };
+    if (/^(zatwierdzam|akceptuję|akceptuje|zgoda|approve|approved|ok|lgtm)\b/i.test(body)) return { approved: true };
     const reject = body.match(/^(odrzuć|odrzucam|reject)\b[:\s]*([\s\S]*)/i);
     if (reject) return { approved: false, feedback: reject[2].trim() || "odrzucone w Linear bez powodu" };
   }
@@ -412,8 +412,15 @@ async function uploadScreenshot(src: LinearSource, ticketId: string, runId: stri
   }
 }
 
+/**
+ * Cięcie OD ŚRODKA: początek (diagnoza/zakres) i koniec (ryzyka/niejasności —
+ * najważniejsze dla ludzkiej decyzji) zawsze widoczne; wycinka w detalach.
+ */
 function clip(s: string, max: number): string {
-  return s.length > max ? s.slice(0, max) + "\n\n… (ucięte)" : s;
+  if (s.length <= max) return s;
+  const head = Math.floor(max * 0.65);
+  const tail = max - head;
+  return `${s.slice(0, head)}\n\n… ✂️ (wycięto ${s.length - max} znaków ze środka — pełny plan w runs/) …\n\n${s.slice(-tail)}`;
 }
 
 function sleep(ms: number) {

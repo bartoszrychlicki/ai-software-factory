@@ -111,7 +111,8 @@ const planStep = createStep({
       ].join("\n"),
       context: `# Ticket ${inputData.id}: ${inputData.title}\n\n${inputData.description}`,
       workspace: inputData.repoPath,
-      budget: { minutes: 5 },
+      // 5 min ubiło Fable@high na produkcyjnym repo (BAR-91: kill w 301 s) — mocne modele myślą dłużej
+      budget: { minutes: 12 },
     });
 
     await recordMetric({
