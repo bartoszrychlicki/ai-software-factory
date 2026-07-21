@@ -1,4 +1,5 @@
 pilot-app:
+  statuses: extended   # tablica Linear odzwierciedla fazy fabryki (pilot wdrożenia — br-budget po akceptacji)
   repo: /Users/senioraiconsultant/Development/Edu/ai-sdlc/pilot-app
   github: bartoszrychlicki/pilot-app
   default_branch: main

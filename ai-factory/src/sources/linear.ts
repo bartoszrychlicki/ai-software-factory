@@ -140,6 +140,23 @@ export class LinearSource implements TicketSource {
     );
   }
 
+  /** Ustawia stan po dokładnej nazwie (stany procesu fabryki). */
+  async setStateByName(id: string, stateName: string): Promise<void> {
+    const issue = await this.fetchIssue(id);
+    const state = issue.team.states.nodes.find((s) => s.name === stateName);
+    if (!state) throw new Error(`Brak stanu "${stateName}" w teamie`);
+    await this.gql(
+      `mutation($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }`,
+      { id: issue.id, input: { stateId: state.id } }
+    );
+  }
+
+  /** Aktualna nazwa stanu issue (wykrywanie aprobaty przez przeciągnięcie karty). */
+  async getStateName(id: string): Promise<string> {
+    const issue = await this.fetchIssue(id);
+    return issue.state.name;
+  }
+
   /** Przywraca label-trigger (auto-retry porażek infrastrukturalnych). */
   async relabelReady(id: string): Promise<void> {
     const label = await this.gql<{ issueLabels: { nodes: { id: string }[] } }>(

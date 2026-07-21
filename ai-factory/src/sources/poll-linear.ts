@@ -67,6 +67,17 @@ let breakerLogged = false; // log otwarcia bezpiecznika raz na zmianę stanu, ni
 
 const marker = (id: string) => `[linear:${id}:v1]`;
 
+/** Fabryka jako jedyny autor stanów procesu (projekty z statuses: extended w projects.yaml). */
+async function setPhase(project: string, src: LinearSource, id: string, stateName: string): Promise<void> {
+  try {
+    const cfg = await getProject(project);
+    if (cfg.statuses !== "extended") return;
+    await src.setStateByName(id, stateName);
+  } catch (err) {
+    console.error(`[${id}] setPhase(${stateName}) nieudane:`, err instanceof Error ? err.message : err);
+  }
+}
+
 // --- główna pętla ---------------------------------------------------------
 
 const once = process.argv.includes("--once");
@@ -137,10 +148,11 @@ async function handleTicket(
     : `🤖 ai-factory przyjęła ticket ${marker(id)}. Planner startuje.`);
   notify(`🤖 ${id}: ticket przyjęty`, reusePlan ? "♻️ Reuse zatwierdzonego planu — build od razu." : `Planner startuje (${project}). Plan przyjdzie do akceptacji.`).catch(() => {});
 
+  await setPhase(project, src, id, reusePlan ? "🔨 Build" : "🧠 Planowanie");
   const runId = await createRun();
   fireStart(runId, { id, title, description, project, labels, reusePlan });
   console.log(`[${id}] run ${runId} wystartowany`);
-  await watchRun(src, id, runId);
+  await watchRun(project, src, id, runId);
 }
 
 /**
@@ -149,6 +161,7 @@ async function handleTicket(
  * skomentowany przed restartem pollera).
  */
 async function watchRun(
+  project: string,
   src: LinearSource,
   id: string,
   runId: string,
@@ -169,13 +182,13 @@ async function watchRun(
   try {
     while (Date.now() < deadline) {
       await sleep(RUN_WATCH_INTERVAL_MS);
-      notifyPhaseMilestones(id, runDir, seenArtifacts);
+      await notifyPhaseMilestones(project, src, id, runDir, seenArtifacts);
       const run = await getRun(runId).catch(() => undefined);
       if (!run) continue; // serwer chwilowo w dole — czekamy, run w Mastrze nie znika
       const status = runStatus(run);
 
       // tryb dopytywania: suspend na clarify-ticket obsługujemy PRZED przepływem aprobaty
-      if (status === "suspended" && await handleClarifySuspend(src, id, runId, runDir, answeredRounds, answeredFallback)) {
+      if (status === "suspended" && await handleClarifySuspend(project, src, id, runId, runDir, answeredRounds, answeredFallback)) {
         continue;
       }
 
@@ -189,13 +202,19 @@ async function watchRun(
               `(Aprobata w Studio też nadal działa: run \`${runId}\`.)\n\n---\n\n${clip(plan, 16000)}`
           );
           planCommentedAt = new Date().toISOString(); // dopiero PO udanym komentarzu — inaczej czkawka API gubi plan na zawsze (BAR-104)
+          await setPhase(project, src, id, "🚦 Plan do akceptacji");
           console.log(`[${id}] plan czeka na decyzję w Linear`);
           notify(`⏳ ${id}: plan do akceptacji`, "Odpowiedz `zatwierdzam` / `odrzuć: powód` w Linear.").catch(() => {});
         } catch (err) {
           console.error(`[${id}] komentarz z planem nieudany (retry w następnym ticku):`, err instanceof Error ? err.message : err);
         }
       } else if (status === "suspended" && planCommentedAt && !decisionSent) {
-        const decision = await readDecision(src, id, planCommentedAt);
+        let decision = await readDecision(src, id, planCommentedAt);
+        // aprobata przez PRZECIĄGNIĘCIE karty: 🚦 Plan do akceptacji → 🔨 Build (bezargumentowa, więc status wystarcza)
+        if (!decision) {
+          const state = await src.getStateName(id).catch(() => undefined);
+          if (state === "🔨 Build") decision = { approved: true };
+        }
         if (decision) {
           decisionSent = true;
           fireResume(runId, decision);
@@ -203,6 +222,7 @@ async function watchRun(
           // natychmiastowe domknięcie pętli zwrotnej — bez tego wygląda, jakby system nie chwycił decyzji
           if (decision.approved) {
             await src.comment(id, `🔨 Aprobata przyjęta ${marker(id)} — build ruszył. Kolejne kroki: verify (checks+testy+e2e) → PR.`).catch(() => {});
+            await setPhase(project, src, id, "🔨 Build");
             notify(`🔨 ${id}: build ruszył`, "Aprobata planu przyjęta.").catch(() => {});
           } else {
             await src.comment(id, `↩️ Odrzucenie przyjęte ${marker(id)} — run zostanie zakończony, powód trafi do raportu.`).catch(() => {});
@@ -227,6 +247,7 @@ async function watchRun(
             `${reviewLine}\n\n${clip(review, 4000)}${screenshotMd}\n\nMerge = decyzja człowieka.`
         );
         await src.setStatus(id, "human_review");
+        await setPhase(project, src, id, "✅ PR do merge");
         await recordRunOutcome(true).catch(() => {});
         notify(`✅ ${id}: PR gotowy`, `${prUrl}${verdict === "lgtm" ? " (ready for review)" : " (draft)"}`).catch(() => {});
         console.log(`[${id}] SUKCES → ${prUrl}`);
@@ -279,7 +300,7 @@ async function watchRun(
 // --- adopcja sierot po restarcie pollera ----------------------------------
 
 async function adoptOrphans() {
-  for (const { src } of sources) {
+  for (const { project, src } of sources) {
   const issues = await src.listWithComments("In Progress");
   for (const issue of issues) {
     if (active.has(issue.id)) continue;
@@ -301,7 +322,7 @@ async function adoptOrphans() {
       c.body.includes("Aprobata przyjęta") || c.body.includes("Odrzucenie przyjęte"));
     active.add(issue.id);
     console.log(`[${issue.id}] ADOPCJA sieroconego runa ${runId}${decisionHandled ? " (decyzja już obsłużona)" : ""}`);
-    watchRun(src, issue.id, runId, planComment?.createdAt, decisionHandled).catch((err) => {
+    watchRun(project, src, issue.id, runId, planComment?.createdAt, decisionHandled).catch((err) => {
       console.error(`[${issue.id}] adopcja padła:`, err);
       active.delete(issue.id);
     });
@@ -413,8 +434,8 @@ function artifactField(path: string, field: string): string {
   }
 }
 
-/** Nowy artefakt = zakończona faza → notyfikacja z werdyktem. */
-function notifyPhaseMilestones(id: string, runDir: string, seen: Set<string>) {
+/** Nowy artefakt = zakończona faza → notyfikacja z werdyktem (+ stan procesu na tablicy). */
+async function notifyPhaseMilestones(project: string, src: LinearSource, id: string, runDir: string, seen: Set<string>) {
   for (const f of safeReaddir(runDir)) {
     if (seen.has(f)) continue;
     seen.add(f);
@@ -431,11 +452,14 @@ function notifyPhaseMilestones(id: string, runDir: string, seen: Set<string>) {
       msg = outcome === "committed"
         ? [`🧱 ${id}: build gotowy (próba ${build[1]})`, "Verify startuje: checks + testy + e2e."]
         : [`⚠️ ${id}: build nieudany (próba ${build[1]})`, `Wynik: ${outcome || "?"} — pętla decyduje o retry.`];
+      if (outcome === "committed") await setPhase(project, src, id, "🧪 Weryfikacja");
     } else if (verify) {
       const outcome = artifactField(p, "outcome");
       msg = outcome === "pass"
         ? [`🧪 ${id}: verify PASS (próba ${verify[1]})`, "Publikacja PR i code review."]
         : [`🧪 ${id}: verify FAIL (próba ${verify[1]})`, `Wynik: ${outcome || "fail"} — feedback wraca do buildera.`];
+      if (outcome === "pass") await setPhase(project, src, id, "👀 Code review");
+      else await setPhase(project, src, id, "🔨 Build");
     } else if (review) {
       const verdict = artifactField(p, "verdict");
       msg = verdict === "lgtm"
@@ -468,6 +492,7 @@ function artifactBody(path: string): string | undefined {
  * pytań obsłużony (pomiń przepływ aprobaty w tym ticku).
  */
 async function handleClarifySuspend(
+  project: string,
   src: LinearSource,
   id: string,
   runId: string,
@@ -494,6 +519,7 @@ async function handleClarifySuspend(
       `${qTag} ${marker(id)} — ticket wymaga doprecyzowania przed planem.\n\n` +
         `Odpowiedz krótko w komentarzu (np. \`1A, 2C\` albo własnymi słowami) — doplanuję bez ponownego labelowania.\n\n---\n\n${qBody}`
     ).catch(() => {});
+    await setPhase(project, src, id, "❓ Pytania do autora");
     notify(`❓ ${id}: pytania do ticketu (runda ${qMax})`, "Odpowiedz w komentarzu — fabryka doplanuje.").catch(() => {});
     console.log(`[${id}] pytania rundy ${qMax} czekają na odpowiedź`);
     return true;
@@ -515,6 +541,7 @@ async function handleClarifySuspend(
     answered.add(qMax);
     fireResumeStep(runId, "clarify-ticket", { answers: answer });
     await src.comment(id, `🧠 Odpowiedzi przyjęte ${marker(id)} — doplanowuję (runda ${qMax}).`).catch(() => {});
+    await setPhase(project, src, id, "🧠 Planowanie");
     notify(`🧠 ${id}: odpowiedzi przyjęte`, `Doplanowanie (runda ${qMax}).`).catch(() => {});
     console.log(`[${id}] odpowiedzi rundy ${qMax} → resume clarify`);
   }

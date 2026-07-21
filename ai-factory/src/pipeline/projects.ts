@@ -11,6 +11,8 @@ export interface ProjectConfig {
   checks?: string[]; // komendy weryfikacyjne projektu (uruchamiane na świeżym checkoutcie)
   /** Opcjonalny podgląd wyniku: fabryka stawia serwer, robi screenshot i dołącza do raportu. */
   screenshot?: { start: string; url: string };
+  /** "extended" = fabryka pisze stany procesu w Linear (🧠❓🚦🔨🧪👀✅) zamiast prostego In Progress/In Review. */
+  statuses?: "extended";
   /** Budżet per ticket-run (nadpisuje globalne defaulty FACTORY_BUDGET_*). */
   budget?: { maxMinutes?: number; maxUsd?: number };
   /** QA: runda 1 = e2e w verify (komenda na świeżym checkoutcie); runda 2 = prod smoke po merge'u. */
