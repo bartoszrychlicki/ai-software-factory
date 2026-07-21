@@ -140,9 +140,15 @@ async function watchRun(src: LinearSource, id: string, runId: string, planCommen
   let decisionSent = false;
   const deadline = Date.now() + RUN_WATCH_MAX_MS;
 
+  // fazy śledzimy po ARTEFAKTACH (snapshot Mastry po resume jest stale — bug guarda, patrz CLAUDE.md);
+  // przy adopcji seedujemy istniejącymi plikami, żeby nie odgrywać starych kamieni milowych
+  const runDir = join(process.cwd(), "runs", id, runId);
+  const seenArtifacts = new Set<string>(safeReaddir(runDir));
+
   try {
     while (Date.now() < deadline) {
       await sleep(RUN_WATCH_INTERVAL_MS);
+      notifyPhaseMilestones(id, runDir, seenArtifacts);
       const run = await getRun(runId).catch(() => undefined);
       if (!run) continue; // serwer chwilowo w dole — czekamy, run w Mastrze nie znika
       const status = runStatus(run);
@@ -342,6 +348,63 @@ async function cleanupAfterMerge(projectKey: string, ticketId: string, branch: s
     }
   } catch (err) {
     console.error(`[${ticketId}] sprzątanie po merge nieudane:`, err instanceof Error ? err.message : err);
+  }
+}
+
+// --- powiadomienia o fazach (artefakty jako sygnał postępu) ----------------
+
+function safeReaddir(dir: string): string[] {
+  try {
+    return readdirSync(dir);
+  } catch {
+    return [];
+  }
+}
+
+/** Nagłówek YAML artefaktu → wartość pola (outcome/verdict). */
+function artifactField(path: string, field: string): string {
+  try {
+    const head = readFileSync(path, "utf8").slice(0, 600);
+    return head.match(new RegExp(`^${field}:\\s*(.+)$`, "m"))?.[1]?.trim() ?? "";
+  } catch {
+    return "";
+  }
+}
+
+/** Nowy artefakt = zakończona faza → notyfikacja z werdyktem. */
+function notifyPhaseMilestones(id: string, runDir: string, seen: Set<string>) {
+  for (const f of safeReaddir(runDir)) {
+    if (seen.has(f)) continue;
+    seen.add(f);
+    const p = join(runDir, f);
+    let msg: [string, string] | undefined;
+
+    const build = f.match(/^build-attempt-(\d+)\.md$/);
+    const verify = f.match(/^verify-attempt-(\d+)\.md$/);
+    const review = f.match(/^review-round-(\d+)\.md$/);
+    const fix = f.match(/^fix-round-(\d+)\.md$/);
+
+    if (build) {
+      const outcome = artifactField(p, "outcome");
+      msg = outcome === "committed"
+        ? [`🧱 ${id}: build gotowy (próba ${build[1]})`, "Verify startuje: checks + testy + e2e."]
+        : [`⚠️ ${id}: build nieudany (próba ${build[1]})`, `Wynik: ${outcome || "?"} — pętla decyduje o retry.`];
+    } else if (verify) {
+      const outcome = artifactField(p, "outcome");
+      msg = outcome === "pass"
+        ? [`🧪 ${id}: verify PASS (próba ${verify[1]})`, "Publikacja PR i code review."]
+        : [`🧪 ${id}: verify FAIL (próba ${verify[1]})`, `Wynik: ${outcome || "fail"} — feedback wraca do buildera.`];
+    } else if (review) {
+      const verdict = artifactField(p, "verdict");
+      msg = verdict === "lgtm"
+        ? [`👀 ${id}: review LGTM (runda ${review[1]})`, "PR wychodzi z drafta."]
+        : [`👀 ${id}: review FIX (runda ${review[1]})`, "Builder poprawia uwagi."];
+    } else if (fix) {
+      const outcome = artifactField(p, "outcome");
+      if (outcome === "pushed") msg = [`🔧 ${id}: poprawki wgrane (runda ${fix[1]})`, "Kolejna runda review."];
+    }
+
+    if (msg) notify(msg[0], msg[1]).catch(() => {});
   }
 }
 
