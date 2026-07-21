@@ -327,7 +327,7 @@ async function watchMerges() {
 
     let pr: { state: string; headRefName: string };
     try {
-      const { stdout } = await exec("gh", ["pr", "view", prUrl, "--json", "state,headRefName"]);
+      const { stdout } = await exec("gh", ["pr", "view", prUrl, "--json", "state,headRefName"], { timeout: 30_000 });
       pr = JSON.parse(stdout);
     } catch {
       continue; // gh chwilowo nie działa — spróbujemy w kolejnym cyklu

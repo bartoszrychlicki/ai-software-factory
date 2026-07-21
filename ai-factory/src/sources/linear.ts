@@ -38,6 +38,8 @@ export class LinearSource implements TicketSource {
       method: "POST",
       headers: { Authorization: this.apiKey, "Content-Type": "application/json" },
       body: JSON.stringify({ query, variables }),
+      // twardy timeout: zawieszony socket bez niego wiesza CAŁĄ pętlę pollera w ciszy (2026-07-22)
+      signal: AbortSignal.timeout(20_000),
     });
     const json = (await res.json()) as { data?: T; errors?: { message: string }[] };
     if (!res.ok || json.errors?.length) {
