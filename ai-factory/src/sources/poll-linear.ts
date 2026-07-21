@@ -138,9 +138,15 @@ async function handleTicket(
  * raportuje finał. planCommentedAtInit ≠ undefined = adopcja (plan już
  * skomentowany przed restartem pollera).
  */
-async function watchRun(src: LinearSource, id: string, runId: string, planCommentedAtInit?: string) {
+async function watchRun(
+  src: LinearSource,
+  id: string,
+  runId: string,
+  planCommentedAtInit?: string,
+  decisionSentInit = false
+) {
   let planCommentedAt = planCommentedAtInit;
-  let decisionSent = false;
+  let decisionSent = decisionSentInit;
   const deadline = Date.now() + RUN_WATCH_MAX_MS;
 
   // fazy śledzimy po ARTEFAKTACH (snapshot Mastry po resume jest stale — bug guarda, patrz CLAUDE.md);
@@ -260,9 +266,13 @@ async function adoptOrphans() {
       c.body.includes("Zbudowane i zweryfikowane") || c.body.includes("🛑 BLOCKED") || c.body.includes("Run nieudany"));
     if (finalized) continue; // run zakończony przed restartem — nie dublujemy finału
     const planComment = mine.filter((c) => c.body.includes("Plan gotowy")).pop();
+    // decyzja obsłużona przed restartem → NIE strzelamy resume drugi raz (BAR-104: ponowny
+    // resume zdublował egzekucję Mastry i podwoił spalanie budżetu)
+    const decisionHandled = mine.some((c) =>
+      c.body.includes("Aprobata przyjęta") || c.body.includes("Odrzucenie przyjęte"));
     active.add(issue.id);
-    console.log(`[${issue.id}] ADOPCJA sieroconego runa ${runId}`);
-    watchRun(src, issue.id, runId, planComment?.createdAt).catch((err) => {
+    console.log(`[${issue.id}] ADOPCJA sieroconego runa ${runId}${decisionHandled ? " (decyzja już obsłużona)" : ""}`);
+    watchRun(src, issue.id, runId, planComment?.createdAt, decisionHandled).catch((err) => {
       console.error(`[${issue.id}] adopcja padła:`, err);
       active.delete(issue.id);
     });
