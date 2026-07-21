@@ -138,6 +138,21 @@ export class LinearSource implements TicketSource {
     );
   }
 
+  /** Przywraca label-trigger (auto-retry porażek infrastrukturalnych). */
+  async relabelReady(id: string): Promise<void> {
+    const label = await this.gql<{ issueLabels: { nodes: { id: string }[] } }>(
+      `query { issueLabels(filter: { name: { eq: "${READY_LABEL}" } }, first: 1) { nodes { id } } }`
+    );
+    const labelId = label.issueLabels.nodes[0]?.id;
+    if (!labelId) throw new Error(`Brak labela ${READY_LABEL} w workspace`);
+    const issue = await this.fetchIssue(id);
+    const labelIds = [...new Set([...issue.labels.nodes.map((l) => l.id), labelId])];
+    await this.gql(
+      `mutation($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }`,
+      { id: issue.id, input: { labelIds } }
+    );
+  }
+
   /** Upload pliku do CDN Lineara; zwrócony assetUrl można osadzić w markdownie komentarza. */
   async uploadFile(filename: string, contentType: string, data: Buffer): Promise<string> {
     const res = await this.gql<{

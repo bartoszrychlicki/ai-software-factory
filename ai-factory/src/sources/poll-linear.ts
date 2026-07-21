@@ -18,7 +18,7 @@
  * Wymaga: LINEAR_API_KEY (env lub .env), działającego `mastra dev`.
  * Idempotencja: marker `[linear:<ISSUE>:v1]` w komentarzach + zdjęcie labela.
  */
-import { readFileSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, dirname, basename } from "node:path";
@@ -186,14 +186,29 @@ async function watchRun(src: LinearSource, id: string, runId: string, planCommen
       if (status === "failed") {
         const msg = errorMessage(run);
         const blocked = /BLOCKED|odrzucony/i.test(msg);
+        // odrzucenie planu przez człowieka to nie porażka fabryki — nie nabija serii bezpiecznika
+        if (!/odrzucony przez człowieka/i.test(msg)) await recordRunOutcome(false).catch(() => {});
+
+        // porażka INFRASTRUKTURALNA (nie-BLOCKED: timeout/spawn/silnik) → auto-retry dokładnie raz;
+        // merytoryczny BLOCKED zawsze czeka na człowieka (retry bez zmiany wejścia = te same pytania za te same tokeny)
+        if (!blocked) {
+          const alreadyRetried = (await src.listComments(id).catch(() => []))
+            .some((c) => c.body.includes("[auto-retry]"));
+          if (!alreadyRetried) {
+            await src.comment(id, `🔁 Porażka infrastrukturalna — auto-retry 1/1 [auto-retry] ${marker(id)}\n\n${clip(msg, 2000)}`);
+            await src.setStatus(id, "needs_clarification"); // Todo — listReady wymaga stanu backlog/unstarted
+            await src.relabelReady(id);
+            console.log(`[${id}] FAILED (infra) → AUTO-RETRY`);
+            break;
+          }
+        }
+
         await src.comment(
           id,
-          `${blocked ? "🛑 BLOCKED" : "❌ Run nieudany"} ${marker(id)}\n\n${clip(msg, 6000)}\n\n` +
+          `${blocked ? "🛑 BLOCKED" : "❌ Run nieudany (auto-retry wyczerpany)"} ${marker(id)}\n\n${clip(msg, 6000)}\n\n` +
             `Uzupełnij ticket i nadaj ponownie label \`agent:ready\`, żeby fabryka spróbowała jeszcze raz.`
         );
         await src.setStatus(id, blocked ? "needs_clarification" : "blocked");
-        // odrzucenie planu przez człowieka to nie porażka fabryki — nie nabija serii bezpiecznika
-        if (!/odrzucony przez człowieka/i.test(msg)) await recordRunOutcome(false).catch(() => {});
         console.log(`[${id}] FAILED${blocked ? " (BLOCKED)" : ""}`);
         break;
       }
@@ -233,7 +248,10 @@ async function adoptOrphans() {
 
 async function watchMerges() {
   for (const { project, src } of sources) {
-  const issues = await src.listWithComments("In Review");
+  // "Done" też: integracja Linear↔GitHub przestawia status natychmiast po merge'u i wygrywa
+  // wyścig z watcherem — ticket znika z "In Review" zanim zdążymy posprzątać (BAR-91/92)
+  for (const state of ["In Review", "Done"] as const) {
+  const issues = await src.listWithComments(state);
   for (const issue of issues) {
     if (mergeHandled.has(issue.id)) continue;
     const mine = issue.comments.filter((c) => c.body.includes(marker(issue.id)));
@@ -242,6 +260,12 @@ async function watchMerges() {
       .filter(Boolean)
       .pop();
     if (!prUrl) continue;
+
+    // ticket już Done (integracja) — nasza rola to tylko dosprzątanie, o ile worktree jeszcze istnieje
+    if (state === "Done") {
+      const project_ = await getProject(project).catch(() => undefined);
+      if (!project_ || !existsSync(join(WORKTREES_ROOT, basename(project_.repo), issue.id))) continue;
+    }
 
     let pr: { state: string; headRefName: string };
     try {
@@ -254,10 +278,12 @@ async function watchMerges() {
     if (pr.state === "MERGED") {
       mergeHandled.add(issue.id);
       await cleanupAfterMerge(project, issue.id, pr.headRefName);
-      await src.comment(issue.id, `🎉 PR zmergowany ${marker(issue.id)} — ticket zamknięty, workspace posprzątany.`);
-      await src.setStatus(issue.id, "done");
-      console.log(`[${issue.id}] MERGED → Done`);
-    } else if (pr.state === "CLOSED") {
+      if (state === "In Review") {
+        await src.comment(issue.id, `🎉 PR zmergowany ${marker(issue.id)} — ticket zamknięty, workspace posprzątany.`);
+        await src.setStatus(issue.id, "done");
+      }
+      console.log(`[${issue.id}] MERGED → Done${state === "Done" ? " (dosprzątanie po integracji)" : ""}`);
+    } else if (pr.state === "CLOSED" && state === "In Review") {
       mergeHandled.add(issue.id);
       await cleanupAfterMerge(project, issue.id, pr.headRefName);
       await src.comment(
@@ -268,6 +294,7 @@ async function watchMerges() {
       await src.setStatus(issue.id, "needs_clarification");
       console.log(`[${issue.id}] PR CLOSED → Todo`);
     }
+  }
   }
   }
 }

@@ -107,7 +107,7 @@ const planStep = createStep({
         "Decyzje kosmetyczne (separator, nazewnictwo, drobny format) podejmij SAM i odnotuj w planie — nie są niejasnością.",
         "Jeśli ticketu NIE DA SIĘ bezpiecznie zaimplementować bez odpowiedzi człowieka (sprzeczne wymagania, brakujący precondition w kodzie, niejednoznaczny zakres), wypisz pytania w sekcji `## Niejasności blokujące`.",
         "Jeśli stan opisany w tickecie JUŻ ISTNIEJE w kodzie (ticket spełniony), to też jest blokujące — napisz to wprost zamiast planować pustą pracę.",
-        "PIERWSZA linia odpowiedzi: `PLAN: OK` albo `PLAN: BLOCKED` (gdy są niejasności blokujące).",
+        "PIERWSZA linia odpowiedzi CZYSTYM TEKSTEM, bez backticków i formatowania: PLAN: OK albo PLAN: BLOCKED (gdy są niejasności blokujące).",
       ].join("\n"),
       context: `# Ticket ${inputData.id}: ${inputData.title}\n\n${inputData.description}`,
       workspace: inputData.repoPath,
@@ -138,7 +138,8 @@ const assertPlanClearStep = createStep({
   inputSchema: planOutputSchema,
   outputSchema: planOutputSchema,
   execute: async ({ inputData }) => {
-    if (!/^PLAN:\s*OK\b/m.test(inputData.plan)) {
+    // tolerancja formatowania: Fable potrafi ubrać marker w backticki (BAR-101 — fałszywy BLOCKED za $2.69)
+    if (!/^[`*\s]*PLAN:\s*OK\b/m.test(inputData.plan)) {
       const questions =
         inputData.plan.match(/^##\s*Niejasności blokujące[\s\S]*?(?=\n##\s|$)/m)?.[0] ??
         inputData.plan.slice(0, 2000);
@@ -179,6 +180,14 @@ const approvePlanStep = createStep({
     }
     return inputData;
   },
+});
+
+const planApprovedStep = createStep({
+  id: "plan-approved",
+  description: "No-op: wymusza zapis snapshotu zaraz po bramce — Studio przestaje pokazywać approve-plan przez cały build",
+  inputSchema: planOutputSchema,
+  outputSchema: planOutputSchema,
+  execute: async ({ inputData }) => inputData,
 });
 
 const initCycleStep = createStep({
@@ -802,6 +811,7 @@ export const ticketPipeline = createWorkflow({
   .then(planStep)
   .then(assertPlanClearStep)
   .then(approvePlanStep)
+  .then(planApprovedStep)
   .then(initCycleStep)
   .dountil(
     buildVerifyCycle,
