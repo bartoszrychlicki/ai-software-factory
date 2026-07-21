@@ -150,6 +150,7 @@ async function handleTicket(
 
   await setPhase(project, src, id, reusePlan ? "🔨 Build" : "🧠 Planowanie");
   const runId = await createRun();
+  await src.comment(id, `🧾 run \`${runId}\` ${marker(id)}`).catch(() => {}); // kotwica adopcji (kluczowa dla reuse — nie ma komentarza z planem)
   fireStart(runId, { id, title, description, project, labels, reusePlan });
   console.log(`[${id}] run ${runId} wystartowany`);
   await watchRun(project, src, id, runId);
@@ -659,8 +660,9 @@ async function readDecision(
   for (const c of comments) {
     if (c.createdAt <= sinceIso || c.body.includes(marker(id))) continue;
     const body = c.body.trim();
-    if (/^(zatwierdzam|akceptuję|akceptuje|zgoda|approve|approved|ok|lgtm)\b/i.test(body)) return { approved: true };
-    const reject = body.match(/^(odrzuć|odrzucam|reject)\b[:\s]*([\s\S]*)/i);
+    // (?![\p{L}\p{N}]) zamiast \b — granice słów w JS są ASCII-only i "odrzuć:"/"akceptuję" nigdy nie matchowały
+    if (/^(zatwierdzam|akceptuję|akceptuje|zgoda|approve|approved|ok|lgtm)(?![\p{L}\p{N}])/iu.test(body)) return { approved: true };
+    const reject = body.match(/^(odrzuć|odrzucam|reject)(?![\p{L}\p{N}])[:\s]*([\s\S]*)/iu);
     if (reject) return { approved: false, feedback: reject[2].trim() || "odrzucone w Linear bez powodu" };
   }
   return undefined;
