@@ -122,6 +122,7 @@ async function handleTicket(
   console.log(`[${id}] claim (${project}): ${title}`);
   await src.claim(id);
   await src.comment(id, `🤖 ai-factory przyjęła ticket ${marker(id)}. Planner startuje.`);
+  notify(`🤖 ${id}: ticket przyjęty`, `Planner startuje (${project}). Plan przyjdzie do akceptacji.`).catch(() => {});
 
   const runId = await createRun();
   fireStart(runId, { id, title, description, project, labels });
