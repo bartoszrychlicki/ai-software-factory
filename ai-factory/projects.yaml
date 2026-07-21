@@ -23,3 +23,12 @@ br-budget:
   budget:
     maxUsd: 8
     maxMinutes: 60
+  qa:
+    prodChecks:
+      # do cutovera DNS (BAR-77/102) ten check FAILuje — i słusznie: deploye nie docierają na prod
+      - name: apex serwuje deployment Vercel (nie stary Cloudflare Pages)
+        url: https://budget.bartoszrychlicki.com
+        headerIncludes: x-vercel-id
+      - name: strona resetu hasła istnieje
+        url: https://budget.bartoszrychlicki.com/reset-password
+        headerIncludes: x-vercel-id

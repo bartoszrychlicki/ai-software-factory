@@ -28,6 +28,8 @@ import { promisify } from "node:util";
 import { LinearSource } from "./linear";
 import { getProject } from "../pipeline/projects";
 import { breakerOpen, recordRunOutcome, checkHourlySpend } from "../pipeline/breaker";
+import { notify } from "../pipeline/notify";
+import { runProdChecks } from "../pipeline/prod-smoke";
 
 const exec = promisify(execFile);
 
@@ -75,6 +77,7 @@ async function main() {
         if (breakerReason) {
           if (!breakerLogged) {
             console.error(`🔌 CIRCUIT BREAKER OTWARTY — nie podejmuję nowych ticketów: ${breakerReason}`);
+            notify("🔌 Fabryka: circuit breaker otwarty", breakerReason).catch(() => {});
             breakerLogged = true;
           }
         } else {
@@ -153,6 +156,7 @@ async function watchRun(src: LinearSource, id: string, runId: string, planCommen
             `(Aprobata w Studio też nadal działa: run \`${runId}\`.)\n\n---\n\n${clip(plan, 16000)}`
         );
         console.log(`[${id}] plan czeka na decyzję w Linear`);
+        notify(`⏳ ${id}: plan do akceptacji`, "Odpowiedz `zatwierdzam` / `odrzuć: powód` w Linear.").catch(() => {});
       } else if (status === "suspended" && planCommentedAt && !decisionSent) {
         const decision = await readDecision(src, id, planCommentedAt);
         if (decision) {
@@ -179,6 +183,7 @@ async function watchRun(src: LinearSource, id: string, runId: string, planCommen
         );
         await src.setStatus(id, "human_review");
         await recordRunOutcome(true).catch(() => {});
+        notify(`✅ ${id}: PR gotowy`, `${prUrl}${verdict === "lgtm" ? " (ready for review)" : " (draft)"}`).catch(() => {});
         console.log(`[${id}] SUKCES → ${prUrl}`);
         break;
       }
@@ -209,6 +214,7 @@ async function watchRun(src: LinearSource, id: string, runId: string, planCommen
             `Uzupełnij ticket i nadaj ponownie label \`agent:ready\`, żeby fabryka spróbowała jeszcze raz.`
         );
         await src.setStatus(id, blocked ? "needs_clarification" : "blocked");
+        notify(`🛑 ${id}: ${blocked ? "BLOCKED — pytania w tickecie" : "run nieudany"}`, clip(msg, 180)).catch(() => {});
         console.log(`[${id}] FAILED${blocked ? " (BLOCKED)" : ""}`);
         break;
       }
@@ -233,6 +239,9 @@ async function adoptOrphans() {
       .filter(Boolean)
       .pop();
     if (!runId) continue;
+    const finalized = mine.some((c) =>
+      c.body.includes("Zbudowane i zweryfikowane") || c.body.includes("🛑 BLOCKED") || c.body.includes("Run nieudany"));
+    if (finalized) continue; // run zakończony przed restartem — nie dublujemy finału
     const planComment = mine.filter((c) => c.body.includes("Plan gotowy")).pop();
     active.add(issue.id);
     console.log(`[${issue.id}] ADOPCJA sieroconego runa ${runId}`);
@@ -283,6 +292,8 @@ async function watchMerges() {
         await src.setStatus(issue.id, "done");
       }
       console.log(`[${issue.id}] MERGED → Done${state === "Done" ? " (dosprzątanie po integracji)" : ""}`);
+      prodSmokeGuard(project, src, issue.id).catch((err) =>
+        console.error(`[${issue.id}] prod smoke padł:`, err instanceof Error ? err.message : err));
     } else if (pr.state === "CLOSED" && state === "In Review") {
       mergeHandled.add(issue.id);
       await cleanupAfterMerge(project, issue.id, pr.headRefName);
@@ -323,6 +334,46 @@ async function cleanupAfterMerge(projectKey: string, ticketId: string, branch: s
     }
   } catch (err) {
     console.error(`[${ticketId}] sprzątanie po merge nieudane:`, err instanceof Error ? err.message : err);
+  }
+}
+
+// --- prod smoke po merge (QA runda 2) -------------------------------------
+
+const smokeDone = new Set<string>(); // jeden smoke per ticket per proces
+
+/**
+ * Po merge'u: poczekaj na deploy i sprawdź, czy zmiana ŻYJE na produkcji.
+ * FAIL → ticket wraca do In Review + komentarz 🚨 + powiadomienie (koniec z cichym Done,
+ * gdy funkcja jest martwa na prodzie — lekcja z BAR-101/102).
+ */
+async function prodSmokeGuard(projectKey: string, src: LinearSource, ticketId: string) {
+  if (smokeDone.has(ticketId)) return;
+  smokeDone.add(ticketId);
+
+  const project = await getProject(projectKey).catch(() => undefined);
+  const checks = project?.qa?.prodChecks;
+  if (!checks?.length) return; // projekt bez configu QA — smoke nie dotyczy
+
+  await sleep(90_000); // deploy potrzebuje chwili (Vercel po merge'u na main)
+
+  let result = await runProdChecks(checks);
+  for (let retry = 0; !result.ok && retry < 4; retry++) {
+    await sleep(60_000); // może deploy jeszcze się propaguje
+    result = await runProdChecks(checks);
+  }
+
+  if (result.ok) {
+    await src.comment(ticketId, `🟢 Prod smoke OK ${marker(ticketId)} — zmiana żyje na produkcji:\n${result.report}`);
+    console.log(`[${ticketId}] PROD SMOKE OK`);
+  } else {
+    await src.comment(
+      ticketId,
+      `🚨 Prod smoke FAILED ${marker(ticketId)} — merge jest, ale produkcja NIE serwuje zmiany:\n${result.report}\n\n` +
+        `Ticket wraca do In Review — zweryfikuj deploy/hosting (por. BAR-77/102).`
+    );
+    await src.setStatus(ticketId, "human_review");
+    notify(`🚨 ${ticketId}: prod smoke FAILED`, "Merge jest, ale produkcja nie serwuje zmiany — szczegóły w tickecie.").catch(() => {});
+    console.log(`[${ticketId}] PROD SMOKE FAILED`);
   }
 }
 

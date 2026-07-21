@@ -13,6 +13,10 @@ export interface ProjectConfig {
   screenshot?: { start: string; url: string };
   /** Budżet per ticket-run (nadpisuje globalne defaulty FACTORY_BUDGET_*). */
   budget?: { maxMinutes?: number; maxUsd?: number };
+  /** QA: prod smoke po merge'u (runda 2) — deklaratywne checki na żywej produkcji. */
+  qa?: {
+    prodChecks?: { name: string; url: string; status?: number; textIncludes?: string; headerIncludes?: string }[];
+  };
 }
 
 /** mastra dev uruchamia kod z .mastra/output — szukamy pliku konfiguracyjnego w górę drzewa */
