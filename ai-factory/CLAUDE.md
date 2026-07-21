@@ -47,7 +47,11 @@ Fabryka software: ticket → intake → plan (+gate niejasności) → human gate
 - **Kalibracja pod premium modele (fable/opus/sol@xhigh)**: budżety kroków plan 12 min / build 25 min; budżet ticketu br-budget $8/60min (plan ~$1-2.3 + build ~$1.7+); pełny cykl ~$5-6 ekwiwalentu — godzinowy limit breakera $10/h łatwo przebić przy retry (nocna zmiana 2026-07-21 przebiła po 5 runach).
 - Nieudany/przerwany run zostawia w repo pilotowym gałąź `agent/<ticket>-…` i worktree'y — kolejny run tego samego ticketu pada na `branch already exists`. Sprzątanie: `git worktree prune`, `rm -rf` martwego katalogu verify, `git branch -D`. (Docelowo: idempotentne workspace.ts — patrz backlog.)
 
-## Stan na 2026-07-21 (koniec sesji 2026-07-20)
+## Stan na 2026-07-21 rano (po nocnej zmianie)
+
+**br-budget w pełni operacyjny na premium modelach.** Nocna zmiana (opiekun: Claude, delegacja Bartosza na aprobaty planów): BAR-92 → [PR #75](https://github.com/bartoszrychlicki/br-budget/pull/75) (glass pills w headerze landingu; Opus builder, verify odrzucił próbę 1, LGTM runda 1), BAR-91 → [PR #76](https://github.com/bartoszrychlicki/br-budget/pull/76) (model wniosków „co się zmieniło" + analiza prod z Fazy 0; Sol builder ~18 min/próba, 2 próby verify, 1 runda fix, LGTM; $6.91 w budżecie $8). Oba ready for review — **czekają na merge Bartosza** razem z PR #4–#8 pilot-app. Koszt nocy ~$15 ekwiwalentu; wszystkie 4 porażki po drodze = kalibracja infry pod premium modele (budżety, PATH, E2BIG), wnioski w Pułapkach. Bezpiecznik godzinowy $10/h zadziałał raz — poprawnie.
+
+## Stan wcześniejszy (koniec sesji 2026-07-20)
 
 **Fabryka jest funkcjonalnie kompletna dla pilota — cały uzgodniony backlog #1–#6 zrealizowany i zweryfikowany E2E na żywych ticketach.** Jedyny brak do trybu bezobsługowego: poller i `mastra dev` to ręcznie odpalane procesy (patrz backlog: operacjonalizacja).
 
