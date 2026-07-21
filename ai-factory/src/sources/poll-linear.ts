@@ -163,16 +163,20 @@ async function watchRun(
       const status = runStatus(run);
 
       if (status === "suspended" && !planCommentedAt) {
-        planCommentedAt = new Date().toISOString();
         const plan = findString(run, "plan") ?? "(nie udało się odczytać planu z runa)";
-        await src.comment(
-          id,
-          `📋 Plan gotowy ${marker(id)} — czeka na Twoją decyzję.\n\n` +
-            `**Odpowiedz komentarzem:** \`zatwierdzam\` — buduję, albo \`odrzuć: <powód>\` — przerywam.\n` +
-            `(Aprobata w Studio też nadal działa: run \`${runId}\`.)\n\n---\n\n${clip(plan, 16000)}`
-        );
-        console.log(`[${id}] plan czeka na decyzję w Linear`);
-        notify(`⏳ ${id}: plan do akceptacji`, "Odpowiedz `zatwierdzam` / `odrzuć: powód` w Linear.").catch(() => {});
+        try {
+          await src.comment(
+            id,
+            `📋 Plan gotowy ${marker(id)} — czeka na Twoją decyzję.\n\n` +
+              `**Odpowiedz komentarzem:** \`zatwierdzam\` — buduję, albo \`odrzuć: <powód>\` — przerywam.\n` +
+              `(Aprobata w Studio też nadal działa: run \`${runId}\`.)\n\n---\n\n${clip(plan, 16000)}`
+          );
+          planCommentedAt = new Date().toISOString(); // dopiero PO udanym komentarzu — inaczej czkawka API gubi plan na zawsze (BAR-104)
+          console.log(`[${id}] plan czeka na decyzję w Linear`);
+          notify(`⏳ ${id}: plan do akceptacji`, "Odpowiedz `zatwierdzam` / `odrzuć: powód` w Linear.").catch(() => {});
+        } catch (err) {
+          console.error(`[${id}] komentarz z planem nieudany (retry w następnym ticku):`, err instanceof Error ? err.message : err);
+        }
       } else if (status === "suspended" && planCommentedAt && !decisionSent) {
         const decision = await readDecision(src, id, planCommentedAt);
         if (decision) {
@@ -190,6 +194,7 @@ async function watchRun(
       }
 
       if (status === "success") {
+        try {
         const prUrl = findString(run, "prUrl") ?? "(brak URL PR)";
         const review = findString(run, "reviewSummary") ?? "";
         // werdykt z result runa — findString by tu zawiódł (bierze najdłuższy string, a "pending" > "lgtm")
@@ -209,9 +214,13 @@ async function watchRun(
         notify(`✅ ${id}: PR gotowy`, `${prUrl}${verdict === "lgtm" ? " (ready for review)" : " (draft)"}`).catch(() => {});
         console.log(`[${id}] SUKCES → ${prUrl}`);
         break;
+        } catch (err) {
+          console.error(`[${id}] finał SUKCES nieudany (retry w następnym ticku):`, err instanceof Error ? err.message : err);
+        }
       }
 
       if (status === "failed") {
+        try {
         const msg = errorMessage(run);
         const blocked = /BLOCKED|odrzucony/i.test(msg);
         // odrzucenie planu przez człowieka to nie porażka fabryki — nie nabija serii bezpiecznika
@@ -240,6 +249,9 @@ async function watchRun(
         notify(`🛑 ${id}: ${blocked ? "BLOCKED — pytania w tickecie" : "run nieudany"}`, clip(msg, 180)).catch(() => {});
         console.log(`[${id}] FAILED${blocked ? " (BLOCKED)" : ""}`);
         break;
+        } catch (err) {
+          console.error(`[${id}] finał FAILED nieudany (retry w następnym ticku):`, err instanceof Error ? err.message : err);
+        }
       }
     }
   } finally {
