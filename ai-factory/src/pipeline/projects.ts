@@ -13,8 +13,9 @@ export interface ProjectConfig {
   screenshot?: { start: string; url: string };
   /** Budżet per ticket-run (nadpisuje globalne defaulty FACTORY_BUDGET_*). */
   budget?: { maxMinutes?: number; maxUsd?: number };
-  /** QA: prod smoke po merge'u (runda 2) — deklaratywne checki na żywej produkcji. */
+  /** QA: runda 1 = e2e w verify (komenda na świeżym checkoutcie); runda 2 = prod smoke po merge'u. */
   qa?: {
+    e2e?: string;
     prodChecks?: { name: string; url: string; status?: number; textIncludes?: string; headerIncludes?: string }[];
   };
 }

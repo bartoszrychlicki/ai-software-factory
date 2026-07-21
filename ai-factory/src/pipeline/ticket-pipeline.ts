@@ -24,6 +24,7 @@ const ticketSchema = z.object({
   github: z.string().optional(),
   checks: z.array(z.string()).optional(),
   screenshot: z.object({ start: z.string(), url: z.string() }).optional(),
+  e2e: z.string().optional(), // komenda QA rundy 1 (uruchamiana w verify na świeżym checkoutcie)
   labels: z.array(z.string()).optional(), // m.in. override engine:*
 });
 
@@ -80,6 +81,7 @@ const intakeStep = createStep({
       github: project.github,
       checks: project.checks,
       screenshot: project.screenshot,
+      e2e: project.qa?.e2e,
       labels: inputData.labels,
     };
   },
@@ -357,6 +359,37 @@ const verifyStep = createStep({
         }
         checkResults.push(`- \`${cmd}\` → OK`);
       }
+      // QA runda 1: pełne e2e projektu na tym samym świeżym checkoutcie (po tanich checks — fail fast)
+      if (ticket.e2e) {
+        const t0e2e = Date.now();
+        try {
+          await exec("bash", ["-c", ticket.e2e], {
+            cwd: co.dir,
+            env: cleanEnv,
+            timeout: 20 * 60_000,
+            maxBuffer: 50 * 1024 * 1024,
+          });
+          await recordMetric({
+            ticket: ticket.id, runId, stage: "verify-e2e", attempt: inputData.attempt,
+            ok: true, outcome: "pass", durationMs: Date.now() - t0e2e,
+          });
+          checkResults.push(`- e2e (\`${ticket.e2e}\`) → OK`);
+        } catch (err) {
+          const e = err as Error & { stdout?: string; stderr?: string };
+          const tail = [e.stdout, e.stderr].filter(Boolean).join("\n").slice(-4000);
+          await recordMetric({
+            ticket: ticket.id, runId, stage: "verify-e2e", attempt: inputData.attempt,
+            ok: false, outcome: "fail", durationMs: Date.now() - t0e2e,
+          });
+          await saveVerify({ outcome: "e2e-fail" }, `${e.message}\n\n${tail}`);
+          return {
+            ...inputData,
+            verdict: "fail" as const,
+            feedback: `Testy e2e nie przeszły na świeżym checkoutcie:\n${tail}\n(checkout: ${co.dir})`,
+          };
+        }
+      }
+
       const checksSummary = checks.length
         ? checkResults.join("\n")
         : "- (brak checks w rejestrze projektu — tylko werdykt agenta)";
