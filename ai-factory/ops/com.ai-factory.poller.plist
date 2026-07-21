@@ -19,6 +19,8 @@
   <dict>
     <key>PATH</key>
     <string>/Users/senioraiconsultant/.local/bin:/Users/senioraiconsultant/.kimi-code/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>FACTORY_CB_USD_PER_H</key>
+    <string>25</string>
   </dict>
 
   <key>RunAtLoad</key>
