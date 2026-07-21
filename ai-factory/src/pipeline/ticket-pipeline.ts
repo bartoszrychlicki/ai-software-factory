@@ -115,7 +115,7 @@ const planStep = createStep({
       context: `# Ticket ${inputData.id}: ${inputData.title}\n\n${inputData.description}`,
       workspace: inputData.repoPath,
       // 5 min ubiło Fable@high na produkcyjnym repo (BAR-91: kill w 301 s) — mocne modele myślą dłużej
-      budget: { minutes: 12 },
+      budget: { minutes: 20 },
     });
 
     await recordMetric({
@@ -429,7 +429,7 @@ const verifyStep = createStep({
         model: route.model,
       effort: route.effort,
         instructions: [
-          "Jesteś niezależnym weryfikatorem w fabryce software.",
+          "Jesteś niezależnym weryfikatorem w ai fabryce software.",
           "Oceń, czy diff realizuje ticket zgodnie z planem:",
           "- każde kryterium akceptacji ma pokrycie w zmianach?",
           "- brak zmian poza zakresem planu?",
