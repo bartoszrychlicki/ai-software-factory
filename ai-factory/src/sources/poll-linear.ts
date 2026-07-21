@@ -261,8 +261,11 @@ async function watchRun(
         try {
         const msg = errorMessage(run);
         const blocked = /BLOCKED|odrzucony/i.test(msg);
-        // odrzucenie planu przez człowieka to nie porażka fabryki — nie nabija serii bezpiecznika
-        if (!/odrzucony przez człowieka/i.test(msg)) await recordRunOutcome(false).catch(() => {});
+        // serii bezpiecznika NIE nabijają: odrzucenie planu przez człowieka ani poprawny
+        // BLOCKED na bramce planu (tani, pożądany fail-closed — np. ticket już zrobiony,
+        // pytania do autora); liczą się porażki wykonania (verify FAIL po próbach, infra, budżet)
+        const planGateBlocked = /plan bez PLAN: OK|niejasności blokujące|Pytania do autora|JUŻ ISTNIEJE|już istnieje/i.test(msg);
+        if (!/odrzucony przez człowieka/i.test(msg) && !planGateBlocked) await recordRunOutcome(false).catch(() => {});
 
         // porażka INFRASTRUKTURALNA (nie-BLOCKED: timeout/spawn/silnik) → auto-retry dokładnie raz;
         // merytoryczny BLOCKED zawsze czeka na człowieka (retry bez zmiany wejścia = te same pytania za te same tokeny)
