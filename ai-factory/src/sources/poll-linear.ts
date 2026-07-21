@@ -100,6 +100,9 @@ async function main() {
         }
         // merge-watcher i adopcja działają też przy otwartym bezpieczniku — one nie zużywają silników
         await watchMerges().catch((err) => console.error("Merge-watcher nieudany:", err));
+        // adopcja w KAŻDYM cyklu (idempotentna — active/finalized guardy): jednorazowa przy starcie
+        // padała na czkawce API Lineara i zostawiała runy bez opiekuna (BAR-104, 2026-07-21)
+        await adoptOrphans().catch((err) => console.error("Adopcja sierot nieudana:", err));
       }
     } catch (err) {
       console.error("Poll nieudany:", err instanceof Error ? err.message : err);
