@@ -340,7 +340,9 @@ async function watchMerges() {
   for (const { project, src } of sources) {
   // "Done" też: integracja Linear↔GitHub przestawia status natychmiast po merge'u i wygrywa
   // wyścig z watcherem — ticket znika z "In Review" zanim zdążymy posprzątać (BAR-91/92)
-  for (const state of ["In Review", "Done"] as const) {
+  // stany procesu (statuses: extended) — ticket po publish siedzi w "✅ PR do merge", nie w "In Review";
+  // bez tego merge-watcher nigdy nie zobaczy zmergowanego PR-a (bug wykryty 2026-07-22)
+  for (const state of ["In Review", "✅ PR do merge", "👀 Code review", "Done"] as const) {
   const issues = await src.listWithComments(state);
   for (const issue of issues) {
     if (mergeHandled.has(issue.id)) continue;
