@@ -521,15 +521,19 @@ function lastAnswer(comments: { body: string; createdAt: string }[], after: { cr
 // --- plan-reuse ------------------------------------------------------------
 
 /**
- * Zatwierdzony plan z poprzedniego runu, gdy finał był porażką INFRA/BUDŻETU
- * (nie merytoryczną — tam świeży plan ma wartość). Zwraca treść planu bez nagłówka.
+ * REGUŁA (Bartosz 2026-07-22): istnieje zatwierdzony plan → reuse jest DOMYŚLNY.
+ * Replan tylko z jawnego powodu: finał merytoryczny (verify FAIL po próbach /
+ * bramka z pytaniami) albo odrzucenie planu przez człowieka. Zombie/budżet/
+ * timeout/restart bez finału = reuse (nie generujemy planu bez powodu).
  */
 async function findReusablePlan(src: LinearSource, id: string): Promise<string | undefined> {
   try {
     const comments = await src.listComments(id);
     const lastFinal = [...comments].reverse().find((c) =>
-      c.body.includes(marker(id)) && (c.body.includes("🛑 BLOCKED") || c.body.includes("Run nieudany")));
-    if (!lastFinal || !/budżet ticketu wyczerpany|Run nieudany/.test(lastFinal.body)) return undefined;
+      c.body.includes(marker(id)) && (c.body.includes("🛑 BLOCKED") || c.body.includes("Run nieudany") || c.body.includes("Plan odrzucony")));
+    const meritorious = lastFinal &&
+      /BLOCKED po \d+\/\d+ próbach|plan bez PLAN: OK|niejasności blokujące|Pytania do autora|Plan odrzucony/.test(lastFinal.body);
+    if (meritorious) return undefined; // plan się zdezaktualizował — świeże planowanie ma wartość
 
     const base = join(process.cwd(), "runs", id);
     const dirs = readdirSync(base)
