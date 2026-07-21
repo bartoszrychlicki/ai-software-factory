@@ -184,14 +184,6 @@ const approvePlanStep = createStep({
   },
 });
 
-const planApprovedStep = createStep({
-  id: "plan-approved",
-  description: "No-op: wymusza zapis snapshotu zaraz po bramce — Studio przestaje pokazywać approve-plan przez cały build",
-  inputSchema: planOutputSchema,
-  outputSchema: planOutputSchema,
-  execute: async ({ inputData }) => inputData,
-});
-
 const initCycleStep = createStep({
   id: "init-cycle",
   description: "Inicjalizacja pętli build→verify (deterministyczny kod)",
@@ -844,7 +836,6 @@ export const ticketPipeline = createWorkflow({
   .then(planStep)
   .then(assertPlanClearStep)
   .then(approvePlanStep)
-  .then(planApprovedStep)
   .then(initCycleStep)
   .dountil(
     buildVerifyCycle,
