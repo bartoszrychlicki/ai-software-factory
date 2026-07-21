@@ -580,7 +580,8 @@ async function findReusablePlan(src: LinearSource, id: string, description: stri
     for (const { d } of dirs) {
       try {
         const dir = join(base, d);
-        if (existsSync(join(dir, "result.json"))) return undefined; // był PR — nic do reużycia
+        // UWAGA: samo istnienie result.json (był PR) NIE blokuje reuse — PR mógł zostać
+        // zamknięty bez merge (konflikt); ticket ze zmergowanym PR-em i tak jest Done i nie wraca do claimu
         const approval = JSON.parse(readFileSync(join(dir, "approval.json"), "utf8")) as { approved?: boolean; descriptionHash?: string };
         if (!approval.approved) continue;
         // ticket zmieniony po aprobacie → plan nieaktualny → replan
