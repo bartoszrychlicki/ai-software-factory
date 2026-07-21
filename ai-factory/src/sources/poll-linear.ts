@@ -25,6 +25,7 @@ import { join, dirname, basename } from "node:path";
 import { fileURLToPath } from "node:url";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { createHash } from "node:crypto";
 import { LinearSource } from "./linear";
 import { getProject } from "../pipeline/projects";
 import { breakerOpen, recordRunOutcome, checkHourlySpend } from "../pipeline/breaker";
@@ -32,6 +33,12 @@ import { notify } from "../pipeline/notify";
 import { runProdChecks } from "../pipeline/prod-smoke";
 
 const exec = promisify(execFile);
+
+// timestampy w logach (debugowanie „kiedy to się stało" bolało przy każdym incydencie)
+for (const level of ["log", "error"] as const) {
+  const orig = console[level].bind(console);
+  console[level] = (...args: unknown[]) => orig(new Date().toISOString().slice(11, 19), ...args);
+}
 
 // --- konfiguracja ---------------------------------------------------------
 
@@ -123,7 +130,7 @@ async function handleTicket(
   labels: string[]
 ) {
   console.log(`[${id}] claim (${project}): ${title}`);
-  const reusePlan = await findReusablePlan(src, id);
+  const reusePlan = await findReusablePlan(src, id, description);
   await src.claim(id);
   await src.comment(id, reusePlan
     ? `🤖 ai-factory przyjęła ticket ${marker(id)}. ♻️ Reużywam zatwierdzonego planu z poprzedniego runu (porażka infra/budżet) — build startuje od razu, bez bramki.`
@@ -526,7 +533,7 @@ function lastAnswer(comments: { body: string; createdAt: string }[], after: { cr
  * bramka z pytaniami) albo odrzucenie planu przez człowieka. Zombie/budżet/
  * timeout/restart bez finału = reuse (nie generujemy planu bez powodu).
  */
-async function findReusablePlan(src: LinearSource, id: string): Promise<string | undefined> {
+async function findReusablePlan(src: LinearSource, id: string, description: string): Promise<string | undefined> {
   try {
     const comments = await src.listComments(id);
     const lastFinal = [...comments].reverse().find((c) =>
@@ -543,8 +550,11 @@ async function findReusablePlan(src: LinearSource, id: string): Promise<string |
       try {
         const dir = join(base, d);
         if (existsSync(join(dir, "result.json"))) return undefined; // był PR — nic do reużycia
-        const approval = JSON.parse(readFileSync(join(dir, "approval.json"), "utf8")) as { approved?: boolean };
+        const approval = JSON.parse(readFileSync(join(dir, "approval.json"), "utf8")) as { approved?: boolean; descriptionHash?: string };
         if (!approval.approved) continue;
+        // ticket zmieniony po aprobacie → plan nieaktualny → replan
+        if (approval.descriptionHash &&
+            approval.descriptionHash !== createHash("sha256").update(description).digest("hex")) return undefined;
         const raw = readFileSync(join(dir, "plan.md"), "utf8");
         const body = raw.split(/^---\s*$/m).slice(2).join("---").trim() || raw;
         if (/^[`*\s]*PLAN:\s*OK\b/m.test(body)) return body;

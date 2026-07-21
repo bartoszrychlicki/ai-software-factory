@@ -1,6 +1,7 @@
 import { createStep, createWorkflow } from "@mastra/core/workflows";
 import { z } from "zod";
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { promisify } from "node:util";
 import { writeFile, readFile, mkdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -258,7 +259,8 @@ const approvePlanStep = createStep({
       // plan-reuse: treść była już zatwierdzona przez człowieka w poprzednim runie — druga bramka byłaby teatrem
       if (inputData.ticket.reusePlan) {
         await saveArtifact(inputData.ticket.id, runId, "approval.json",
-          JSON.stringify({ approved: true, reused: true, at: new Date().toISOString() }, null, 2));
+          JSON.stringify({ approved: true, reused: true, at: new Date().toISOString(),
+            descriptionHash: createHash("sha256").update(inputData.ticket.description).digest("hex") }, null, 2));
         return inputData;
       }
       await suspend({ plan: inputData.plan });
@@ -268,7 +270,9 @@ const approvePlanStep = createStep({
       inputData.ticket.id,
       runId,
       "approval.json",
-      JSON.stringify({ approved: resumeData.approved, feedback: resumeData.feedback ?? null, at: new Date().toISOString() }, null, 2)
+      JSON.stringify({ approved: resumeData.approved, feedback: resumeData.feedback ?? null, at: new Date().toISOString(),
+        // edycja ticketu po aprobacie unieważnia reuse (hash porównywany przy claimie)
+        descriptionHash: createHash("sha256").update(inputData.ticket.description).digest("hex") }, null, 2)
     );
     if (!resumeData.approved) {
       throw new Error(`Plan odrzucony przez człowieka: ${resumeData.feedback ?? "bez uzasadnienia"}`);
