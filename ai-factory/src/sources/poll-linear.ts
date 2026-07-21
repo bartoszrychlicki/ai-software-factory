@@ -18,7 +18,7 @@
  * Wymaga: LINEAR_API_KEY (env lub .env), działającego `mastra dev`.
  * Idempotencja: marker `[linear:<ISSUE>:v1]` w komentarzach + zdjęcie labela.
  */
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, readdirSync, existsSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, dirname, basename } from "node:path";
@@ -163,6 +163,13 @@ async function watchRun(src: LinearSource, id: string, runId: string, planCommen
           decisionSent = true;
           fireResume(runId, decision);
           console.log(`[${id}] decyzja z Linear: ${decision.approved ? "ZATWIERDZONO" : "ODRZUCONO"}`);
+          // natychmiastowe domknięcie pętli zwrotnej — bez tego wygląda, jakby system nie chwycił decyzji
+          if (decision.approved) {
+            await src.comment(id, `🔨 Aprobata przyjęta ${marker(id)} — build ruszył. Kolejne kroki: verify (checks+testy+e2e) → PR.`).catch(() => {});
+            notify(`🔨 ${id}: build ruszył`, "Aprobata planu przyjęta.").catch(() => {});
+          } else {
+            await src.comment(id, `↩️ Odrzucenie przyjęte ${marker(id)} — run zostanie zakończony, powód trafi do raportu.`).catch(() => {});
+          }
         }
       }
 
@@ -479,14 +486,20 @@ function findString(
 
 // --- media / drobnica -----------------------------------------------------
 
-/** Screenshot z verify (runs/<ticket>/<runId>/screenshot.png) → CDN Lineara → markdown do komentarza. */
+/** Wszystkie screenshoty runu (screenshot.png + screenshot-N.png widoków z planu) → CDN Lineara → markdown. */
 async function uploadScreenshot(src: LinearSource, ticketId: string, runId: string): Promise<string> {
   try {
-    const png = readFileSync(join(process.cwd(), "runs", ticketId, runId, "screenshot.png"));
-    const assetUrl = await src.uploadFile(`${ticketId}-screenshot.png`, "image/png", png);
-    return `\n\n**Podgląd:**\n![screenshot ${ticketId}](${assetUrl})`;
+    const dir = join(process.cwd(), "runs", ticketId, runId);
+    const files = readdirSync(dir).filter((f) => /^screenshot(-\d+)?\.png$/.test(f)).sort();
+    const parts: string[] = [];
+    for (const f of files) {
+      const png = readFileSync(join(dir, f));
+      const assetUrl = await src.uploadFile(`${ticketId}-${f}`, "image/png", png);
+      parts.push(`![${f} ${ticketId}](${assetUrl})`);
+    }
+    return parts.length ? `\n\n**Podgląd (oceń UI przed merge):**\n${parts.join("\n")}` : "";
   } catch {
-    return ""; // brak screenshota (projekt bez configu / screenshot się nie udał) — komentarz bez podglądu
+    return ""; // brak screenshotów (projekt bez configu / zrzuty się nie udały) — komentarz bez podglądu
   }
 }
 

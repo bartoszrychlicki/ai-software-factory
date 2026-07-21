@@ -2,7 +2,7 @@ import { createStep, createWorkflow } from "@mastra/core/workflows";
 import { z } from "zod";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { writeFile } from "node:fs/promises";
+import { writeFile, readFile, mkdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createWorkspace, createCheckout, removeCheckout } from "./workspace";
@@ -107,6 +107,7 @@ const planStep = createStep({
         "- plan zmian plik po pliku",
         "- plan testów",
         "Decyzje kosmetyczne (separator, nazewnictwo, drobny format) podejmij SAM i odnotuj w planie — nie są niejasnością.",
+        "Jeśli zmiana dotyka UI: wypisz w planie 1-4 linie `SCREENSHOT: /ścieżka` (czysty tekst, początek linii) ze ścieżkami widoków, na których zmianę widać — fabryka zrobi z nich zrzuty do oceny przez człowieka.",
         "Jeśli ticketu NIE DA SIĘ bezpiecznie zaimplementować bez odpowiedzi człowieka (sprzeczne wymagania, brakujący precondition w kodzie, niejednoznaczny zakres), wypisz pytania w sekcji `## Niejasności blokujące`.",
         "Jeśli stan opisany w tickecie JUŻ ISTNIEJE w kodzie (ticket spełniony), to też jest blokujące — napisz to wprost zamiast planować pustą pracę.",
         "PIERWSZA linia odpowiedzi CZYSTYM TEKSTEM, bez backticków i formatowania: PLAN: OK albo PLAN: BLOCKED (gdy są niejasności blokujące).",
@@ -353,6 +354,25 @@ const verifyStep = createStep({
       }
       // QA runda 1: pełne e2e projektu na tym samym świeżym checkoutcie (po tanich checks — fail fast)
       if (ticket.e2e) {
+        // screenshoty widoków wskazanych przez plannera (linie `SCREENSHOT: /ścieżka`) — tymczasowy spec
+        // dziedziczy z configu repo zalogowaną sesję i seedowane dane; sprzątany PRZED werdyktem agenta
+        const shotTargets = [...inputData.plan.matchAll(/^SCREENSHOT:\s*(\/\S*)/gm)].map((m) => m[1]).slice(0, 4);
+        const shotsDir = join(co.dir, ".factory-shots");
+        const shotSpec = join(co.dir, "e2e", "__factory-screens.spec.ts");
+        if (shotTargets.length) {
+          await mkdir(shotsDir, { recursive: true });
+          await writeFile(shotSpec, [
+            `import { test } from "@playwright/test";`,
+            `const targets: string[] = ${JSON.stringify(shotTargets)};`,
+            `for (const [i, path] of targets.entries()) {`,
+            `  test(\`factory screenshot \${i + 1}: \${path}\`, async ({ page }) => {`,
+            `    await page.goto(path);`,
+            `    await page.waitForLoadState("networkidle");`,
+            `    await page.screenshot({ path: \`${shotsDir}/screenshot-\${i + 1}.png\`, fullPage: true });`,
+            `  });`,
+            `}`,
+          ].join("\n"));
+        }
         const t0e2e = Date.now();
         try {
           await exec("bash", ["-c", ticket.e2e], {
@@ -361,12 +381,20 @@ const verifyStep = createStep({
             timeout: 20 * 60_000,
             maxBuffer: 50 * 1024 * 1024,
           });
+          for (const [i] of shotTargets.entries()) {
+            const png = await readFile(join(shotsDir, `screenshot-${i + 1}.png`)).catch(() => undefined);
+            if (png) await saveArtifact(ticket.id, runId, `screenshot-${i + 1}.png`, png);
+          }
+          await rm(shotSpec, { force: true }).catch(() => {});
+          await rm(shotsDir, { recursive: true, force: true }).catch(() => {});
           await recordMetric({
             ticket: ticket.id, runId, stage: "verify-e2e", attempt: inputData.attempt,
             ok: true, outcome: "pass", durationMs: Date.now() - t0e2e,
           });
           checkResults.push(`- e2e (\`${ticket.e2e}\`) → OK`);
         } catch (err) {
+          await rm(shotSpec, { force: true }).catch(() => {});
+          await rm(shotsDir, { recursive: true, force: true }).catch(() => {});
           const e = err as Error & { stdout?: string; stderr?: string };
           const tail = [e.stdout, e.stderr].filter(Boolean).join("\n").slice(-4000);
           await recordMetric({
