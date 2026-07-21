@@ -26,6 +26,8 @@ const ticketSchema = z.object({
   screenshot: z.object({ start: z.string(), url: z.string() }).optional(),
   e2e: z.string().optional(), // komenda QA rundy 1 (uruchamiana w verify na świeżym checkoutcie)
   labels: z.array(z.string()).optional(), // m.in. override engine:*
+  /** Plan-reuse: zatwierdzony plan z poprzedniego runu (porażka infra/budżet) — pomija planner i bramkę. */
+  reusePlan: z.string().optional(),
 });
 
 const intakeInputSchema = z.object({
@@ -34,6 +36,7 @@ const intakeInputSchema = z.object({
   description: z.string(),
   project: z.string(),
   labels: z.array(z.string()).optional(),
+  reusePlan: z.string().optional(),
 });
 
 const planOutputSchema = z.object({
@@ -83,18 +86,64 @@ const intakeStep = createStep({
       screenshot: project.screenshot,
       e2e: project.qa?.e2e,
       labels: inputData.labels,
+      reusePlan: inputData.reusePlan,
     };
   },
 });
 
+/**
+ * Stan pętli plan↔dopytywanie: planner pyta autora (ABCD + rekomendacje) zamiast
+ * twardego BLOCKED; odpowiedzi wracają komentarzem i doplanowuje w tym samym runie.
+ */
+const planCycleSchema = z.object({
+  ticket: ticketSchema,
+  plan: z.string(),
+  planCostUsd: z.number().optional(),
+  clarifyRound: z.number(),
+  maxClarifyRounds: z.number(),
+  answers: z.array(z.string()),
+});
+
+const PLAN_OK_RE = /^[`*\s]*PLAN:\s*OK\b/m;
+
+const initPlanCycleStep = createStep({
+  id: "init-plan-cycle",
+  description: "Inicjalizacja pętli plan↔dopytywanie (deterministyczny kod)",
+  inputSchema: ticketSchema,
+  outputSchema: planCycleSchema,
+  execute: async ({ inputData }) => ({
+    ticket: inputData,
+    plan: "",
+    clarifyRound: 0,
+    maxClarifyRounds: 2,
+    answers: [],
+  }),
+});
+
 const planStep = createStep({
   id: "plan",
-  description: "Planner: zamienia ticket w implementowalny plan",
-  inputSchema: ticketSchema,
-  outputSchema: planOutputSchema,
+  description: "Planner: zamienia ticket (+ ew. odpowiedzi autora) w implementowalny plan",
+  inputSchema: planCycleSchema,
+  outputSchema: planCycleSchema,
   execute: async ({ inputData, runId }) => {
-    const route = await resolveRoute("plan", inputData);
+    const ticket = inputData.ticket;
+
+    // plan-reuse: retry po porażce infra/budżetu nie pali tokenów na replan zatwierdzonej treści
+    if (ticket.reusePlan && !inputData.plan) {
+      await recordMetric({ ticket: ticket.id, runId, stage: "plan", engine: "reuse", ok: true, outcome: "reused", costUsd: 0, durationMs: 0 });
+      await saveArtifact(ticket.id, runId, "plan.md",
+        artifactHeader({ step: "plan", engine: "reuse", reused: "true" }) + ticket.reusePlan);
+      return { ...inputData, plan: ticket.reusePlan };
+    }
+    // plan już OK (wejście kolejnej iteracji) — nie przeplanowujemy
+    if (PLAN_OK_RE.test(inputData.plan)) return inputData;
+
+    const route = await resolveRoute("plan", ticket);
     const t0 = Date.now();
+    const answersBlock = inputData.answers.length
+      ? "\n\n# Odpowiedzi autora ticketu na Twoje wcześniejsze pytania\n" +
+        inputData.answers.map((a, i) => `\n## Runda ${i + 1}\n${a}`).join("\n")
+      : "";
     const result = await route.engine.run({
       role: "plan",
       model: route.model,
@@ -108,56 +157,93 @@ const planStep = createStep({
         "- plan testów",
         "Decyzje kosmetyczne (separator, nazewnictwo, drobny format) podejmij SAM i odnotuj w planie — nie są niejasnością.",
         "Jeśli zmiana dotyka UI: wypisz w planie 1-4 linie `SCREENSHOT: /ścieżka` (czysty tekst, początek linii) ze ścieżkami widoków, na których zmianę widać — fabryka zrobi z nich zrzuty do oceny przez człowieka.",
-        "Jeśli ticketu NIE DA SIĘ bezpiecznie zaimplementować bez odpowiedzi człowieka (sprzeczne wymagania, brakujący precondition w kodzie, niejednoznaczny zakres), wypisz pytania w sekcji `## Niejasności blokujące`.",
-        "Jeśli stan opisany w tickecie JUŻ ISTNIEJE w kodzie (ticket spełniony), to też jest blokujące — napisz to wprost zamiast planować pustą pracę.",
-        "PIERWSZA linia odpowiedzi CZYSTYM TEKSTEM, bez backticków i formatowania: PLAN: OK albo PLAN: BLOCKED (gdy są niejasności blokujące).",
+        "Jeśli ticketu NIE DA SIĘ bezpiecznie zaplanować bez odpowiedzi człowieka: PLAN: BLOCKED + sekcja `## Pytania do autora ticketu` — ponumerowane pytania, każde z opcjami A)/B)/C) i dopiskiem (REKOMENDACJA) przy tej, którą byś wybrał. Autor odpowie krótko (np. \"1A, 2C\") i doplanujesz z odpowiedziami w kontekście.",
+        "Jeśli masz już odpowiedzi autora (sekcja poniżej ticketu) — potraktuj je jako wiążące decyzje i NIE zadawaj tych samych pytań ponownie.",
+        "Jeśli stan opisany w tickecie JUŻ ISTNIEJE w kodzie (ticket spełniony): PLAN: BLOCKED i wyjaśnienie BEZ pytań — nie planuj pustej pracy.",
+        "PIERWSZA linia odpowiedzi CZYSTYM TEKSTEM, bez backticków i formatowania: PLAN: OK albo PLAN: BLOCKED.",
       ].join("\n"),
-      context: `# Ticket ${inputData.id}: ${inputData.title}\n\n${inputData.description}`,
-      workspace: inputData.repoPath,
+      context: `# Ticket ${ticket.id}: ${ticket.title}\n\n${ticket.description}${answersBlock}`,
+      workspace: ticket.repoPath,
       // 5 min ubiło Fable@high na produkcyjnym repo (BAR-91: kill w 301 s) — mocne modele myślą dłużej
       budget: { minutes: 20 },
     });
 
     await recordMetric({
-      ticket: inputData.id, runId, stage: "plan", engine: route.spec,
-      ok: result.ok, outcome: result.ok ? (/^PLAN:\s*OK/m.test(result.report) ? "ok" : "blocked") : "engine-fail",
+      ticket: ticket.id, runId, stage: "plan", engine: route.spec,
+      ok: result.ok,
+      outcome: result.ok ? (PLAN_OK_RE.test(result.report) ? "ok" : "blocked") : "engine-fail",
       costUsd: result.costUsd, durationMs: Date.now() - t0,
     });
     await saveArtifact(
-      inputData.id,
+      ticket.id,
       runId,
       "plan.md",
-      artifactHeader({ step: "plan", engine: route.spec, costUsd: result.costUsd, ok: String(result.ok) }) + result.report
+      artifactHeader({ step: "plan", engine: route.spec, costUsd: result.costUsd, ok: String(result.ok), round: inputData.clarifyRound }) + result.report
     );
     if (!result.ok) throw new Error(`Planner (${route.spec}) nie dostarczył planu: ${result.report}`);
 
-    return { ticket: inputData, plan: result.report, planCostUsd: result.costUsd };
+    return { ...inputData, plan: result.report, planCostUsd: (inputData.planCostUsd ?? 0) + (result.costUsd ?? 0) };
   },
 });
 
-const assertPlanClearStep = createStep({
-  id: "assert-plan-clear",
-  description: "Bramka: niejasności blokujące w planie = BLOCKED przed ludzką aprobatą (fail-closed)",
-  inputSchema: planOutputSchema,
+const clarifyGateStep = createStep({
+  id: "clarify-ticket",
+  description: "Dopytywanie: pytania ABCD do autora ticketu zamiast twardego BLOCKED (max 2 rundy)",
+  inputSchema: planCycleSchema,
+  outputSchema: planCycleSchema,
+  suspendSchema: z.object({ questions: z.string() }),
+  resumeSchema: z.object({ answers: z.string() }),
+  execute: async ({ inputData, resumeData, suspend, runId }) => {
+    if (PLAN_OK_RE.test(inputData.plan)) return inputData;
+    const questions = inputData.plan.match(/^##\s*Pytania do autora[\s\S]*?(?=\n##\s|$)/m)?.[0];
+    // BLOCKED bez pytań (np. ticket już zrealizowany) → finalize zablokuje twardo
+    if (!questions || inputData.clarifyRound >= inputData.maxClarifyRounds) return inputData;
+    if (!resumeData) {
+      await saveArtifact(inputData.ticket.id, runId, `questions-round-${inputData.clarifyRound + 1}.md`,
+        artifactHeader({ step: "clarify", round: inputData.clarifyRound + 1 }) + questions);
+      await suspend({ questions });
+      return inputData;
+    }
+    return {
+      ...inputData,
+      answers: [...inputData.answers, resumeData.answers],
+      clarifyRound: inputData.clarifyRound + 1,
+    };
+  },
+});
+
+/** Zagnieżdżona pętla plan↔pytania — jednostka dountil (jak build-verify-cycle). */
+const planClarifyCycle = createWorkflow({
+  id: "plan-clarify-cycle",
+  inputSchema: planCycleSchema,
+  outputSchema: planCycleSchema,
+})
+  .then(planStep)
+  .then(clarifyGateStep);
+planClarifyCycle.commit();
+
+const finalizePlanStep = createStep({
+  id: "finalize-plan",
+  description: "Bramka: plan bez PLAN: OK po rundach dopytywania = twardy BLOCKED (fail-closed)",
+  inputSchema: planCycleSchema,
   outputSchema: planOutputSchema,
   execute: async ({ inputData }) => {
-    // tolerancja formatowania: Fable potrafi ubrać marker w backticki (BAR-101 — fałszywy BLOCKED za $2.69)
-    if (!/^[`*\s]*PLAN:\s*OK\b/m.test(inputData.plan)) {
-      const questions =
-        inputData.plan.match(/^##\s*Niejasności blokujące[\s\S]*?(?=\n##\s|$)/m)?.[0] ??
+    if (!PLAN_OK_RE.test(inputData.plan)) {
+      const detail =
+        inputData.plan.match(/^##\s*(Pytania do autora|Niejasności blokujące)[\s\S]*?(?=\n##\s|$)/m)?.[0] ??
         inputData.plan.slice(0, 2000);
       throw new Error(
-        `BLOCKED: plan zawiera niejasności blokujące (lub brak markera \`PLAN: OK\`). ` +
-          `Odpowiedz na pytania w tickecie i uruchom ponownie.\n\n${questions}`
+        `BLOCKED: plan bez PLAN: OK${inputData.clarifyRound > 0 ? ` po ${inputData.clarifyRound} rundach dopytywania` : ""}. ` +
+          `Uzupełnij ticket i nadaj label ponownie.\n\n${detail}`
       );
     }
-    return inputData;
+    return { ticket: inputData.ticket, plan: inputData.plan, planCostUsd: inputData.planCostUsd };
   },
 });
 
 const approvePlanStep = createStep({
   id: "approve-plan",
-  description: "Human gate: akceptacja planu przed buildem",
+  description: "Human gate: akceptacja planu przed buildem (reuse = plan już raz zatwierdzony)",
   inputSchema: planOutputSchema,
   outputSchema: planOutputSchema,
   suspendSchema: z.object({
@@ -169,6 +255,12 @@ const approvePlanStep = createStep({
   }),
   execute: async ({ inputData, resumeData, suspend, runId }) => {
     if (!resumeData) {
+      // plan-reuse: treść była już zatwierdzona przez człowieka w poprzednim runie — druga bramka byłaby teatrem
+      if (inputData.ticket.reusePlan) {
+        await saveArtifact(inputData.ticket.id, runId, "approval.json",
+          JSON.stringify({ approved: true, reused: true, at: new Date().toISOString() }, null, 2));
+        return inputData;
+      }
       await suspend({ plan: inputData.plan });
       return inputData;
     }
@@ -861,8 +953,15 @@ export const ticketPipeline = createWorkflow({
   outputSchema: reviewCycleSchema,
 })
   .then(intakeStep)
-  .then(planStep)
-  .then(assertPlanClearStep)
+  .then(initPlanCycleStep)
+  .dountil(
+    planClarifyCycle,
+    async ({ inputData }) =>
+      PLAN_OK_RE.test(inputData.plan) ||
+      (!inputData.plan.match(/^##\s*Pytania do autora/m)) && inputData.plan !== "" ||
+      inputData.clarifyRound >= inputData.maxClarifyRounds
+  )
+  .then(finalizePlanStep)
   .then(approvePlanStep)
   .then(initCycleStep)
   .dountil(

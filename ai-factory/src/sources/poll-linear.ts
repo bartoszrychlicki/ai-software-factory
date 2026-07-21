@@ -18,7 +18,7 @@
  * Wymaga: LINEAR_API_KEY (env lub .env), działającego `mastra dev`.
  * Idempotencja: marker `[linear:<ISSUE>:v1]` w komentarzach + zdjęcie labela.
  */
-import { readFileSync, readdirSync, existsSync } from "node:fs";
+import { readFileSync, readdirSync, existsSync, statSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, dirname, basename } from "node:path";
@@ -123,12 +123,15 @@ async function handleTicket(
   labels: string[]
 ) {
   console.log(`[${id}] claim (${project}): ${title}`);
+  const reusePlan = await findReusablePlan(src, id);
   await src.claim(id);
-  await src.comment(id, `🤖 ai-factory przyjęła ticket ${marker(id)}. Planner startuje.`);
-  notify(`🤖 ${id}: ticket przyjęty`, `Planner startuje (${project}). Plan przyjdzie do akceptacji.`).catch(() => {});
+  await src.comment(id, reusePlan
+    ? `🤖 ai-factory przyjęła ticket ${marker(id)}. ♻️ Reużywam zatwierdzonego planu z poprzedniego runu (porażka infra/budżet) — build startuje od razu, bez bramki.`
+    : `🤖 ai-factory przyjęła ticket ${marker(id)}. Planner startuje.`);
+  notify(`🤖 ${id}: ticket przyjęty`, reusePlan ? "♻️ Reuse zatwierdzonego planu — build od razu." : `Planner startuje (${project}). Plan przyjdzie do akceptacji.`).catch(() => {});
 
   const runId = await createRun();
-  fireStart(runId, { id, title, description, project, labels });
+  fireStart(runId, { id, title, description, project, labels, reusePlan });
   console.log(`[${id}] run ${runId} wystartowany`);
   await watchRun(src, id, runId);
 }
@@ -153,6 +156,8 @@ async function watchRun(
   // przy adopcji seedujemy istniejącymi plikami, żeby nie odgrywać starych kamieni milowych
   const runDir = join(process.cwd(), "runs", id, runId);
   const seenArtifacts = new Set<string>(safeReaddir(runDir));
+  const answeredRounds = new Set<number>(); // rundy pytań, dla których resume już poszedł
+  const answeredFallback = new Set<number>(); // drugi strzał z pełną ścieżką kroku (format id w zagnieżdżonym workflow)
 
   try {
     while (Date.now() < deadline) {
@@ -162,8 +167,13 @@ async function watchRun(
       if (!run) continue; // serwer chwilowo w dole — czekamy, run w Mastrze nie znika
       const status = runStatus(run);
 
+      // tryb dopytywania: suspend na clarify-ticket obsługujemy PRZED przepływem aprobaty
+      if (status === "suspended" && await handleClarifySuspend(src, id, runId, runDir, answeredRounds, answeredFallback)) {
+        continue;
+      }
+
       if (status === "suspended" && !planCommentedAt) {
-        const plan = findString(run, "plan") ?? "(nie udało się odczytać planu z runa)";
+        const plan = findString(run, "plan") ?? artifactBody(join(runDir, "plan.md")) ?? "(nie udało się odczytać planu z runa)";
         try {
           await src.comment(
             id,
@@ -431,6 +441,122 @@ function notifyPhaseMilestones(id: string, runDir: string, seen: Set<string>) {
 
     if (msg) notify(msg[0], msg[1]).catch(() => {});
   }
+}
+
+// --- dopytywanie (clarify) -------------------------------------------------
+
+/** Treść artefaktu bez nagłówka YAML. */
+function artifactBody(path: string): string | undefined {
+  try {
+    const raw = readFileSync(path, "utf8");
+    return raw.split(/^---\s*$/m).slice(2).join("---").trim() || raw;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Suspend w trybie pytań: komentuje pytania ABCD, czeka na odpowiedź autora
+ * (dowolny komentarz bez markera fabryki) i wznawia doplanowanie. true = tryb
+ * pytań obsłużony (pomiń przepływ aprobaty w tym ticku).
+ */
+async function handleClarifySuspend(
+  src: LinearSource,
+  id: string,
+  runId: string,
+  runDir: string,
+  answered: Set<number>,
+  answeredFallback: Set<number>
+): Promise<boolean> {
+  const qFiles = safeReaddir(runDir).filter((f) => /^questions-round-\d+\.md$/.test(f));
+  if (!qFiles.length) return false;
+  const qMax = Math.max(...qFiles.map((f) => Number(f.match(/\d+/)![0])));
+  // plan już OK → pytania rozstrzygnięte, ten suspend to bramka aprobaty
+  const planBody = artifactBody(join(runDir, "plan.md")) ?? "";
+  if (/^[`*\s]*PLAN:\s*OK\b/m.test(planBody)) return false;
+
+  const comments = await src.listComments(id).catch(() => undefined);
+  if (!comments) return true; // czkawka API — następny tick
+
+  const qTag = `❓ Pytania do Ciebie (runda ${qMax})`;
+  const qComment = comments.find((c) => c.body.includes(qTag));
+  if (!qComment) {
+    const qBody = artifactBody(join(runDir, `questions-round-${qMax}.md`)) ?? "(nie udało się odczytać pytań)";
+    await src.comment(
+      id,
+      `${qTag} ${marker(id)} — ticket wymaga doprecyzowania przed planem.\n\n` +
+        `Odpowiedz krótko w komentarzu (np. \`1A, 2C\` albo własnymi słowami) — doplanuję bez ponownego labelowania.\n\n---\n\n${qBody}`
+    ).catch(() => {});
+    notify(`❓ ${id}: pytania do ticketu (runda ${qMax})`, "Odpowiedz w komentarzu — fabryka doplanuje.").catch(() => {});
+    console.log(`[${id}] pytania rundy ${qMax} czekają na odpowiedź`);
+    return true;
+  }
+
+  // idempotencja po restarcie: potwierdzenie przyjęcia odpowiedzi = resume już był
+  if (comments.some((c) => c.body.includes("🧠 Odpowiedzi przyjęte") && c.body.includes(`(runda ${qMax})`))) {
+    if (answered.has(qMax) && !answeredFallback.has(qMax)) {
+      // wciąż suspended tick później — spróbuj pełnej ścieżki kroku w zagnieżdżonym workflow
+      answeredFallback.add(qMax);
+      fireResumeStep(runId, ["plan-clarify-cycle", "clarify-ticket"], { answers: lastAnswer(comments, qComment) ?? "" });
+    }
+    answered.add(qMax);
+    return true;
+  }
+
+  const answer = lastAnswer(comments, qComment);
+  if (answer && !answered.has(qMax)) {
+    answered.add(qMax);
+    fireResumeStep(runId, "clarify-ticket", { answers: answer });
+    await src.comment(id, `🧠 Odpowiedzi przyjęte ${marker(id)} — doplanowuję (runda ${qMax}).`).catch(() => {});
+    notify(`🧠 ${id}: odpowiedzi przyjęte`, `Doplanowanie (runda ${qMax}).`).catch(() => {});
+    console.log(`[${id}] odpowiedzi rundy ${qMax} → resume clarify`);
+  }
+  return true;
+}
+
+function lastAnswer(comments: { body: string; createdAt: string }[], after: { createdAt: string }): string | undefined {
+  return comments.find((c) => c.createdAt > after.createdAt && !c.body.includes("[linear:"))?.body;
+}
+
+// --- plan-reuse ------------------------------------------------------------
+
+/**
+ * Zatwierdzony plan z poprzedniego runu, gdy finał był porażką INFRA/BUDŻETU
+ * (nie merytoryczną — tam świeży plan ma wartość). Zwraca treść planu bez nagłówka.
+ */
+async function findReusablePlan(src: LinearSource, id: string): Promise<string | undefined> {
+  try {
+    const comments = await src.listComments(id);
+    const lastFinal = [...comments].reverse().find((c) =>
+      c.body.includes(marker(id)) && (c.body.includes("🛑 BLOCKED") || c.body.includes("Run nieudany")));
+    if (!lastFinal || !/budżet ticketu wyczerpany|Run nieudany/.test(lastFinal.body)) return undefined;
+
+    const base = join(process.cwd(), "runs", id);
+    const dirs = readdirSync(base)
+      .map((d) => ({ d, m: statSync(join(base, d)).mtimeMs }))
+      .sort((a, b) => b.m - a.m);
+    for (const { d } of dirs) {
+      try {
+        const dir = join(base, d);
+        if (existsSync(join(dir, "result.json"))) return undefined; // był PR — nic do reużycia
+        const approval = JSON.parse(readFileSync(join(dir, "approval.json"), "utf8")) as { approved?: boolean };
+        if (!approval.approved) continue;
+        const raw = readFileSync(join(dir, "plan.md"), "utf8");
+        const body = raw.split(/^---\s*$/m).slice(2).join("---").trim() || raw;
+        if (/^[`*\s]*PLAN:\s*OK\b/m.test(body)) return body;
+      } catch { /* katalog bez kompletu artefaktów — próbujemy starszy */ }
+    }
+  } catch { /* brak katalogu runs — brak reuse */ }
+  return undefined;
+}
+
+/** resume-async dowolnego kroku (clarify-ticket / approve-plan) — 504-odporny fire-and-forget. */
+function fireResumeStep(runId: string, step: string | string[], resumeData: Record<string, unknown>) {
+  fetch(`${FACTORY_API}/workflows/${WORKFLOW}/resume-async?runId=${runId}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ step, resumeData }),
+  }).catch(() => {});
 }
 
 // --- prod smoke po merge (QA runda 2) -------------------------------------
