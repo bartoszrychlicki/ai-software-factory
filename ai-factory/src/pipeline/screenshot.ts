@@ -1,11 +1,43 @@
 import { spawn } from "node:child_process";
 
+// Dwa równoległe tickety tego samego projektu zwykle używają tego samego
+// preview URL/portu. Bez kolejki drugi `vite preview --strictPort` kończył się,
+// a jego waitForUrl mógł uznać serwer PIERWSZEGO ticketu za własny i zapisać
+// screenshot obcej gałęzi. Kolejka jest per URL, więc różne projekty/porty nadal
+// mogą robić podglądy równolegle.
+const previewQueues = new Map<string, Promise<void>>();
+
+/** Wyłączność na preview URL; eksportowana, żeby regresję współbieżności dało się testować bez przeglądarki. */
+export async function withPreviewLock<T>(key: string, task: () => Promise<T>): Promise<T> {
+  const previous = previewQueues.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const tail = previous.then(() => gate);
+  previewQueues.set(key, tail);
+
+  await previous;
+  try {
+    return await task();
+  } finally {
+    release();
+    if (previewQueues.get(key) === tail) previewQueues.delete(key);
+  }
+}
+
 /**
  * Podgląd wyniku: stawia serwer projektu (np. vite preview) w katalogu checkoutu,
  * czeka aż URL odpowie, robi pełnostronicowy screenshot i ubija serwer.
  * Zwraca PNG albo undefined — screenshot jest doradczy i NIGDY nie wywala pipeline'u.
  */
 export async function takeScreenshot(
+  cwd: string,
+  config: { start: string; url: string },
+  cleanEnv: NodeJS.ProcessEnv
+): Promise<Buffer | undefined> {
+  return withPreviewLock(config.url, () => takeScreenshotUnlocked(cwd, config, cleanEnv));
+}
+
+async function takeScreenshotUnlocked(
   cwd: string,
   config: { start: string; url: string },
   cleanEnv: NodeJS.ProcessEnv
