@@ -31,6 +31,11 @@ test("deterministyczny harness prowadzi ticket przez plan, human gate, build, ve
       "#!/bin/sh",
       "if [ \"$1 $2\" = \"pr create\" ]; then",
       "  echo https://github.test/factory/pilot/pull/1",
+      "elif [ \"$1 $2\" = \"pr view\" ] && echo \"$*\" | grep -q 'headRefOid,statusCheckRollup'; then",
+      "  sha=$(git rev-parse HEAD)",
+      "  printf '{\"headRefOid\":\"%s\",\"statusCheckRollup\":[{\"name\":\"quality\",\"status\":\"COMPLETED\",\"conclusion\":\"SUCCESS\",\"workflowName\":\"CI\"}]}\\n' \"$sha\"",
+      "elif [ \"$1 $2\" = \"pr view\" ]; then",
+      "  echo https://github.test/factory/pilot/pull/1",
       "fi",
       "exit 0",
     ].join("\n"));
@@ -44,6 +49,9 @@ test("deterministyczny harness prowadzi ticket przez plan, human gate, build, ve
       "  default_branch: main",
       "  checks:",
       "    - test -f feature.txt",
+      "  ci:",
+      "    requiredChecks:",
+      "      - quality",
     ].join("\n"));
     writeFileSync(join(root, "routing.yaml"), [
       "defaults:",
@@ -64,6 +72,8 @@ test("deterministyczny harness prowadzi ticket przez plan, human gate, build, ve
       import("@mastra/libsql"),
       import("../mastra/workflow-persistence-patch"),
     ]);
+    let reviewCalls = 0;
+    let verifyCalls = 0;
     engines.fake = {
       name: "fake",
       async run(input) {
@@ -76,13 +86,21 @@ test("deterministyczny harness prowadzi ticket przez plan, human gate, build, ve
           };
         }
         if (input.role === "build") {
-          writeFileSync(join(input.workspace, "feature.txt"), "implemented by deterministic harness\n");
+          const feature = join(input.workspace, "feature.txt");
+          const content = input.context.includes("Uwagi z code review")
+            ? "implemented by deterministic harness\nreview fix verified\n"
+            : "implemented by deterministic harness\n";
+          writeFileSync(feature, content);
           return { ok: true, report: "Zapisano feature.txt" };
         }
         if (input.role === "verify") {
+          verifyCalls += 1;
           return { ok: true, report: "Kryteria spełnione\n\n```factory\n{\"verdict\":\"pass\"}\n```" };
         }
-        return { ok: true, report: "Kod czytelny\n\n```factory\n{\"verdict\":\"lgtm\"}\n```" };
+        reviewCalls += 1;
+        return reviewCalls === 1
+          ? { ok: true, report: "- Brakuje jawnego potwierdzenia finalnego SHA po poprawce\n\n```factory\n{\"verdict\":\"fix\"}\n```" }
+          : { ok: true, report: "Kod czytelny\n\n```factory\n{\"verdict\":\"lgtm\"}\n```" };
       },
     };
 
@@ -110,6 +128,9 @@ test("deterministyczny harness prowadzi ticket przez plan, human gate, build, ve
     });
     assert.equal(completed.status, "success");
     assert.equal(completed.result?.reviewVerdict, "lgtm");
+    assert.equal(completed.result?.verifiedSha, completed.result?.sha);
+    assert.equal(verifyCalls, 2, "review-fix wymaga drugiego acceptance verify dla nowego SHA");
+    assert.equal(reviewCalls, 2);
     assert.equal(completed.result?.prUrl, "https://github.test/factory/pilot/pull/1");
     assert.equal(readFileSync(join(repo, "README.md"), "utf8"), "# Harness\n");
     assert.match(

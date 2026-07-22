@@ -8,6 +8,10 @@ pilot-app:
     - npm ci
     - npm run build
     - npm test
+  ci:
+    requiredChecks:
+      - quality
+    timeoutMinutes: 20
   screenshot:
     start: npx vite preview --port 4173 --strictPort
     url: http://localhost:4173/
@@ -22,6 +26,10 @@ br-budget:
     - npm run lint
     - npm run build
     - npm run test
+  ci:
+    requiredChecks:
+      - quality
+    timeoutMinutes: 30
   # bez screenshot: next dev/start wymaga env i bazy — do włączenia świadomie później
   # premium modele (fable/opus/sol@xhigh): pełny cykl kosztuje ~$5-6 ekwiwalentu — default $3 ubił BAR-92 po zielonym buildzie
   budget:

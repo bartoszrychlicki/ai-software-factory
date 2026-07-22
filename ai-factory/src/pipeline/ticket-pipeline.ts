@@ -15,6 +15,8 @@ import { recordMetric } from "./metrics";
 import { budgetExceeded } from "./budget";
 import { parsePlanVerdict, parseVerifyVerdict, parseReviewVerdict, verdictInstruction, MISSING_VERDICT } from "./verdicts";
 import { allQualityCommands, cleanExecutionEnv, fullBranchDiff, QualityGateError, runQualityCommands } from "./quality";
+import { changedFilesInWorkspace, undeclaredChangedFiles } from "./scope";
+import { waitForGithubChecks } from "./github-ci";
 
 const exec = promisify(execFile);
 
@@ -26,6 +28,10 @@ const ticketSchema = z.object({
   repoPath: z.string(),
   github: z.string().optional(),
   checks: z.array(z.string()).optional(),
+  githubCi: z.object({
+    requiredChecks: z.array(z.string()).min(1),
+    timeoutMinutes: z.number().positive(),
+  }).optional(),
   screenshot: z.object({ start: z.string(), url: z.string() }).optional(),
   e2e: z.string().optional(), // komenda QA rundy 1 (uruchamiana w verify na świeżym checkoutcie)
   labels: z.array(z.string()).optional(), // m.in. override engine:*
@@ -62,6 +68,8 @@ const cycleSchema = z.object({
   branch: z.string(),
   workspaceDir: z.string(),
   sha: z.string(),
+  /** Dokładny SHA, który przeszedł pełne checks/e2e i acceptance verification. */
+  verifiedSha: z.string(),
   changedFiles: z.array(z.string()),
   buildReport: z.string(),
   verifyReport: z.string(),
@@ -107,6 +115,9 @@ const intakeStep = createStep({
       repoPath: project.repo,
       github: project.github,
       checks: project.checks,
+      githubCi: project.ci
+        ? { requiredChecks: project.ci.requiredChecks, timeoutMinutes: project.ci.timeoutMinutes ?? 20 }
+        : undefined,
       screenshot: project.screenshot,
       e2e: project.qa?.e2e,
       labels: inputData.labels,
@@ -254,21 +265,18 @@ const finalizePlanStep = createStep({
   inputSchema: planCycleSchema,
   outputSchema: planOutputSchema,
   execute: async ({ inputData }) => {
-    // plan-reuse: treść była już zatwierdzona przez człowieka. Stare plany (sprzed
-    // kontraktu ```factory) nie mają bloku — ponowne sądzenie ich werdyktem zablokowałoby
-    // ticket, którego plan jest ważny. Bramka dotyczy planów ŚWIEŻO wygenerowanych.
-    if (!inputData.ticket.reusePlan) {
-      const planVerdict = parsePlanVerdict(inputData.plan);
-      if (!planVerdict.ok) {
-        const detail =
-          planVerdict.source === "missing"
-            ? `${MISSING_VERDICT}\n\n${inputData.plan.slice(0, 2000)}`
+    const planVerdict = parsePlanVerdict(inputData.plan);
+    if (!planVerdict.ok || !planVerdict.files.length) {
+      const detail =
+        planVerdict.source === "missing"
+          ? `${MISSING_VERDICT}\n\n${inputData.plan.slice(0, 2000)}`
+          : !planVerdict.files.length
+            ? `Plan nie deklaruje żadnych plików w polu factory.files.\n\n${inputData.plan.slice(0, 2000)}`
             : (planVerdict.questions ?? inputData.plan.slice(0, 2000));
-        throw new Error(
-          `BLOCKED: plan bez werdyktu ok${inputData.clarifyRound > 0 ? ` po ${inputData.clarifyRound} rundach dopytywania` : ""}. ` +
-            `Uzupełnij ticket i przenieś go na Todo, żeby fabryka spróbowała ponownie.\n\n${detail}`
-        );
-      }
+      throw new Error(
+        `BLOCKED: plan bez kompletnego kontraktu factory${inputData.clarifyRound > 0 ? ` po ${inputData.clarifyRound} rundach dopytywania` : ""}. ` +
+          `Uzupełnij ticket i przenieś go na Todo, żeby fabryka spróbowała ponownie.\n\n${detail}`
+      );
     }
     return { ticket: inputData.ticket, plan: inputData.plan, planCostUsd: inputData.planCostUsd };
   },
@@ -328,6 +336,7 @@ const initCycleStep = createStep({
     branch: "",
     workspaceDir: "",
     sha: "",
+    verifiedSha: "",
     changedFiles: [],
     buildReport: "",
     verifyReport: "",
@@ -395,8 +404,7 @@ const buildStep = createStep({
     }
 
     // dowód pracy: git status, nie deklaracja agenta
-    const { stdout: status } = await exec("git", ["-C", ws.dir, "status", "--porcelain"]);
-    const changedFiles = status.split("\n").filter(Boolean).map((l) => l.slice(3));
+    const changedFiles = await changedFilesInWorkspace(ws.dir);
     if (changedFiles.length === 0) {
       await buildMetric(false, "no-changes", result.costUsd);
       await saveBuild({ engine: route.spec, costUsd: result.costUsd, outcome: "no-changes" }, result.report);
@@ -405,6 +413,24 @@ const buildStep = createStep({
         attempt,
         verdict: "fail" as const,
         feedback: "Builder nie zmienił żadnego pliku mimo deklaracji ukończenia.",
+      };
+    }
+
+    const declaredFiles = parsePlanVerdict(plan).files;
+    const undeclared = undeclaredChangedFiles(declaredFiles, changedFiles);
+    if (undeclared.length) {
+      await buildMetric(false, "scope-violation", result.costUsd);
+      await saveBuild(
+        { engine: route.spec, costUsd: result.costUsd, outcome: "scope-violation", files: undeclared.join(", ") },
+        `${result.report}\n\nPliki spoza zatwierdzonego planu:\n${undeclared.map((file) => `- ${file}`).join("\n")}`
+      );
+      return {
+        ...inputData,
+        attempt,
+        verdict: "fail" as const,
+        feedback:
+          `Builder zmienił pliki spoza zatwierdzonego kontraktu: ${undeclared.join(", ")}. ` +
+          "Nie commituję zmian. Planner musi jawnie rozszerzyć zakres albo builder ma pozostać w zadeklarowanych plikach.",
       };
     }
 
@@ -426,6 +452,7 @@ const buildStep = createStep({
       branch: ws.branch,
       workspaceDir: ws.dir,
       sha: sha.trim(),
+      verifiedSha: "",
       changedFiles,
       buildReport: result.report,
     };
@@ -525,14 +552,11 @@ const verifyStep = createStep({
         }
       }
 
-      const checksSummary = checks.length
-        ? checkResults.join("\n")
-        : "- (brak checks w rejestrze projektu — tylko werdykt agenta)";
+      const checksSummary = checkResults.join("\n");
 
       // 2) Diff dla agenta-werdyktu
-      const { stdout: diff } = await exec("git", ["-C", co.dir, "show", sha], {
-        maxBuffer: 10 * 1024 * 1024,
-      });
+      const project = await getProject(ticket.project);
+      const diff = await fullBranchDiff(co.dir, project.default_branch ?? "main");
 
       // 3) Niezależny werdykt: osobny run, read-only, czysty katalog
       const overBudget = await budgetExceeded(ticket, runId);
@@ -559,7 +583,7 @@ const verifyStep = createStep({
           "# Plan",
           inputData.plan,
           "",
-          "# Diff (git show)",
+          "# Pełny diff brancha względem aktualnej bazy",
           diff.slice(0, 60_000),
           "",
           "# Checks projektu wykonane przez fabrykę na świeżym checkoutcie:",
@@ -609,7 +633,7 @@ const verifyStep = createStep({
         if (png) await saveArtifact(ticket.id, runId, "screenshot.png", png);
       }
 
-      return { ...inputData, verdict: "pass" as const, verifyReport: result.report };
+      return { ...inputData, verdict: "pass" as const, verifiedSha: sha, verifyReport: result.report };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       return {
@@ -622,6 +646,113 @@ const verifyStep = createStep({
     }
   },
 });
+
+type CycleState = z.infer<typeof cycleSchema>;
+
+/**
+ * Każdy SHA utworzony po pierwotnym verify (merge z mainem albo review-fix)
+ * ponownie przechodzi pełne checks/e2e i acceptance verification na czystym checkoutcie.
+ */
+async function reverifyExactSha(
+  inputData: CycleState,
+  runId: string,
+  reason: string
+): Promise<CycleState> {
+  if (inputData.sha === inputData.verifiedSha) return inputData;
+  const { ticket, sha } = inputData;
+  const co = await createCheckout(ticket.repoPath, sha, `${ticket.id}-final-${reason}`);
+  const artifactName = `verify-final-${reason}-${sha.slice(0, 8)}.md`;
+  try {
+    const cleanEnv = cleanExecutionEnv();
+    const commands = allQualityCommands(ticket);
+    await runQualityCommands(co.dir, commands, { env: cleanEnv, timeoutMs: 20 * 60_000 });
+    const checksSummary = commands.map((command) => `- \`${command}\` → OK`).join("\n");
+    const project = await getProject(ticket.project);
+    const diff = await fullBranchDiff(co.dir, project.default_branch ?? "main");
+    const overBudget = await budgetExceeded(ticket, runId);
+    if (overBudget) throw new Error(`budżet ticketu wyczerpany przed finalnym verify — ${overBudget}`);
+
+    const route = await resolveRoute("verify", ticket);
+    const startedAt = Date.now();
+    const result = await route.engine.run({
+      role: "verify",
+      model: route.model,
+      effort: route.effort,
+      instructions: [
+        "Jesteś niezależnym weryfikatorem finalnego SHA w fabryce software.",
+        `Powód ponownej weryfikacji: ${reason}.`,
+        "Oceń pełny diff aktualnego SHA względem main:",
+        "- każde kryterium akceptacji ticketu nadal ma pokrycie?",
+        "- poprawka lub merge nie zmieniły zachowania poza zakresem?",
+        "- checks i e2e dotyczą dokładnie tego SHA?",
+        verdictInstruction("verify"),
+        "Wątpliwość = FAIL.",
+      ].join("\n"),
+      context: [
+        `# Ticket ${ticket.id}: ${ticket.title}`,
+        ticket.description,
+        "",
+        "# Plan",
+        inputData.plan,
+        "",
+        `# Finalny SHA: ${sha}`,
+        diff.slice(0, 60_000),
+        "",
+        "# Checks na czystym checkoutcie",
+        checksSummary,
+      ].join("\n"),
+      workspace: co.dir,
+      budget: { minutes: 5 },
+    });
+    const verdict = result.ok ? parseVerifyVerdict(result.transcript ?? result.report) : undefined;
+    const pass = !!result.ok && !!verdict?.pass;
+    await recordMetric({
+      ticket: ticket.id,
+      runId,
+      stage: "verify",
+      engine: route.spec,
+      attempt: inputData.attempt,
+      ok: result.ok,
+      outcome: pass ? `final-pass:${reason}` : `final-fail:${reason}`,
+      costUsd: result.costUsd,
+      durationMs: Date.now() - startedAt,
+    });
+    await saveArtifact(
+      ticket.id,
+      runId,
+      artifactName,
+      artifactHeader({ step: "verify-final", reason, sha, engine: route.spec, outcome: pass ? "pass" : "fail" }) +
+        `${result.report}\n\n# Checks\n${checksSummary}`
+    );
+    if (!pass) {
+      const detail = !result.ok
+        ? `Verifier (${route.spec}) padł: ${result.report}`
+        : verdict?.source === "missing"
+          ? `${MISSING_VERDICT}\n\n${result.report}`
+          : result.report;
+      throw new Error(`Finalny SHA ${sha} nie przeszedł acceptance verification (${reason}):\n${detail}`);
+    }
+    return {
+      ...inputData,
+      verdict: "pass" as const,
+      verifiedSha: sha,
+      verifyReport: result.report,
+    };
+  } catch (err) {
+    if (!(err instanceof Error && err.message.includes("Finalny SHA"))) {
+      await saveArtifact(
+        ticket.id,
+        runId,
+        artifactName,
+        artifactHeader({ step: "verify-final", reason, sha, outcome: "infra-error" }) +
+          (err instanceof Error ? err.message : String(err))
+      ).catch(() => {});
+    }
+    throw err;
+  } finally {
+    await removeCheckout(ticket.repoPath, co.dir);
+  }
+}
 
 /** Zagnieżdżony cykl build→verify — jednostka pętli dountil. */
 const buildVerifyCycle = createWorkflow({
@@ -681,30 +812,34 @@ const publishStep = createStep({
         );
       }
 
-      // re-verify na scalonym drzewie: checks projektu + e2e (jeśli skonfigurowane)
-      const cleanEnv = cleanExecutionEnv();
       const t0mq = Date.now();
-      for (const cmd of [...(ticket.checks ?? []), ...(ticket.e2e ? [ticket.e2e] : [])]) {
-        try {
-          await runQualityCommands(workspaceDir, [cmd], { env: cleanEnv, timeoutMs: 20 * 60_000 });
-        } catch (err) {
-          const e = err instanceof QualityGateError ? err : new QualityGateError(cmd, String(err), 0, err);
-          const tail = e.outputTail.slice(-3000);
-          await recordMetric({ ticket: ticket.id, runId, stage: "merge-queue", ok: false, outcome: "recheck-fail", durationMs: Date.now() - t0mq });
-          await saveArtifact(ticket.id, runId, "merge-queue.md",
-            artifactHeader({ step: "merge-queue", outcome: "recheck-fail", check: cmd }) + tail);
-          throw new Error(
-            `BLOCKED: po scaleniu z ${def} check "${cmd}" nie przechodzi — konflikt semantyczny. ` +
-              `Nadaj label ponownie (reuse planu zbuduje na świeżym mainie).\n\n${tail}`
-          );
-        }
+      const { stdout: newSha } = await exec("git", ["-C", workspaceDir, "rev-parse", "HEAD"]);
+      inputData = { ...inputData, sha: newSha.trim(), verifiedSha: "" };
+      try {
+        inputData = await reverifyExactSha(inputData, runId, "merge-main");
+      } catch (err) {
+        await recordMetric({ ticket: ticket.id, runId, stage: "merge-queue", ok: false, outcome: "recheck-fail", durationMs: Date.now() - t0mq });
+        await saveArtifact(
+          ticket.id,
+          runId,
+          "merge-queue.md",
+          artifactHeader({ step: "merge-queue", outcome: "recheck-fail", behind: behind.trim() }) +
+            (err instanceof Error ? err.message : String(err))
+        );
+        throw new Error(`BLOCKED: scalony SHA nie przeszedł pełnej weryfikacji.\n${err instanceof Error ? err.message : err}`);
       }
       await recordMetric({ ticket: ticket.id, runId, stage: "merge-queue", ok: true, outcome: "rebased", durationMs: Date.now() - t0mq });
-      await saveArtifact(ticket.id, runId, "merge-queue.md",
-        artifactHeader({ step: "merge-queue", outcome: "rebased", behind: behind.trim() }) +
-        `Gałąź zaktualizowana o ${behind.trim()} commit(ów) z ${def}; checks na scalonym drzewie: OK.`);
-      const { stdout: newSha } = await exec("git", ["-C", workspaceDir, "rev-parse", "HEAD"]);
-      inputData = { ...inputData, sha: newSha.trim() };
+      await saveArtifact(
+        ticket.id,
+        runId,
+        "merge-queue.md",
+        artifactHeader({ step: "merge-queue", outcome: "rebased", behind: behind.trim(), sha: inputData.sha }) +
+          `Gałąź zaktualizowana o ${behind.trim()} commit(ów) z ${def}; checks, e2e i acceptance verify: OK.`
+      );
+    }
+
+    if (!inputData.verifiedSha || inputData.verifiedSha !== inputData.sha) {
+      throw new Error(`BLOCKED: publish odrzucony — SHA ${inputData.sha} nie ma zgodnego verifiedSha.`);
     }
 
     await exec("git", ["-C", workspaceDir, "push", "-u", "--force-with-lease", "origin", branch]);
@@ -754,6 +889,7 @@ const publishStep = createStep({
       prUrl,
       branch,
       sha: inputData.sha,
+      verifiedSha: inputData.verifiedSha,
       attempt: inputData.attempt,
       maxAttempts: inputData.maxAttempts,
       changedFiles: inputData.changedFiles,
@@ -761,6 +897,68 @@ const publishStep = createStep({
     }, null, 2));
     return { ...inputData, prUrl };
   },
+});
+
+async function runGithubCiGate(
+  inputData: z.infer<typeof publishOutputSchema>,
+  runId: string,
+  reason: string
+): Promise<z.infer<typeof publishOutputSchema>> {
+  const { ticket } = inputData;
+  if (!ticket.githubCi) throw new Error(`BLOCKED: projekt ${ticket.project} nie ma konfiguracji GitHub CI.`);
+  if (inputData.sha !== inputData.verifiedSha) {
+    throw new Error(`BLOCKED: GitHub CI nie może zatwierdzić niezweryfikowanego SHA ${inputData.sha}.`);
+  }
+  const startedAt = Date.now();
+  try {
+    const result = await waitForGithubChecks({
+      cwd: inputData.workspaceDir,
+      pr: inputData.prUrl,
+      expectedSha: inputData.sha,
+      requiredChecks: ticket.githubCi.requiredChecks,
+      timeoutMs: ticket.githubCi.timeoutMinutes * 60_000,
+    });
+    await recordMetric({
+      ticket: ticket.id,
+      runId,
+      stage: "github-ci",
+      ok: true,
+      outcome: `pass:${reason}`,
+      durationMs: Date.now() - startedAt,
+    });
+    await saveArtifact(
+      ticket.id,
+      runId,
+      `github-ci-${reason}-${inputData.sha.slice(0, 8)}.md`,
+      artifactHeader({ step: "github-ci", reason, sha: inputData.sha, outcome: "pass" }) + result.report
+    );
+    return inputData;
+  } catch (err) {
+    await recordMetric({
+      ticket: ticket.id,
+      runId,
+      stage: "github-ci",
+      ok: false,
+      outcome: `fail:${reason}`,
+      durationMs: Date.now() - startedAt,
+    });
+    await saveArtifact(
+      ticket.id,
+      runId,
+      `github-ci-${reason}-${inputData.sha.slice(0, 8)}.md`,
+      artifactHeader({ step: "github-ci", reason, sha: inputData.sha, outcome: "fail" }) +
+        (err instanceof Error ? err.message : String(err))
+    );
+    throw new Error(`BLOCKED: GitHub CI gate nie przeszedł dla ${inputData.sha}.\n${err instanceof Error ? err.message : err}`);
+  }
+}
+
+const githubCiStep = createStep({
+  id: "github-ci",
+  description: "GitHub CI: wymagane checks muszą przejść dla dokładnego PR head SHA",
+  inputSchema: publishOutputSchema,
+  outputSchema: publishOutputSchema,
+  execute: async ({ inputData, runId }) => runGithubCiGate(inputData, runId, "publish"),
 });
 
 /**
@@ -1034,12 +1232,29 @@ const remediateStep = createStep({
         return inputData; // następna runda zrecenzuje ten sam SHA — rundy i tak są policzalne
       }
 
-      const { stdout: status } = await exec("git", ["-C", workspaceDir, "status", "--porcelain"]);
-      const changed = status.split("\n").filter(Boolean).map((l) => l.slice(3));
+      const changed = await changedFilesInWorkspace(workspaceDir);
       if (changed.length === 0) {
         await fixMetric(false, "no-changes", result.costUsd);
         await saveFix({ engine: route.spec, costUsd: result.costUsd, outcome: "no-changes" }, result.report);
         return inputData;
+      }
+
+      const undeclared = undeclaredChangedFiles(parsePlanVerdict(inputData.plan).files, changed);
+      if (undeclared.length) {
+        await exec("git", ["-C", workspaceDir, "reset", "--hard", "HEAD"]);
+        await exec("git", ["-C", workspaceDir, "clean", "-fd"]);
+        await fixMetric(false, "scope-violation-reverted", result.costUsd);
+        await saveFix(
+          { engine: route.spec, costUsd: result.costUsd, outcome: "scope-violation-reverted", files: undeclared.join(", ") },
+          `${result.report}\n\nPliki spoza zatwierdzonego planu:\n${undeclared.map((file) => `- ${file}`).join("\n")}`
+        );
+        return {
+          ...inputData,
+          oscillation: true,
+          reviewSummary:
+            `${inputData.reviewSummary}\n\n⚠️ Poprawka review próbowała zmienić pliki spoza planu: ${undeclared.join(", ")}. ` +
+            "Zmiany wycofano; PR pozostaje draftem.",
+        };
       }
 
       await exec("git", ["-C", workspaceDir, "add", "-A"]);
@@ -1048,38 +1263,41 @@ const remediateStep = createStep({
       const { stdout: newShaRaw } = await exec("git", ["-C", workspaceDir, "rev-parse", "HEAD"]);
       const newSha = newShaRaw.trim();
 
-      // fail-closed na regresję: checks projektu na świeżym checkoutcie poprawki
-      const co = await createCheckout(ticket.repoPath, newSha, `${ticket.id}-fixcheck`);
-      const cleanEnv = cleanExecutionEnv();
+      let nextState: z.infer<typeof reviewCycleSchema> = {
+        ...inputData,
+        sha: newSha,
+        verifiedSha: "",
+        changedFiles: Array.from(new Set([...inputData.changedFiles, ...changed])),
+        reviewVerdict: "pending" as const,
+      };
       try {
-        await runQualityCommands(co.dir, allQualityCommands(ticket), { env: cleanEnv, timeoutMs: 20 * 60_000 });
+        nextState = { ...nextState, ...(await reverifyExactSha(nextState, runId, `review-fix-${round}`)) };
       } catch (err) {
-        const e = err instanceof QualityGateError ? err : new QualityGateError("quality", String(err), 0, err);
-        const tail = e.outputTail.slice(-3000);
-        await exec("git", ["-C", workspaceDir, "reset", "--hard", "HEAD~1"]); // poprawka psuje build → wycofujemy
-        await removeCheckout(ticket.repoPath, co.dir);
-        await fixMetric(false, "checks-fail-reverted", result.costUsd);
+        await exec("git", ["-C", workspaceDir, "reset", "--hard", "HEAD~1"]);
+        await fixMetric(false, "final-verify-fail-reverted", result.costUsd);
         await saveFix({ engine: route.spec, costUsd: result.costUsd, outcome: "checks-fail-reverted", sha: newSha },
-          `${e.message}\n\n${tail}`);
-        return inputData;
+          err instanceof Error ? err.message : String(err));
+        return {
+          ...inputData,
+          oscillation: true,
+          reviewSummary:
+            `${inputData.reviewSummary}\n\n⚠️ Poprawka review nie przeszła pełnego final-SHA gate i została wycofana:\n` +
+            (err instanceof Error ? err.message : String(err)),
+        };
       }
-      await removeCheckout(ticket.repoPath, co.dir);
 
       await exec("git", ["-C", workspaceDir, "push", "--force-with-lease", "origin", branch]);
+      nextState = await runGithubCiGate(nextState, runId, `review-fix-${round}`) as z.infer<typeof reviewCycleSchema>;
       await fixMetric(true, "pushed", result.costUsd);
       await saveFix(
         { engine: route.spec, costUsd: result.costUsd, outcome: "pushed", sha: newSha, files: changed.join(", ") },
         result.report
       );
-      return {
-        ...inputData,
-        sha: newSha,
-        changedFiles: Array.from(new Set([...inputData.changedFiles, ...changed])),
-        reviewVerdict: "pending" as const, // nowy SHA → potrzebna świeża recenzja
-      };
+      return nextState;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       await saveFix({ outcome: "infra-error" }, msg);
+      if (msg.startsWith("BLOCKED:")) throw err;
       return inputData;
     }
   },
@@ -1099,8 +1317,14 @@ const finalizeReviewStep = createStep({
   description: "Zamknięcie pętli review: LGTM → PR ready for review; nierozwiązane uwagi → zostaje draft z ⚠️",
   inputSchema: reviewCycleSchema,
   outputSchema: reviewCycleSchema,
-  execute: async ({ inputData }) => {
+  execute: async ({ inputData, runId }) => {
     if (inputData.reviewVerdict === "lgtm") {
+      if (!inputData.verifiedSha || inputData.sha !== inputData.verifiedSha) {
+        throw new Error(
+          `BLOCKED: PR nie może zostać oznaczony ready — sha=${inputData.sha}, verifiedSha=${inputData.verifiedSha || "brak"}.`
+        );
+      }
+      await runGithubCiGate(inputData, runId, "finalize");
       // czysta recenzja = koniec pracy maszyn; draft → ready, merge nadal ludzki
       await exec("gh", ["pr", "ready", inputData.branch], { cwd: inputData.workspaceDir });
     } else if (inputData.reviewVerdict === "fix") {
@@ -1141,6 +1365,7 @@ export const ticketPipeline = createWorkflow({
   )
   .then(assertVerifiedStep)
   .then(publishStep)
+  .then(githubCiStep)
   .then(initReviewCycleStep)
   .dountil(
     reviewFixCycle,

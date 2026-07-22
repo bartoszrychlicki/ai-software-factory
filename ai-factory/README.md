@@ -31,6 +31,8 @@ nie może być używany podczas aktywnego runu ticketu.
 - `src/sources/mastra-client.ts` — sprawdzany klient start/resume/cancel,
 - `src/pipeline/run-registry.ts` — trwały stan ticketu i outbox komend,
 - `src/pipeline/quality.ts` — wspólny runner checks/e2e i pełny diff brancha,
+- `src/pipeline/github-ci.ts` — gate wymaganych checks dla dokładnego PR head SHA,
+- `src/pipeline/scope.ts` — porównanie faktycznych zmian z kontraktem `plan.files`,
 - `projects.yaml` — repozytoria, limity, checks i prod smoke,
 - `routing.yaml` — routing ról do adapterów silników,
 - `runs/<ticket>/<run>/` — artefakty audytowe konkretnego przebiegu.
@@ -47,3 +49,8 @@ nie może być używany podczas aktywnego runu ticketu.
   `FACTORY_ALLOW_UNSANDBOXED_KIMI=1`.
 - Merge pozostaje decyzją człowieka. Fabryka publikuje draft PR, wykonuje review,
   re-verify po przesunięciu `main` i sprząta dopiero po merge/zamknięciu.
+- Każdy nowy SHA po synchronizacji z `main` lub poprawce review ponownie przechodzi
+  checks/e2e i acceptance verification. `PR ready` wymaga `sha === verifiedSha`
+  oraz zielonego GitHub CI dla tego samego SHA.
+- Projekt bez deterministycznych checks/required checks oraz zmiana pliku spoza
+  zatwierdzonego planu są blokowane fail-closed.

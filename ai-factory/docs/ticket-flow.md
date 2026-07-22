@@ -30,19 +30,29 @@ flowchart TD
     O -- "nie" --> P["Trwały outbox: RESUME approve-plan"]
 
     P --> Q["Builder w osobnym worktree"]
-    Q --> R["Commit fabryki"]
+    Q --> QA{"Actual changed files ⊆ plan.files?"}
+    QA -- "nie" --> Q
+    QA -- "tak" --> R["Commit fabryki"]
     R --> S["Świeży detached checkout"]
-    S --> T["Checks + e2e + niezależny verifier"]
+    S --> T["Checks + e2e + acceptance verifier<br/>verifiedSha = SHA"]
     T -- "FAIL, próba < 2" --> Q
     T -- "FAIL po limicie" --> X
-    T -- "PASS" --> U["Sync z origin/main + re-verify scalonego drzewa"]
+    T -- "PASS" --> U["Sync z origin/main"]
 
-    U -- "konflikt / czerwone checks" --> X
-    U -- "zielone" --> V["Push + draft PR"]
-    V --> W["Pełny diff PR: code review"]
-    W -- "FIX, runda < 3" --> Y["Builder poprawia + checks/e2e + push"]
-    Y --> W
-    W -- "LGTM" --> Z["PR ready for review"]
+    U -- "nowy SHA" --> UA["Pełne checks/e2e + acceptance verifier<br/>verifiedSha = nowy SHA"]
+    UA -- "FAIL / konflikt" --> X
+    U -- "SHA bez zmian" --> V["Push + draft PR"]
+    UA -- "PASS" --> V
+    V --> VB["GitHub CI dla dokładnego PR head SHA"]
+    VB -- "missing / pending / FAIL" --> VC["PR pozostaje draftem"]
+    VB -- "PASS" --> W["Pełny diff PR: code review"]
+    W -- "FIX, runda < 3" --> Y["Builder poprawia w zakresie plan.files"]
+    Y --> YA["Nowy SHA: pełne checks/e2e + acceptance verifier"]
+    YA -- "FAIL" --> VC
+    YA -- "PASS" --> YB["Push + GitHub CI dla nowego SHA"]
+    YB -- "FAIL" --> VC
+    YB -- "PASS" --> W
+    W -- "LGTM + sha = verifiedSha + CI PASS" --> Z["PR ready for review"]
     W -- "uwagi po limicie / review niedostępne" --> ZA["PR pozostaje draftem"]
 
     Z --> ZB{"Decyzja człowieka o PR"}
@@ -85,3 +95,8 @@ flowchart TD
    wyznaczane przez kod deterministyczny.
 6. Fabryka nie wykonuje automatycznego merge. Merge watcher obsługuje skutki
    decyzji człowieka i powtarza prod smoke po restarcie, jeśli nie został zapisany.
+7. Każda zmiana SHA unieważnia `verifiedSha`; publikacja i zdjęcie draftu wymagają
+   pełnych checks/e2e, acceptance verification oraz GitHub CI dla dokładnego head SHA.
+8. Projekt bez deterministycznych `checks` lub GitHub `ci.requiredChecks` jest
+   odrzucany przy intake. Zmiany buildera i remediation muszą mieścić się w
+   zatwierdzonym `factory.files`.
