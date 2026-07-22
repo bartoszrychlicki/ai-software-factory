@@ -72,6 +72,75 @@ export interface ReviewVerdict {
   source: VerdictSource;
 }
 
+interface ClarifyOption {
+  letter: string;
+  content: string;
+  recommended: boolean;
+}
+
+/**
+ * Normalizuje pytania plannera do Markdownu czytelnego w komentarzu Linear.
+ * Nieznany lub niepełny format zwraca bez zmian, żeby nie zgubić treści agenta.
+ */
+export function formatClarifyQuestions(raw: string): string {
+  const input = raw.trim();
+  if (!input) return "";
+
+  const questionMarkers = [...input.matchAll(/(^|\s)(\d+)[.)]\s+/g)].map((match) => ({
+    number: match[2],
+    start: (match.index ?? 0) + match[1].length,
+    contentStart: (match.index ?? 0) + match[0].length,
+  }));
+  if (!questionMarkers.length) return input;
+
+  const formattedQuestions: string[] = [];
+  for (const [index, marker] of questionMarkers.entries()) {
+    const end = questionMarkers[index + 1]?.start ?? input.length;
+    const block = input.slice(marker.contentStart, end).trim();
+    const optionMarkers = [...block.matchAll(/(^|\s)(?:[-*+]\s+)?([A-Z])\)\s*/gi)].map((match) => ({
+      letter: match[2].toUpperCase(),
+      start: (match.index ?? 0) + match[1].length,
+      contentStart: (match.index ?? 0) + match[0].length,
+    }));
+    const distinctLetters = new Set(optionMarkers.map((option) => option.letter));
+    if (
+      optionMarkers.length < 2 ||
+      distinctLetters.size < 2 ||
+      optionMarkers.some((option) => !["A", "B", "C"].includes(option.letter))
+    ) {
+      return input;
+    }
+
+    const question = block.slice(0, optionMarkers[0].start).trim().replace(/^\*\*([\s\S]+)\*\*$/, "$1").trim();
+    const options: ClarifyOption[] = optionMarkers.map((option, optionIndex) => {
+      const optionEnd = optionMarkers[optionIndex + 1]?.start ?? block.length;
+      const content = block.slice(option.contentStart, optionEnd).trim();
+      const recommended = /\(\s*REKOMENDACJA\s*\)/i.test(content);
+      return {
+        letter: option.letter,
+        content: content
+          .replace(/\(\s*REKOMENDACJA\s*\)/gi, "")
+          .trim()
+          .replace(/\s+[—-]\s*$/, "")
+          .trim(),
+        recommended,
+      };
+    });
+    if (!question || options.some((option) => !option.content)) return input;
+
+    formattedQuestions.push([
+      `${marker.number}. **${question}**`,
+      "",
+      ...options.map((option) =>
+        `- ${option.letter}) ${option.content}${option.recommended ? " — **REKOMENDACJA**" : ""}`
+      ),
+    ].join("\n"));
+  }
+
+  const preamble = input.slice(0, questionMarkers[0].start).trim();
+  return [preamble, ...formattedQuestions].filter(Boolean).join("\n\n");
+}
+
 /** Blok `​```factory {...}​``` z końca raportu — ostatni wygrywa. */
 function structuredBlock(report: string): Record<string, unknown> | undefined {
   const blocks = [...report.matchAll(/```factory\s*\n([\s\S]*?)```/g)];

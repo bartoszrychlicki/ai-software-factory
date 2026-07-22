@@ -13,7 +13,14 @@ import { saveArtifact, artifactHeader } from "./artifacts";
 import { takeScreenshot } from "./screenshot";
 import { recordMetric } from "./metrics";
 import { budgetExceeded } from "./budget";
-import { parsePlanVerdict, parseVerifyVerdict, parseReviewVerdict, verdictInstruction, MISSING_VERDICT } from "./verdicts";
+import {
+  formatClarifyQuestions,
+  parsePlanVerdict,
+  parseVerifyVerdict,
+  parseReviewVerdict,
+  verdictInstruction,
+  MISSING_VERDICT,
+} from "./verdicts";
 import { allQualityCommands, cleanExecutionEnv, fullBranchDiff, QualityGateError, runQualityCommands } from "./quality";
 import { changedFilesInWorkspace, undeclaredChangedFiles } from "./scope";
 import { waitForGithubChecks } from "./github-ci";
@@ -232,7 +239,7 @@ const clarifyGateStep = createStep({
   execute: async ({ inputData, resumeData, suspend, runId }) => {
     const verdict = parsePlanVerdict(inputData.plan);
     if (verdict.ok) return inputData;
-    const questions = verdict.questions;
+    const questions = verdict.questions ? formatClarifyQuestions(verdict.questions) : undefined;
     // BLOCKED bez pytań (np. ticket już zrealizowany) → finalize zablokuje twardo
     if (!questions || inputData.clarifyRound >= inputData.maxClarifyRounds) return inputData;
     if (!resumeData) {
@@ -272,7 +279,7 @@ const finalizePlanStep = createStep({
           ? `${MISSING_VERDICT}\n\n${inputData.plan.slice(0, 2000)}`
           : !planVerdict.files.length
             ? `Plan nie deklaruje żadnych plików w polu factory.files.\n\n${inputData.plan.slice(0, 2000)}`
-            : (planVerdict.questions ?? inputData.plan.slice(0, 2000));
+            : (planVerdict.questions ? formatClarifyQuestions(planVerdict.questions) : inputData.plan.slice(0, 2000));
       throw new Error(
         `BLOCKED: plan bez kompletnego kontraktu factory${inputData.clarifyRound > 0 ? ` po ${inputData.clarifyRound} rundach dopytywania` : ""}. ` +
           `Uzupełnij ticket i przenieś go na Todo, żeby fabryka spróbowała ponownie.\n\n${detail}`
