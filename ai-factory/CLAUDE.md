@@ -49,7 +49,20 @@ Fabryka software: ticket → intake → plan (+gate niejasności) → human gate
 - **Kalibracja pod premium modele (fable/opus/sol@xhigh)**: budżety kroków plan 12 min / build 25 min; budżet ticketu br-budget $8/60min (plan ~$1-2.3 + build ~$1.7+); pełny cykl ~$5-6 ekwiwalentu — godzinowy limit breakera $10/h łatwo przebić przy retry (nocna zmiana 2026-07-21 przebiła po 5 runach).
 - Nieudany/przerwany run zostawia w repo pilotowym gałąź `agent/<ticket>-…` i worktree'y — kolejny run tego samego ticketu pada na `branch already exists`. Sprzątanie: `git worktree prune`, `rm -rf` martwego katalogu verify, `git branch -D`. (Docelowo: idempotentne workspace.ts — patrz backlog.)
 
-## Stan na 2026-07-21 rano (po nocnej zmianie)
+## Stan na 2026-07-22 (po nocnej zmianie #2 — 20 ticketów autonomicznie)
+
+**18/20 ticketów doprowadzonych do Done** (zmergowane + final check: build OK, 42/42 testów), 2 zamknięte świadomą decyzją (BAR-107 Canceled — poprawny BLOCKED „już zaimplementowane"; BAR-112 Duplicate). Koszt: **$30.76** ekwiwalentu, 166 wywołań silników, ~4 h. pilot-app urósł z gołego licznika do PWA (tryb ciemny, persystencja, statystyki sesji, skróty klawiszowe, schowek, logo, changelog, README).
+
+**Wdrożone tej nocy poprawki fabryki:** unicode-safe regexy decyzji (`odrzuć`/`akceptuję` NIGDY nie działały — `\b` po ć/ę), kotwica runId w komentarzu claim (adopcja runów reuse), reuse jako domyślny + hash opisu unieważniający, `result.json` nie blokuje reuse, merge-watcher skanuje stany procesu (inaczej nie widzi merge'y przy `statuses: extended`), BLOCKED z bramki planu nie nabija serii breakera, twarde timeouty fetch/gh, stany procesu w Linear + aprobata przeciągnięciem.
+
+**Otwarte problemy (priorytet):**
+1. **Brak merge-queue** — fabryka odgałęzia od maina i nie aktualizuje przed publish; przy 4+ równoległych ticketach 6 PR-ów wpadło w konflikt (5, 8, 10, 16, 25, 28). Fix: przed publish `merge origin/main` + ponowne checks; konflikt → feedback do buildera.
+2. **Konflikt semantyczny** — BAR-106 (animacja) + BAR-111 (persystencja) zielone osobno, po scaleniu 2 testy padły (stub bez classList). Fix: pre-merge re-verify na scalonym drzewie.
+3. **Pętla review oscyluje** — BAR-110: runda 2 wprowadziła `resolveTheme.toString()`, runda 3 to cofnęła i zgłosiła jako uwagę. Fix: recenzent dostaje poprzednie werdykty + zakaz cofania zaakceptowanych zmian.
+4. **`claude -p` gubi treść z wiadomości pośrednich** — pytania clarify utknęły 2× (BAR-108, BAR-121 działało). Fix: wymusić komplet w finalnej wiadomości + rozpoznawanie pytań po strukturze (A)/B)/REKOMENDACJA), nie po nagłówku.
+5. Stany procesu nadpisują ręczne decyzje człowieka (Duplicate → 🚦). Fix: nie nadpisywać stanów końcowych.
+
+## Stan wcześniejszy (2026-07-21 rano)
 
 **br-budget w pełni operacyjny na premium modelach.** Nocna zmiana (opiekun: Claude, delegacja Bartosza na aprobaty planów): BAR-92 → [PR #75](https://github.com/bartoszrychlicki/br-budget/pull/75) (glass pills w headerze landingu; Opus builder, verify odrzucił próbę 1, LGTM runda 1), BAR-91 → [PR #76](https://github.com/bartoszrychlicki/br-budget/pull/76) (model wniosków „co się zmieniło" + analiza prod z Fazy 0; Sol builder ~18 min/próba, 2 próby verify, 1 runda fix, LGTM; $6.91 w budżecie $8). Oba ready for review — **czekają na merge Bartosza** razem z PR #4–#8 pilot-app. Koszt nocy ~$15 ekwiwalentu; wszystkie 4 porażki po drodze = kalibracja infry pod premium modele (budżety, PATH, E2BIG), wnioski w Pułapkach. Bezpiecznik godzinowy $10/h zadziałał raz — poprawnie.
 
