@@ -32,6 +32,7 @@ import { breakerOpen, recordRunOutcome, checkHourlySpend } from "../pipeline/bre
 import { notify } from "../pipeline/notify";
 import { runProdChecks } from "../pipeline/prod-smoke";
 import * as registry from "../pipeline/run-registry";
+import { LINEAR_STATE_MAP as MAP, phaseOfState, decisionOfState } from "./state-map";
 
 const exec = promisify(execFile);
 
@@ -70,26 +71,22 @@ const limitLogged = new Set<string>(); // log limitu równoległości raz na pro
 const marker = (id: string) => `[linear:${id}:v1]`;
 
 /** Fabryka jako jedyny autor stanów procesu (projekty z statuses: extended w projects.yaml). */
-const PHASE_BY_STATE: Record<string, registry.FactoryPhase> = {
-  "🧠 Planowanie": "planning",
-  "❓ Pytania do autora": "questions",
-  "🚦 Plan do akceptacji": "plan-approval",
-  "🔨 Build": "build",
-  "🧪 Weryfikacja": "verify",
-  "👀 Code review": "review",
-  "✅ PR do merge": "pr-ready",
-};
-
-async function setPhase(project: string, src: LinearSource, id: string, stateName: string, runId?: string): Promise<void> {
+/** Ustawia fazę fabryki. Nigdy nie nadpisuje stanów końcowych (BAR-127). */
+async function setPhase(project: string, src: LinearSource, id: string, phase: registry.FactoryPhase, runId?: string): Promise<void> {
   try {
-    const phase = PHASE_BY_STATE[stateName];
+    const stateName = MAP.phases[phase];
     const rid = runId ?? registry.readState(id)?.runId;
-    if (phase && rid) registry.recordPhase(id, { project, runId: rid }, phase, stateName);
+    if (rid) registry.recordPhase(id, { project, runId: rid }, phase, stateName);
     const cfg = await getProject(project);
     if (cfg.statuses !== "extended") return;
+    const current = await src.getStateName(id).catch(() => undefined);
+    if (current && MAP.terminal.includes(current)) {
+      console.log(`[${id}] pomijam fazę ${phase} — ticket w stanie końcowym (${current})`);
+      return;
+    }
     await src.setStateByName(id, stateName);
   } catch (err) {
-    console.error(`[${id}] setPhase(${stateName}) nieudane:`, err instanceof Error ? err.message : err);
+    console.error(`[${id}] setPhase(${phase}) nieudane:`, err instanceof Error ? err.message : err);
   }
 }
 
@@ -195,7 +192,7 @@ async function handleTicket(
       planMode: labels.find((l) => l.startsWith("plan:"))?.slice(5),
     };
   });
-  await setPhase(project, src, id, reusePlan ? "🔨 Build" : "🧠 Planowanie");
+  await setPhase(project, src, id, reusePlan ? "build" : "planning", runId);
   await src.comment(id, `🧾 run \`${runId}\` ${marker(id)}`).catch(() => {}); // kotwica adopcji (kluczowa dla reuse — nie ma komentarza z planem)
   fireStart(runId, { id, title, description, project, labels, reusePlan });
   console.log(`[${id}] run ${runId} wystartowany`);
@@ -250,7 +247,7 @@ async function watchRun(
           );
           planCommentedAt = new Date().toISOString(); // dopiero PO udanym komentarzu — inaczej czkawka API gubi plan na zawsze (BAR-104)
           registry.openGateRecord(id, { project, runId }, "plan-approval", 0, "🚦 Plan do akceptacji");
-          await setPhase(project, src, id, "🚦 Plan do akceptacji", runId);
+          await setPhase(project, src, id, "plan-approval", runId);
           console.log(`[${id}] plan czeka na decyzję w Linear`);
           notify(`⏳ ${id}: plan do akceptacji`, "Odpowiedz `zatwierdzam` / `odrzuć: powód` w Linear.").catch(() => {});
         } catch (err) {
@@ -260,8 +257,11 @@ async function watchRun(
         let decision = await readDecision(src, id, planCommentedAt);
         // aprobata przez PRZECIĄGNIĘCIE karty: 🚦 Plan do akceptacji → 🔨 Build (bezargumentowa, więc status wystarcza)
         if (!decision) {
+          // DETERMINISTYCZNY sygnał: przejście stanu wg mapy decyzji (bez regexów na tekście)
           const state = await src.getStateName(id).catch(() => undefined);
-          if (state === "🔨 Build") decision = { approved: true };
+          const kind = state ? decisionOfState(MAP, "plan-approval", state) : undefined;
+          if (kind === "approve") decision = { approved: true };
+          else if (kind === "reject") decision = { approved: false, feedback: "odrzucone przeniesieniem karty" };
         }
         if (decision) {
           decisionSent = true;
@@ -278,7 +278,7 @@ async function watchRun(
           // natychmiastowe domknięcie pętli zwrotnej — bez tego wygląda, jakby system nie chwycił decyzji
           if (decision.approved) {
             await src.comment(id, `🔨 Aprobata przyjęta ${marker(id)} — build ruszył. Kolejne kroki: verify (checks+testy+e2e) → PR.`).catch(() => {});
-            await setPhase(project, src, id, "🔨 Build");
+            await setPhase(project, src, id, "build", runId);
             notify(`🔨 ${id}: build ruszył`, "Aprobata planu przyjęta.").catch(() => {});
           } else {
             await src.comment(id, `↩️ Odrzucenie przyjęte ${marker(id)} — run zostanie zakończony, powód trafi do raportu.`).catch(() => {});
@@ -305,7 +305,7 @@ async function watchRun(
         await src.setStatus(id, "human_review");
         registry.updateState(id, { project, runId }, (st) => { st.prUrl = prUrl; });
         registry.finalize(id, { project, runId }, "success");
-        await setPhase(project, src, id, "✅ PR do merge", runId);
+        await setPhase(project, src, id, "pr-ready", runId);
         await recordRunOutcome(true).catch(() => {});
         notify(`✅ ${id}: PR gotowy`, `${prUrl}${verdict === "lgtm" ? " (ready for review)" : " (draft)"}`).catch(() => {});
         console.log(`[${id}] SUKCES → ${prUrl}`);
@@ -347,7 +347,7 @@ async function watchRun(
           `${blocked ? "🛑 BLOCKED" : "❌ Run nieudany (auto-retry wyczerpany)"} ${marker(id)}\n\n${clip(msg, 6000)}\n\n` +
             `Uzupełnij ticket i nadaj ponownie label \`agent:ready\`, żeby fabryka spróbowała jeszcze raz.`
         );
-        await src.setStatus(id, blocked ? "needs_clarification" : "blocked");
+        await setPhase(project, src, id, "blocked", runId);
         registry.finalize(id, { project, runId }, /odrzucony przez człowieka/i.test(msg) ? "rejected" : blocked ? "blocked" : "failed");
         notify(`🛑 ${id}: ${blocked ? "BLOCKED — pytania w tickecie" : "run nieudany"}`, clip(msg, 180)).catch(() => {});
         console.log(`[${id}] FAILED${blocked ? " (BLOCKED)" : ""}`);
@@ -542,14 +542,14 @@ async function notifyPhaseMilestones(project: string, src: LinearSource, id: str
       msg = outcome === "committed"
         ? [`🧱 ${id}: build gotowy (próba ${build[1]})`, "Verify startuje: checks + testy + e2e."]
         : [`⚠️ ${id}: build nieudany (próba ${build[1]})`, `Wynik: ${outcome || "?"} — pętla decyduje o retry.`];
-      if (outcome === "committed") await setPhase(project, src, id, "🧪 Weryfikacja");
+      if (outcome === "committed") await setPhase(project, src, id, "verify");
     } else if (verify) {
       const outcome = artifactField(p, "outcome");
       msg = outcome === "pass"
         ? [`🧪 ${id}: verify PASS (próba ${verify[1]})`, "Publikacja PR i code review."]
         : [`🧪 ${id}: verify FAIL (próba ${verify[1]})`, `Wynik: ${outcome || "fail"} — feedback wraca do buildera.`];
-      if (outcome === "pass") await setPhase(project, src, id, "👀 Code review");
-      else await setPhase(project, src, id, "🔨 Build");
+      if (outcome === "pass") await setPhase(project, src, id, "review");
+      else await setPhase(project, src, id, "build");
     } else if (review) {
       const verdict = artifactField(p, "verdict");
       msg = verdict === "lgtm"
@@ -610,7 +610,7 @@ async function handleClarifySuspend(
         `Odpowiedz krótko w komentarzu (np. \`1A, 2C\` albo własnymi słowami) — doplanuję bez ponownego labelowania.\n\n---\n\n${qBody}`
     ).catch(() => {});
     registry.openGateRecord(id, { project, runId }, "clarify", qMax, "❓ Pytania do autora");
-    await setPhase(project, src, id, "❓ Pytania do autora", runId);
+    await setPhase(project, src, id, "questions", runId);
     notify(`❓ ${id}: pytania do ticketu (runda ${qMax})`, "Odpowiedz w komentarzu — fabryka doplanuje.").catch(() => {});
     console.log(`[${id}] pytania rundy ${qMax} czekają na odpowiedź`);
     return true;
@@ -637,7 +637,7 @@ async function handleClarifySuspend(
     fireResumeStep(runId, "clarify-ticket", { answers: answer });
     registry.markDecisionStep(id, { project, runId }, "clarify", qMax, "resumeSentAt");
     await src.comment(id, `🧠 Odpowiedzi przyjęte ${marker(id)} — doplanowuję (runda ${qMax}).`).catch(() => {});
-    await setPhase(project, src, id, "🧠 Planowanie");
+    await setPhase(project, src, id, "planning", runId);
     notify(`🧠 ${id}: odpowiedzi przyjęte`, `Doplanowanie (runda ${qMax}).`).catch(() => {});
     console.log(`[${id}] odpowiedzi rundy ${qMax} → resume clarify`);
   }
