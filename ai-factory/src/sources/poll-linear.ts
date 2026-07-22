@@ -159,7 +159,7 @@ async function main() {
               free -= 1;
               active.add(t.id);
               // fire-and-forget: każdy ticket żyje własnym cyklem, pętla polluje dalej
-              handleTicket(project, src, t.id, t.title, t.description, t.labels).catch((err) => {
+              handleTicket(project, src, t.id, t.title, t.description, t.labels, t.url).catch((err) => {
                 console.error(`[${t.id}] nieobsłużony błąd:`, err);
                 active.delete(t.id);
               });
@@ -188,7 +188,8 @@ async function handleTicket(
   id: string,
   title: string,
   description: string,
-  labels: string[]
+  labels: string[],
+  url?: string
 ) {
   console.log(`[${id}] claim (${project}): ${title}`);
   const reusePlan = await findReusablePlan(src, id, description);
@@ -202,6 +203,7 @@ async function handleTicket(
       engine: labels.find((l) => l.startsWith("engine:"))?.slice(7),
       domain: labels.find((l) => l.startsWith("domain:"))?.slice(7),
       planMode: labels.find((l) => l.startsWith("plan:"))?.slice(5),
+      url,
     };
   });
   if (!initialized) {
@@ -221,7 +223,7 @@ async function handleTicket(
     ? `🤖 ai-factory przyjęła ticket ${marker(id)}. ♻️ Reużywam zatwierdzonego planu z poprzedniego runu (porażka infra/budżet) — build startuje od razu, bez bramki.`
     : `🤖 ai-factory przyjęła ticket ${marker(id)}. Planner startuje.`
   ).catch((err) => console.error(`[${id}] komentarz claimu nieudany:`, err instanceof Error ? err.message : err));
-  notify(`🤖 ${id}: ticket przyjęty`, reusePlan ? "♻️ Reuse zatwierdzonego planu — build od razu." : `Planner startuje (${project}). Plan przyjdzie do akceptacji.`).catch(() => {});
+  notify(`🤖 ${id}: ticket przyjęty`, reusePlan ? "♻️ Reuse zatwierdzonego planu — build od razu." : `Planner startuje (${project}). Plan przyjdzie do akceptacji.`, url).catch(() => {});
   await setPhase(project, src, id, reusePlan ? "build" : "planning", runId);
   await src.comment(id, `🧾 run \`${runId}\` ${marker(id)}`).catch(() => {}); // kotwica adopcji (kluczowa dla reuse — nie ma komentarza z planem)
   await dispatchPendingOutbox(mastraClient, id, { project, runId });
@@ -246,6 +248,7 @@ async function watchRun(
   let decisionSent = decisionSentInit;
   let hintSent = false;
   let collisionNotified = false; // BAR-141: „czekam na pliki" mówimy raz, nie co tick
+  const ticketUrl = registry.readState(id)?.manifest?.url;
   const deadline = Date.now() + RUN_WATCH_MAX_MS;
 
   // fazy śledzimy po ARTEFAKTACH (snapshot Mastry po resume jest stale — bug guarda, patrz CLAUDE.md);
@@ -258,7 +261,7 @@ async function watchRun(
   try {
     while (Date.now() < deadline) {
       await sleep(RUN_WATCH_INTERVAL_MS);
-      await notifyPhaseMilestones(project, src, id, runDir, seenArtifacts);
+      await notifyPhaseMilestones(project, src, id, runDir, seenArtifacts, ticketUrl);
 
       // Stan końcowy ustawiony przez człowieka jest nadrzędny. Bez tego Canceled
       // zatrzymywał tylko kartę, a kosztowny builder/reviewer pracował dalej.
@@ -282,7 +285,7 @@ async function watchRun(
       const status = runStatus(run);
 
       // tryb dopytywania: suspend na clarify-ticket obsługujemy PRZED przepływem aprobaty
-      if (status === "suspended" && await handleClarifySuspend(project, src, id, runId, runDir, run, answeredRounds, hintedRounds)) {
+      if (status === "suspended" && await handleClarifySuspend(project, src, id, runId, runDir, run, answeredRounds, hintedRounds, ticketUrl)) {
         continue;
       }
 
@@ -300,7 +303,7 @@ async function watchRun(
           registry.openGateRecord(id, { project, runId }, "plan-approval", 0, "🚦 Plan do akceptacji");
           await setPhase(project, src, id, "plan-approval", runId);
           console.log(`[${id}] plan czeka na decyzję w Linear`);
-          notify(`⏳ ${id}: plan do akceptacji`, `Przeciągnij kartę na „${MAP.phases.build}" albo napisz /approve.`).catch(() => {});
+          notify(`⏳ ${id}: plan do akceptacji`, `Przeciągnij kartę na „${MAP.phases.build}" albo napisz /approve.`, ticketUrl).catch(() => {});
         } catch (err) {
           console.error(`[${id}] komentarz z planem nieudany (retry w następnym ticku):`, err instanceof Error ? err.message : err);
         }
@@ -366,7 +369,7 @@ async function watchRun(
           if (decision.approved) {
             await src.comment(id, `🔨 Aprobata przyjęta ${marker(id)} — build ruszył. Kolejne kroki: verify (checks+testy+e2e) → PR.`).catch(() => {});
             await setPhase(project, src, id, "build", runId);
-            notify(`🔨 ${id}: build ruszył`, "Aprobata planu przyjęta.").catch(() => {});
+            notify(`🔨 ${id}: build ruszył`, "Aprobata planu przyjęta.", ticketUrl).catch(() => {});
           } else {
             await src.comment(id, `↩️ Odrzucenie przyjęte ${marker(id)} — run zostanie zakończony, powód trafi do raportu.`).catch(() => {});
           }
@@ -394,7 +397,7 @@ async function watchRun(
         registry.finalize(id, { project, runId }, "success");
         await setPhase(project, src, id, "pr-ready", runId);
         await recordRunOutcome(true).catch(() => {});
-        notify(`✅ ${id}: PR gotowy`, `${prUrl}${verdict === "lgtm" ? " (ready for review)" : " (draft)"}`).catch(() => {});
+        notify(`✅ ${id}: PR gotowy`, `${prUrl}${verdict === "lgtm" ? " (ready for review)" : " (draft)"}`, ticketUrl).catch(() => {});
         console.log(`[${id}] SUKCES → ${prUrl}`);
         break;
         } catch (err) {
@@ -435,7 +438,7 @@ async function watchRun(
         if (projectConfig?.statuses !== "extended") await src.setStatus(id, "blocked");
         await setPhase(project, src, id, "blocked", runId);
         registry.finalize(id, { project, runId }, reason === "rejected" ? "rejected" : blocked ? "blocked" : "failed", reason);
-        notify(`🛑 ${id}: ${blocked ? "BLOCKED — pytania w tickecie" : "run nieudany"}`, clip(msg, 180)).catch(() => {});
+        notify(`🛑 ${id}: ${blocked ? "BLOCKED — pytania w tickecie" : "run nieudany"}`, clip(msg, 180), ticketUrl).catch(() => {});
         console.log(`[${id}] FAILED${blocked ? " (BLOCKED)" : ""}`);
         break;
         } catch (err) {
@@ -601,7 +604,7 @@ async function preMergeGuard(project: string, src: LinearSource, ticketId: strin
   const fail = async (body: string) => {
     await exec("gh", ["pr", "ready", prUrl, "--undo"], { timeout: 30_000 });
     await src.comment(ticketId, `${body} ${marker(ticketId)}`).catch(() => {});
-    notify(`⚠️ ${ticketId}: PR nie przechodzi po scaleniu z ${def}`, "PR wrócił do draftu — wymaga poprawki.").catch(() => {});
+    notify(`⚠️ ${ticketId}: PR nie przechodzi po scaleniu z ${def}`, "PR wrócił do draftu — wymaga poprawki.", st?.manifest?.url).catch(() => {});
     registry.updateState(ticketId, seed, (s) => { s.preMerge = { mainSha, headSha, ok: false, at: new Date().toISOString() }; });
   };
 
@@ -698,7 +701,14 @@ function artifactField(path: string, field: string): string {
 }
 
 /** Nowy artefakt = zakończona faza → notyfikacja z werdyktem (+ stan procesu na tablicy). */
-async function notifyPhaseMilestones(project: string, src: LinearSource, id: string, runDir: string, seen: Set<string>) {
+async function notifyPhaseMilestones(
+  project: string,
+  src: LinearSource,
+  id: string,
+  runDir: string,
+  seen: Set<string>,
+  ticketUrl?: string
+) {
   for (const f of safeReaddir(runDir)) {
     if (seen.has(f)) continue;
     seen.add(f);
@@ -733,7 +743,7 @@ async function notifyPhaseMilestones(project: string, src: LinearSource, id: str
       if (outcome === "pushed") msg = [`🔧 ${id}: poprawki wgrane (runda ${fix[1]})`, "Kolejna runda review."];
     }
 
-    if (msg) notify(msg[0], msg[1]).catch(() => {});
+    if (msg) notify(msg[0], msg[1], ticketUrl).catch(() => {});
   }
 }
 
@@ -762,7 +772,8 @@ async function handleClarifySuspend(
   runDir: string,
   run: MastraRunSnapshot,
   answered: Set<number>,
-  hintedRounds: Set<number>
+  hintedRounds: Set<number>,
+  ticketUrl?: string
 ): Promise<boolean> {
   const qFiles = safeReaddir(runDir).filter((f) => /^questions-round-\d+\.md$/.test(f));
   if (!qFiles.length) return false;
@@ -786,7 +797,7 @@ async function handleClarifySuspend(
     ).catch(() => {});
     registry.openGateRecord(id, { project, runId }, "clarify", qMax, "❓ Pytania do autora");
     await setPhase(project, src, id, "questions", runId);
-    notify(`❓ ${id}: pytania do ticketu (runda ${qMax})`, "Odpowiedz w komentarzu — fabryka doplanuje.").catch(() => {});
+    notify(`❓ ${id}: pytania do ticketu (runda ${qMax})`, "Odpowiedz w komentarzu — fabryka doplanuje.", ticketUrl).catch(() => {});
     console.log(`[${id}] pytania rundy ${qMax} czekają na odpowiedź`);
     return true;
   }
@@ -830,7 +841,7 @@ async function handleClarifySuspend(
     await dispatchPendingOutbox(mastraClient, id, { project, runId });
     await src.comment(id, `🧠 Odpowiedzi przyjęte ${marker(id)} — doplanowuję (runda ${qMax}).`).catch(() => {});
     await setPhase(project, src, id, "planning", runId);
-    notify(`🧠 ${id}: odpowiedzi przyjęte`, `Doplanowanie (runda ${qMax}).`).catch(() => {});
+    notify(`🧠 ${id}: odpowiedzi przyjęte`, `Doplanowanie (runda ${qMax}).`, ticketUrl).catch(() => {});
     console.log(`[${id}] odpowiedzi rundy ${qMax} → resume clarify`);
   }
   return true;
@@ -894,7 +905,9 @@ const smokeRunning = new Set<string>();
  * gdy funkcja jest martwa na prodzie — lekcja z BAR-101/102).
  */
 async function prodSmokeGuard(projectKey: string, src: LinearSource, ticketId: string) {
-  if (registry.readState(ticketId)?.prodSmokeAt || smokeRunning.has(ticketId)) return;
+  const ticketState = registry.readState(ticketId);
+  if (ticketState?.prodSmokeAt || smokeRunning.has(ticketId)) return;
+  const ticketUrl = ticketState?.manifest?.url;
   smokeRunning.add(ticketId);
 
   try {
@@ -923,7 +936,7 @@ async function prodSmokeGuard(projectKey: string, src: LinearSource, ticketId: s
           `Ticket wraca do In Review — zweryfikuj deploy/hosting (por. BAR-77/102).`
       );
       await src.setStatus(ticketId, "human_review");
-      notify(`🚨 ${ticketId}: prod smoke FAILED`, "Merge jest, ale produkcja nie serwuje zmiany — szczegóły w tickecie.").catch(() => {});
+      notify(`🚨 ${ticketId}: prod smoke FAILED`, "Merge jest, ale produkcja nie serwuje zmiany — szczegóły w tickecie.", ticketUrl).catch(() => {});
       console.log(`[${ticketId}] PROD SMOKE FAILED`);
     }
     registry.updateState(ticketId, { project: projectKey, runId: registry.readState(ticketId)?.runId ?? "" }, (s) => { s.prodSmokeAt = new Date().toISOString(); });

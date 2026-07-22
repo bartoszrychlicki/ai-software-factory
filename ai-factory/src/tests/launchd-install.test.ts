@@ -1,11 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { spawnSync } from "node:child_process";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const script = readFileSync(join(here, "../../ops/install-launchd.sh"), "utf8");
+const scriptPath = join(here, "../../ops/install-launchd.sh");
+const script = readFileSync(scriptPath, "utf8");
 
 function position(fragment: string): number {
   const index = script.indexOf(fragment);
@@ -44,4 +47,36 @@ test("nieudany bootstrap nie akceptuje starego joba jako sukcesu", () => {
     /if launchctl print[^}]+then\s+return 0/s,
     "stary job launchd nie może maskować nieudanego bootstrapu",
   );
+});
+
+test("brak terminal-notifier blokuje instalację przed pierwszym bootout", () => {
+  const preflight = lastPosition("\npreflight_terminal_notifier\n");
+  const freezePoller = position('bootout_agent "$POLLER_SERVICE"');
+  assert.ok(preflight < freezePoller);
+
+  const root = mkdtempSync(join(tmpdir(), "factory-launchd-preflight-"));
+  const fakeBin = join(root, "bin");
+  const launchctlLog = join(root, "launchctl.log");
+  const launchctl = join(fakeBin, "launchctl");
+  try {
+    mkdirSync(fakeBin);
+    writeFileSync(launchctl, '#!/bin/bash\nprintf "%s\\n" "$*" >> "$LAUNCHCTL_LOG"\n');
+    chmodSync(launchctl, 0o755);
+
+    const result = spawnSync("/bin/bash", [scriptPath], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        HOME: root,
+        PATH: `${fakeBin}:/usr/bin:/bin`,
+        LAUNCHCTL_LOG: launchctlLog,
+      },
+    });
+
+    assert.equal(result.status, 1);
+    assert.match(`${result.stdout}${result.stderr}`, /brew install terminal-notifier/);
+    assert.equal(existsSync(launchctlLog), false, "launchctl nie może zostać wywołany przed preflightem");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });

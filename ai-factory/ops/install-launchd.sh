@@ -13,6 +13,13 @@ POLLER_SERVICE="com.ai-factory.poller"
 SERVER_PLIST="$AGENTS_DIR/$SERVER_SERVICE.plist"
 POLLER_PLIST="$AGENTS_DIR/$POLLER_SERVICE.plist"
 
+preflight_terminal_notifier() {
+  if ! command -v terminal-notifier >/dev/null 2>&1; then
+    echo "terminal-notifier nie jest zainstalowany. Zainstaluj: brew install terminal-notifier" >&2
+    exit 1
+  fi
+}
+
 # bootout jest asynchroniczny. Build może ruszyć dopiero wtedy, gdy proces
 # naprawdę zniknął i nie czyta już regenerowanego katalogu .mastra/output.
 wait_until_unloaded() {
@@ -70,6 +77,8 @@ if(fs.existsSync(root)) for(const ticket of fs.readdirSync(root)) {
 process.stdout.write(ids.join(","));
 ' "$FACTORY_DIR"
 }
+
+preflight_terminal_notifier
 
 mkdir -p "$HOME/.ai-factory/logs"
 mkdir -p "$AGENTS_DIR"
