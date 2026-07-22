@@ -25,7 +25,7 @@ Fabryka software: ticket → intake → plan (+gate niejasności) → human gate
 ## Komendy
 
 - Typecheck: `npx tsc --noEmit` — **obowiązkowo po każdej zmianie** (mastra dev/tsx nie sprawdzają typów).
-- **Produkcyjnie: usługi launchd** (`com.ai-factory.server` = mastra dev, `com.ai-factory.poller`): instalacja/reload `bash ops/install-launchd.sh`; logi `~/.ai-factory/logs/`; stop `launchctl bootout gui/501/com.ai-factory.<server|poller>`. Auto-start przy logowaniu, auto-restart po padzie. UWAGA: ręczny `mastra dev` gryzie się z usługą (port + lock DuckDB) — najpierw bootout.
+- **Produkcyjnie: usługi launchd** (`com.ai-factory.server` = `mastra start` ze zbudowanego bundle'a, `com.ai-factory.poller`): instalacja/reload `bash ops/install-launchd.sh`; logi `~/.ai-factory/logs/`; stop `launchctl bootout gui/501/com.ai-factory.<server|poller>`. Auto-start przy logowaniu, auto-restart po padzie. UWAGA: ręczny `mastra dev` gryzie się z usługą (port + lock DuckDB) — najpierw bootout.
 - Dev ręcznie (gdy usługa zatrzymana): `FACTORY_ROOT=$(pwd) CLAUDE_BIN=~/.local/bin/claude npm run dev` → Studio `localhost:4111`.
 - Run bez Studio: API Mastry (`localhost:4111/api`, endpointy create-run/start/resume — lista w Studio → API endpoints). Human gate `approve-plan` wymaga resume z `{"approved": true}`.
 - Smoke adapterów: `CLAUDE_BIN=~/.local/bin/claude npx tsx src/engines/smoke.ts`.

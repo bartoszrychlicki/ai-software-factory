@@ -5,21 +5,25 @@ Mastra prowadzi trwały workflow ticketu, a adaptery CLI realizują role planner
 builder, verifier i reviewer w izolowanych worktree.
 
 Pełny, aktualny diagram i opis stanów: [docs/ticket-flow.md](docs/ticket-flow.md).
+Wynik bramki trwałości BAR-157: [docs/mastra-lifecycle-spike.md](docs/mastra-lifecycle-spike.md).
 
 ## Uruchomienie
 
-Produkcja działa z wcześniej zbudowanego bundle'a, bez hot reloadu:
+Lokalna usługa działa z wcześniej zbudowanego bundle'a razem z Mastra Studio,
+bez hot reloadu:
 
 ```shell
 npm ci
 npm run check
 npm test
-npm run build
 bash ops/install-launchd.sh
 ```
 
-Instalator nie przełączy usług, jeśli rejestr zawiera niedokończone runy. Najpierw
-uruchamia serwer i czeka na health check; poller startuje dopiero po gotowości API.
+Instalator zatrzymuje poller, sprawdza niedokończone runy, zatrzymuje serwer i
+dopiero wtedy buduje `.mastra/output`. Waliduje pliki wejściowe bundle'a oraz health
+check API i Studio; poller startuje dopiero po gotowości obu endpointów. Nie
+uruchamiaj osobnego `npm run build` przy działających usługach — Mastra regeneruje
+katalog output destrukcyjnie.
 
 Tryb developerski (`npm run dev`) jest wyłącznie do pracy lokalnej. Hot reload
 nie może być używany podczas aktywnego runu ticketu.
