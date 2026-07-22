@@ -9,6 +9,8 @@ export interface ProjectConfig {
   default_branch?: string;
   routing?: Record<string, string>; // per-projektowe nadpisania silników/modeli
   checks?: string[]; // komendy weryfikacyjne projektu (uruchamiane na świeżym checkoutcie)
+  /** GitHub checks wymagane dla dokładnego PR head SHA przed review i zdjęciem draftu. */
+  ci?: { requiredChecks: string[]; timeoutMinutes?: number };
   /** Opcjonalny podgląd wyniku: fabryka stawia serwer, robi screenshot i dołącza do raportu. */
   screenshot?: { start: string; url: string };
   /** Limit równolegle prowadzonych ticketów projektu (BAR-122). Domyślnie bez limitu. */
@@ -44,5 +46,15 @@ export async function getProject(key: string): Promise<ProjectConfig> {
   const all = parse(raw) as Record<string, ProjectConfig>;
   const project = all[key];
   if (!project) throw new Error(`Nieznany projekt "${key}" — brak wpisu w projects.yaml`);
+  const checks = project.checks?.map((command) => command.trim()).filter(Boolean) ?? [];
+  if (!checks.length) {
+    throw new Error(`Projekt "${key}" nie ma deterministycznych checks — rejestracja jest fail-closed.`);
+  }
+  const requiredChecks = project.ci?.requiredChecks?.map((name) => name.trim()).filter(Boolean) ?? [];
+  if (project.github && !requiredChecks.length) {
+    throw new Error(`Projekt "${key}" ma GitHub, ale nie ma ci.requiredChecks — PR nie może być bezpiecznie opublikowany.`);
+  }
+  project.checks = checks;
+  if (project.ci) project.ci.requiredChecks = requiredChecks;
   return project;
 }

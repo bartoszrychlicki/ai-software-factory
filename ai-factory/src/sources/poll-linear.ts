@@ -215,8 +215,7 @@ async function handleTicket(
   });
   if (reusePlan) {
     const files = parsePlanVerdict(reusePlan).files;
-    // Stary, zatwierdzony plan bez kontraktu plików blokuje konserwatywnie cały projekt.
-    registry.recordFiles(id, { project, runId }, files.length ? files : ["*"]);
+    registry.recordFiles(id, { project, runId }, files);
   }
   await src.comment(id, reusePlan
     ? `🤖 ai-factory przyjęła ticket ${marker(id)}. ♻️ Reużywam zatwierdzonego planu z poprzedniego runu (porażka infra/budżet) — build startuje od razu, bez bramki.`
@@ -874,9 +873,11 @@ async function findReusablePlan(src: LinearSource, id: string, description: stri
             approval.descriptionHash !== createHash("sha256").update(description).digest("hex")) return undefined;
         const raw = readFileSync(join(dir, "plan.md"), "utf8");
         const body = raw.split(/^---\s*$/m).slice(2).join("---").trim() || raw;
-        // approval.json jest źródłem prawdy: plan został zaakceptowany przez człowieka.
-        // Stare plany mogą nie mieć kontraktu factory; pipeline świadomie pozwala je reużyć.
-        return body;
+        // Reuse zachowuje akceptację człowieka tylko wtedy, gdy istnieje również
+        // maszynowo egzekwowalny kontrakt plików. Stary plan bez factory.files
+        // musi zostać zaplanowany ponownie, inaczej scope gate byłby fikcją.
+        const verdict = parsePlanVerdict(body);
+        if (verdict.ok && verdict.files.length) return body;
       } catch { /* katalog bez kompletu artefaktów — próbujemy starszy */ }
     }
   } catch { /* brak katalogu runs — brak reuse */ }
