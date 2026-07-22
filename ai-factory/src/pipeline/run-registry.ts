@@ -63,6 +63,11 @@ export interface TicketState {
   /** Parametry zlecenia z labeli — czytane RAZ przy claimie, potem niezmienne. */
   manifest?: { labels: string[]; engine?: string; domain?: string; planMode?: string };
   autoRetry: { count: number; lastAt?: string };
+  /**
+   * Pliki zadeklarowane przez plannera (BAR-141). Ticket „trzyma" je od aprobaty
+   * planu do merge'a PR-a — w tym oknie żaden inny ticket nie rusza tych plików.
+   */
+  files?: string[];
   prUrl?: string;
   mergeHandledAt?: string;
   prodSmokeAt?: string;
@@ -154,6 +159,7 @@ export function updateState(
       state.finalized = undefined;
       state.prUrl = undefined;
       state.mergeHandledAt = undefined;
+      state.files = undefined;
       state.createdAt = now;
     }
     mutate(state);
@@ -257,13 +263,52 @@ export function finalize(
   });
 }
 
-/** Tickety z niedokończonym runem — podstawa adopcji sierot po restarcie. */
-export function listUnfinished(): TicketState[] {
+function listAll(): TicketState[] {
   try {
     return readdirSync(runsRoot())
       .map((t) => readState(t))
-      .filter((s): s is TicketState => !!s && s.lifecycle !== "finalized");
+      .filter((s): s is TicketState => !!s);
   } catch {
     return [];
   }
+}
+
+/** Tickety z niedokończonym runem — podstawa adopcji sierot po restarcie. */
+export function listUnfinished(): TicketState[] {
+  return listAll().filter((s) => s.lifecycle !== "finalized");
+}
+
+/** Ścieżka porównywalna: bez `./`, bez wiodącego `/`, bez ogona `/`. */
+export const normalizePath = (p: string): string => p.trim().replace(/^\.?\//, "").replace(/\/+$/, "");
+
+export function recordFiles(ticketId: string, seed: { project: string; runId: string }, files: string[]): void {
+  const clean = [...new Set(files.map(normalizePath).filter(Boolean))].slice(0, 200);
+  if (clean.length) updateState(ticketId, seed, (s) => void (s.files = clean));
+}
+
+/**
+ * Okno trzymania plików: od aprobaty planu do domknięcia PR-a. Zwolnienie:
+ * merge/zamknięcie PR-a (`mergeHandledAt`) albo finał bez PR-a (blocked/failed).
+ * Twardy limit wieku chroni przed wiecznym blokowaniem przez zapomniany stan.
+ */
+const HOLD_MAX_MS = 24 * 3600_000;
+
+function holdsFiles(s: TicketState): boolean {
+  if (!s.files?.length || s.mergeHandledAt) return false;
+  if (s.finalized && s.finalized.outcome !== "success") return false;
+  return Date.now() - Date.parse(s.updatedAt) < HOLD_MAX_MS;
+}
+
+/**
+ * Kolizje plikowe (BAR-141): pliki, o które nowy ticket zahacza o inny aktywny run.
+ * Serializacja zamiast równoległych PR-ów na tym samym pliku — źródło 6 konfliktów
+ * i jednego konfliktu semantycznego z nocnej zmiany 2026-07-22.
+ */
+export function fileCollisions(ticketId: string, files: string[]): { ticketId: string; files: string[] }[] {
+  const wanted = new Set(files.map(normalizePath).filter(Boolean));
+  if (!wanted.size) return [];
+  return listAll()
+    .filter((s) => s.ticketId !== ticketId && holdsFiles(s))
+    .map((s) => ({ ticketId: s.ticketId, files: (s.files ?? []).filter((f) => wanted.has(f)) }))
+    .filter((c) => c.files.length > 0);
 }

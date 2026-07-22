@@ -66,9 +66,26 @@ const cycleSchema = z.object({
   verifyReport: z.string(),
 });
 
-/** Domena buildu z labela ticketu (`domain:frontend` → routing `build.frontend`). */
-const ticketDomain = (ticket: { labels?: string[] }): string | undefined =>
-  ticket.labels?.find((l) => l.startsWith("domain:"))?.slice("domain:".length);
+const KNOWN_DOMAINS = ["frontend", "backend", "fullstack", "ops"];
+
+/**
+ * Domena buildu → routing `build.<domena>` (BAR-133).
+ *
+ * Kolejność: label `domain:*` = ręczny override człowieka, dalej deklaracja
+ * plannera z bloku `factory`. Bez tego frontend leciał defaultowym silnikiem,
+ * dopóki ktoś nie pamiętał o labelu (BAR-92 run 1 poszedł w codex zamiast Opusa).
+ * Nieznana wartość jest ignorowana — routing spada na default, nigdy nie wybucha.
+ */
+const ticketDomain = (ticket: { labels?: string[] }, plan?: string): string | undefined => {
+  const fromLabel = ticket.labels?.find((l) => l.startsWith("domain:"))?.slice("domain:".length);
+  if (fromLabel) return fromLabel;
+  const declared = plan ? parsePlanVerdict(plan).domain?.trim().toLowerCase() : undefined;
+  if (declared && !KNOWN_DOMAINS.includes(declared)) {
+    console.warn(`[routing] planner zadeklarował nieznaną domenę "${declared}" — używam defaultu`);
+    return undefined;
+  }
+  return declared;
+};
 
 const intakeStep = createStep({
   id: "intake",
@@ -161,6 +178,8 @@ const planStep = createStep({
         "Jeśli masz już odpowiedzi autora (sekcja poniżej ticketu) — potraktuj je jako wiążące decyzje i NIE zadawaj tych samych pytań ponownie.",
         "Jeśli stan opisany w tickecie JUŻ ISTNIEJE w kodzie (ticket spełniony): PLAN: BLOCKED i wyjaśnienie BEZ pytań — nie planuj pustej pracy.",
         "PIERWSZA linia odpowiedzi CZYSTYM TEKSTEM, bez backticków i formatowania: PLAN: OK albo PLAN: BLOCKED.",
+        `W bloku factory wypełnij "files" KOMPLETNĄ listą plików, które ticket zmieni (ścieżki względem repo) — fabryka serializuje na ich podstawie równoległe tickety, więc pominięty plik grozi konfliktem merge'a.`,
+        `Oraz "domain": frontend | backend | fullstack | ops — na podstawie zakresu zmian; od tego zależy dobór silnika buildu.`,
         verdictInstruction("plan"),
       ].join("\n"),
       context: `# Ticket ${ticket.id}: ${ticket.title}\n\n${ticket.description}${answersBlock}`,
@@ -179,7 +198,7 @@ const planStep = createStep({
       ticket.id,
       runId,
       "plan.md",
-      artifactHeader({ step: "plan", engine: route.spec, costUsd: result.costUsd, ok: String(result.ok), round: inputData.clarifyRound }) + result.report
+      artifactHeader({ step: "plan", engine: route.spec, costUsd: result.costUsd, ok: String(result.ok), round: inputData.clarifyRound }) + (result.transcript ?? result.report)
     );
     if (!result.ok) throw new Error(`Planner (${route.spec}) nie dostarczył planu: ${result.report}`);
 
@@ -332,7 +351,7 @@ const buildStep = createStep({
       ? `\n\n# FEEDBACK Z ODRZUCONEJ PRÓBY #${inputData.attempt}\nPoprzednia implementacja została odrzucona. Napraw wskazane problemy:\n${inputData.feedback.slice(0, 12_000)}`
       : "";
 
-    const route = await resolveRoute("build", ticket, ticketDomain(ticket));
+    const route = await resolveRoute("build", ticket, ticketDomain(ticket, inputData.plan));
     const t0 = Date.now();
     const buildMetric = (ok: boolean, outcome: string, costUsd?: number) =>
       recordMetric({ ticket: ticket.id, runId, stage: "build", engine: route.spec, attempt, ok, outcome, costUsd, durationMs: Date.now() - t0 });
@@ -893,7 +912,7 @@ const remediateStep = createStep({
       saveArtifact(ticket.id, runId, `fix-round-${round}.md`, artifactHeader({ step: "fix", round, ...meta }) + body);
 
     try {
-      const route = await resolveRoute("build", ticket, ticketDomain(ticket));
+      const route = await resolveRoute("build", ticket, ticketDomain(ticket, inputData.plan));
       const t0 = Date.now();
       const fixMetric = (ok: boolean, outcome: string, costUsd?: number) =>
         recordMetric({ ticket: ticket.id, runId, stage: "fix", engine: route.spec, round, ok, outcome, costUsd, durationMs: Date.now() - t0 });

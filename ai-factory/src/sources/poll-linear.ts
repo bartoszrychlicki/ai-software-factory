@@ -37,6 +37,7 @@ import { runProdChecks } from "../pipeline/prod-smoke";
 import * as registry from "../pipeline/run-registry";
 import { LINEAR_STATE_MAP as MAP, phaseOfState, decisionOfState } from "./state-map";
 import { parseCommand, hintFor } from "./commands";
+import { parsePlanVerdict } from "../pipeline/verdicts";
 
 const exec = promisify(execFile);
 
@@ -219,6 +220,7 @@ async function watchRun(
   let planCommentedAt = planCommentedAtInit;
   let decisionSent = decisionSentInit;
   let hintSent = false;
+  let collisionNotified = false; // BAR-141: „czekam na pliki" mówimy raz, nie co tick
   const deadline = Date.now() + RUN_WATCH_MAX_MS;
 
   // fazy śledzimy po ARTEFAKTACH (snapshot Mastry po resume jest stale — bug guarda, patrz CLAUDE.md);
@@ -252,6 +254,7 @@ async function watchRun(
               `Z telefonu: komenda \`/approve\` albo \`/reject <powód>\`.\n\n---\n\n${clip(plan, 16000)}`
           );
           planCommentedAt = new Date().toISOString(); // dopiero PO udanym komentarzu — inaczej czkawka API gubi plan na zawsze (BAR-104)
+          registry.recordFiles(id, { project, runId }, parsePlanVerdict(plan).files); // BAR-141: rezerwacja plików na czas budowy
           registry.openGateRecord(id, { project, runId }, "plan-approval", 0, "🚦 Plan do akceptacji");
           await setPhase(project, src, id, "plan-approval", runId);
           console.log(`[${id}] plan czeka na decyzję w Linear`);
@@ -280,6 +283,24 @@ async function watchRun(
           : kind === "reject"
             ? { approved: false, feedback: cmd?.decision?.payload ?? (await collectPayload(src, id, planCommentedAt)) ?? "odrzucone bez powodu" }
             : undefined;
+        // BAR-141: aprobata nie startuje builda, dopóki inny run trzyma te same pliki.
+        // Równoległe gałęzie na jednym pliku dały 6 konfliktów merge'a i jeden semantyczny
+        // (nocna zmiana 2026-07-22) — tu zamieniamy je na czekanie w kolejce.
+        if (decision?.approved) {
+          const collisions = registry.fileCollisions(id, registry.readState(id)?.files ?? []);
+          if (collisions.length) {
+            if (!collisionNotified) {
+              collisionNotified = true;
+              const who = collisions.map((c) => `**${c.ticketId}** (${c.files.join(", ")})`).join("; ");
+              await src.comment(id, `⏸️ Aprobata przyjęta, ale build czeka ${marker(id)} — te pliki trzyma inny ticket: ${who}. Ruszę automatycznie po jego merge'u.`).catch(() => {});
+              console.log(`[${id}] build wstrzymany — kolizja plikowa z ${collisions.map((c) => c.ticketId).join(", ")}`);
+            }
+            continue; // decyzja NIE jest konsumowana — kolejny tick sprawdzi ponownie
+          }
+          if (collisionNotified) {
+            await src.comment(id, `▶️ Pliki zwolnione ${marker(id)} — build rusza.`).catch(() => {});
+          }
+        }
         if (decision) {
           decisionSent = true;
           registry.recordDecision(id, { project, runId }, "plan-approval", 0, {
@@ -488,6 +509,8 @@ async function watchMerges() {
           `Uzupełnij wymagania i nadaj label \`agent:ready\`, żeby spróbować ponownie.`
       );
       await src.setStatus(issue.id, "needs_clarification");
+      // zamknięty PR też zwalnia pliki (BAR-141) — inaczej kolejka stoi na martwym tickecie
+      registry.updateState(issue.id, { project, runId: registry.readState(issue.id)?.runId ?? "" }, (st) => { st.mergeHandledAt = new Date().toISOString(); });
       console.log(`[${issue.id}] PR CLOSED → Todo`);
     }
   }
