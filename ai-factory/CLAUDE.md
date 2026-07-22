@@ -55,8 +55,10 @@ Fabryka software: ticket → intake → plan (+gate niejasności) → human gate
 
 **Wdrożone tej nocy poprawki fabryki:** unicode-safe regexy decyzji (`odrzuć`/`akceptuję` NIGDY nie działały — `\b` po ć/ę), kotwica runId w komentarzu claim (adopcja runów reuse), reuse jako domyślny + hash opisu unieważniający, `result.json` nie blokuje reuse, merge-watcher skanuje stany procesu (inaczej nie widzi merge'y przy `statuses: extended`), BLOCKED z bramki planu nie nabija serii breakera, twarde timeouty fetch/gh, stany procesu w Linear + aprobata przeciągnięciem.
 
+**Zrobione 2026-07-22 rano:** BAR-122 (limit `max_concurrent_tickets` per projekt — pilot-app 2, br-budget 1) i BAR-123 (merge-queue: worktree od świeżego `origin/<default>`, przed publish merge z mainem + re-verify checks/e2e na scalonym drzewie; konflikt lub czerwone checks = BLOCKED z instrukcją relabel → reuse planu buduje na świeżym mainie).
+
 **Otwarte problemy (priorytet):**
-1. **Brak merge-queue** — fabryka odgałęzia od maina i nie aktualizuje przed publish; przy 4+ równoległych ticketach 6 PR-ów wpadło w konflikt (5, 8, 10, 16, 25, 28). Fix: przed publish `merge origin/main` + ponowne checks; konflikt → feedback do buildera.
+1. ~~Brak merge-queue~~ zrobione (BAR-122+123) — fabryka odgałęzia od maina i nie aktualizuje przed publish; przy 4+ równoległych ticketach 6 PR-ów wpadło w konflikt (5, 8, 10, 16, 25, 28). Fix: przed publish `merge origin/main` + ponowne checks; konflikt → feedback do buildera.
 2. **Konflikt semantyczny** — BAR-106 (animacja) + BAR-111 (persystencja) zielone osobno, po scaleniu 2 testy padły (stub bez classList). Fix: pre-merge re-verify na scalonym drzewie.
 3. **Pętla review oscyluje** — BAR-110: runda 2 wprowadziła `resolveTheme.toString()`, runda 3 to cofnęła i zgłosiła jako uwagę. Fix: recenzent dostaje poprzednie werdykty + zakaz cofania zaakceptowanych zmian.
 4. **`claude -p` gubi treść z wiadomości pośrednich** — pytania clarify utknęły 2× (BAR-108, BAR-121 działało). Fix: wymusić komplet w finalnej wiadomości + rozpoznawanie pytań po strukturze (A)/B)/REKOMENDACJA), nie po nagłówku.

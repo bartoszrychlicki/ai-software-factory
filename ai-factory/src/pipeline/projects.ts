@@ -11,6 +11,8 @@ export interface ProjectConfig {
   checks?: string[]; // komendy weryfikacyjne projektu (uruchamiane na świeżym checkoutcie)
   /** Opcjonalny podgląd wyniku: fabryka stawia serwer, robi screenshot i dołącza do raportu. */
   screenshot?: { start: string; url: string };
+  /** Limit równolegle prowadzonych ticketów projektu (BAR-122). Domyślnie bez limitu. */
+  max_concurrent_tickets?: number;
   /** "extended" = fabryka pisze stany procesu w Linear (🧠❓🚦🔨🧪👀✅) zamiast prostego In Progress/In Review. */
   statuses?: "extended";
   /** Budżet per ticket-run (nadpisuje globalne defaulty FACTORY_BUDGET_*). */

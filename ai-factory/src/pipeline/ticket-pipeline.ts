@@ -323,7 +323,8 @@ const buildStep = createStep({
       .replace(/^-+|-+$/g, "")
       .slice(0, 30);
     // świeży worktree per próba — retry to nowa próba, nie grzebanie w brudzie
-    const ws = await createWorkspace(ticket.repoPath, ticket.id, slug);
+    const project = await getProject(ticket.project).catch(() => undefined);
+    const ws = await createWorkspace(ticket.repoPath, ticket.id, slug, project?.default_branch ?? "main");
 
     // clip: raporty błędów bywają ogromne (echo komend) — nieprzycięte rozdęły prompt próby 2 do spawn E2BIG (BAR-91)
     const feedbackBlock = inputData.feedback
@@ -633,9 +634,57 @@ const publishStep = createStep({
   inputSchema: cycleSchema,
   outputSchema: publishOutputSchema,
   execute: async ({ inputData, runId }) => {
-    const { ticket, branch, workspaceDir } = inputData;
+    let { ticket, branch, workspaceDir } = inputData;
     if (!ticket.github) {
       throw new Error("Projekt nie ma repo GitHub w rejestrze — publish niemożliwy");
+    }
+
+    // MERGE-QUEUE (BAR-123): publikujemy wyłącznie gałąź zsynchronizowaną z mainem i przechodzącą
+    // checks NA SCALONYM drzewie — inaczej PR ląduje w konflikcie albo wnosi konflikt semantyczny
+    // (dwie gałęzie zielone osobno, po scaleniu czerwone — BAR-106+BAR-111, noc 2026-07-22)
+    const project = await getProject(ticket.project).catch(() => undefined);
+    const def = project?.default_branch ?? "main";
+    await exec("git", ["-C", workspaceDir, "fetch", "origin", def]);
+    const { stdout: behind } = await exec("git", ["-C", workspaceDir, "rev-list", "--count", `HEAD..origin/${def}`]);
+
+    if (Number(behind.trim()) > 0) {
+      try {
+        await exec("git", ["-C", workspaceDir, "merge", `origin/${def}`, "--no-edit"]);
+      } catch {
+        const { stdout: conflicted } = await exec("git", ["-C", workspaceDir, "diff", "--diff-filter=U", "--name-only"]).catch(() => ({ stdout: "" }));
+        await exec("git", ["-C", workspaceDir, "merge", "--abort"]).catch(() => {});
+        throw new Error(
+          `BLOCKED: konflikt z ${def} przy publikacji (pliki: ${conflicted.trim().split("\n").filter(Boolean).join(", ") || "?"}). ` +
+            `Main przesunął się w trakcie builda. Nadaj label ponownie — reuse planu zbuduje na świeżym mainie.`
+        );
+      }
+
+      // re-verify na scalonym drzewie: checks projektu + e2e (jeśli skonfigurowane)
+      const cleanEnv = Object.fromEntries(
+        Object.entries(process.env).filter(([k]) => !k.startsWith("npm_") && k !== "NODE_ENV")
+      ) as NodeJS.ProcessEnv;
+      const t0mq = Date.now();
+      for (const cmd of [...(ticket.checks ?? []), ...(ticket.e2e ? [ticket.e2e] : [])]) {
+        try {
+          await exec("bash", ["-c", cmd], { cwd: workspaceDir, env: cleanEnv, timeout: 20 * 60_000, maxBuffer: 50 * 1024 * 1024 });
+        } catch (err) {
+          const e = err as Error & { stdout?: string; stderr?: string };
+          const tail = [e.stdout, e.stderr].filter(Boolean).join("\n").slice(-3000);
+          await recordMetric({ ticket: ticket.id, runId, stage: "merge-queue", ok: false, outcome: "recheck-fail", durationMs: Date.now() - t0mq });
+          await saveArtifact(ticket.id, runId, "merge-queue.md",
+            artifactHeader({ step: "merge-queue", outcome: "recheck-fail", check: cmd }) + tail);
+          throw new Error(
+            `BLOCKED: po scaleniu z ${def} check "${cmd}" nie przechodzi — konflikt semantyczny. ` +
+              `Nadaj label ponownie (reuse planu zbuduje na świeżym mainie).\n\n${tail}`
+          );
+        }
+      }
+      await recordMetric({ ticket: ticket.id, runId, stage: "merge-queue", ok: true, outcome: "rebased", durationMs: Date.now() - t0mq });
+      await saveArtifact(ticket.id, runId, "merge-queue.md",
+        artifactHeader({ step: "merge-queue", outcome: "rebased", behind: behind.trim() }) +
+        `Gałąź zaktualizowana o ${behind.trim()} commit(ów) z ${def}; checks na scalonym drzewie: OK.`);
+      const { stdout: newSha } = await exec("git", ["-C", workspaceDir, "rev-parse", "HEAD"]);
+      inputData = { ...inputData, sha: newSha.trim() };
     }
 
     await exec("git", ["-C", workspaceDir, "push", "-u", "--force", "origin", branch]);

@@ -64,6 +64,7 @@ const sources = PROJECTS.map((project) => ({ project, src: new LinearSource(API_
 const active = new Set<string>(); // tickety z opiekunem w tym procesie
 const mergeHandled = new Set<string>(); // merge obsłużony w tym procesie (stan trwały i tak jest w Linear)
 let breakerLogged = false; // log otwarcia bezpiecznika raz na zmianę stanu, nie co cykl
+const limitLogged = new Set<string>(); // log limitu równoległości raz na projekt, nie co cykl
 
 const marker = (id: string) => `[linear:${id}:v1]`;
 
@@ -105,8 +106,30 @@ async function main() {
               console.error(`[${project}] listReady nieudane:`, err instanceof Error ? err.message : err);
               return [];
             });
+            if (!tickets.length) continue;
+
+            // BAR-122: limit równoległości per projekt — nadmiar ticketów budowanych naraz
+            // rozjeżdża maina i kończy się konfliktami (noc 2026-07-22: 6 skonfliktowanych PR-ów)
+            const cfg = await getProject(project).catch(() => undefined);
+            const limit = cfg?.max_concurrent_tickets;
+            let free = Number.POSITIVE_INFINITY;
+            if (limit !== undefined) {
+              const inFlight = await src.countActive().catch(() => 0);
+              free = Math.max(0, limit - inFlight);
+              if (free === 0) {
+                if (!limitLogged.has(project)) {
+                  console.log(`[${project}] limit równoległości ${limit} osiągnięty (${inFlight} w toku) — ${tickets.length} ticket(ów) czeka z labelem`);
+                  limitLogged.add(project);
+                }
+                continue;
+              }
+              limitLogged.delete(project);
+            }
+
             for (const t of tickets) {
               if (active.has(t.id)) continue;
+              if (free <= 0) break;
+              free -= 1;
               active.add(t.id);
               // fire-and-forget: każdy ticket żyje własnym cyklem, pętla polluje dalej
               handleTicket(project, src, t.id, t.title, t.description, t.labels).catch((err) => {

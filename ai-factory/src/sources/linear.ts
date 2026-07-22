@@ -157,6 +157,15 @@ export class LinearSource implements TicketSource {
     return issue.state.name;
   }
 
+  /** Ile ticketów projektu jest w toku (stany typu started: In Progress/In Review + stany procesu). */
+  async countActive(): Promise<number> {
+    const data = await this.gql<{ issues: { nodes: { id: string }[] } }>(
+      `query($filter: IssueFilter) { issues(filter: $filter, first: 50) { nodes { id } } }`,
+      { filter: { project: { name: { eq: this.project } }, state: { type: { eq: "started" } } } }
+    );
+    return data.issues.nodes.length;
+  }
+
   /** Przywraca label-trigger (auto-retry porażek infrastrukturalnych). */
   async relabelReady(id: string): Promise<void> {
     const label = await this.gql<{ issueLabels: { nodes: { id: string }[] } }>(

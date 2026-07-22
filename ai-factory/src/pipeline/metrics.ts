@@ -11,7 +11,7 @@ export interface MetricRow {
   ts: string;
   ticket: string;
   runId: string;
-  stage: "plan" | "build" | "verify" | "verify-checks" | "verify-e2e" | "review" | "fix";
+  stage: "plan" | "build" | "verify" | "verify-checks" | "verify-e2e" | "merge-queue" | "review" | "fix";
   engine?: string; // spec z routingu, np. codex albo claude-code/sonnet
   attempt?: number; // próba build→verify
   round?: number; // runda review→fix

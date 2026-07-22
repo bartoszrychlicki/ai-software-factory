@@ -19,7 +19,8 @@ const ROOT = process.env.FACTORY_WORKTREES ?? join(homedir(), ".ai-factory", "wo
 export async function createWorkspace(
   repoPath: string,
   ticketId: string,
-  slug: string
+  slug: string,
+  defaultBranch = "main"
 ): Promise<Workspace> {
   const branch = `agent/${ticketId}-${slug}`;
   const dir = join(ROOT, basename(repoPath), ticketId);
@@ -33,7 +34,13 @@ export async function createWorkspace(
   await exec("git", ["-C", repoPath, "worktree", "prune"]).catch(() => {});
   await exec("git", ["-C", repoPath, "branch", "-D", branch]).catch(() => {});
 
-  await exec("git", ["-C", repoPath, "worktree", "add", "-b", branch, dir, "main"]);
+  // BAZA = świeży origin/<default>, nie lokalny main: praca równoległa przesuwa maina
+  // w trakcie builda, a odgałęzienie od nieaktualnego stanu = gwarantowany konflikt przy publish
+  await exec("git", ["-C", repoPath, "fetch", "origin", defaultBranch]).catch(() => {});
+  const base = await exec("git", ["-C", repoPath, "rev-parse", "--verify", `origin/${defaultBranch}`])
+    .then(() => `origin/${defaultBranch}`)
+    .catch(() => defaultBranch);
+  await exec("git", ["-C", repoPath, "worktree", "add", "-b", branch, dir, base]);
   return { ticketId, branch, dir, repoPath };
 }
 
