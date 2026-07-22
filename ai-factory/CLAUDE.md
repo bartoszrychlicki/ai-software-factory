@@ -59,12 +59,14 @@ Fabryka software: ticket → intake → plan (+gate niejasności) → human gate
 
 **Zrobione 2026-07-22 rano:** BAR-122 (limit `max_concurrent_tickets` per projekt — pilot-app 2, br-budget 1) i BAR-123 (merge-queue: worktree od świeżego `origin/<default>`, przed publish merge z mainem + re-verify checks/e2e na scalonym drzewie; konflikt lub czerwone checks = BLOCKED z instrukcją relabel → reuse planu buduje na świeżym mainie).
 
+**Zrobione 2026-07-22 popołudniu:** BAR-141 (serializacja kolizji plikowych — planner deklaruje `files`, rejestr trzyma je od aprobaty do domknięcia PR-a, kolejny ticket na tym samym pliku CZEKA), BAR-133 (domena buildu z deklaracji plannera; label = override), BAR-124 (pre-merge re-verify otwartych PR-ów: main ruszył → scalenie w tymczasowym worktree + pełne checks/e2e → czerwono = PR wraca do draftu), BAR-125 (pamięć pętli review: historia rund w promptach recenzenta i buildera, zakaz cofania poprawek, wykrywanie oscylacji tokenowo → koniec pętli z ⚠️), BAR-129 (upload screenshotów: 3 próby, log per plik, jawna notka zamiast ciszy).
+
 **Otwarte problemy (priorytet):**
 1. ~~Brak merge-queue~~ zrobione (BAR-122+123) — fabryka odgałęzia od maina i nie aktualizuje przed publish; przy 4+ równoległych ticketach 6 PR-ów wpadło w konflikt (5, 8, 10, 16, 25, 28). Fix: przed publish `merge origin/main` + ponowne checks; konflikt → feedback do buildera.
-2. **Konflikt semantyczny** — BAR-106 (animacja) + BAR-111 (persystencja) zielone osobno, po scaleniu 2 testy padły (stub bez classList). Fix: pre-merge re-verify na scalonym drzewie.
-3. **Pętla review oscyluje** — BAR-110: runda 2 wprowadziła `resolveTheme.toString()`, runda 3 to cofnęła i zgłosiła jako uwagę. Fix: recenzent dostaje poprzednie werdykty + zakaz cofania zaakceptowanych zmian.
-4. **`claude -p` gubi treść z wiadomości pośrednich** — pytania clarify utknęły 2× (BAR-108, BAR-121 działało). Fix: wymusić komplet w finalnej wiadomości + rozpoznawanie pytań po strukturze (A)/B)/REKOMENDACJA), nie po nagłówku.
-5. Stany procesu nadpisują ręczne decyzje człowieka (Duplicate → 🚦). Fix: nie nadpisywać stanów końcowych.
+2. ~~Konflikt semantyczny~~ ✓ BAR-123 (re-verify przy publikacji) + BAR-124 (re-verify otwartego PR-a, gdy main ruszył) + BAR-141 (rozłączność plików).
+3. ~~Pętla review oscyluje~~ ✓ BAR-125 (historia rund + zakaz cofania + detekcja oscylacji).
+4. ~~`claude -p` gubi treść z wiadomości pośrednich~~ ✓ BAR-130 (stream-json + transcript).
+5. ~~Stany procesu nadpisują ręczne decyzje~~ ✓ BAR-127.
 
 ## Stan wcześniejszy (2026-07-21 rano)
 
