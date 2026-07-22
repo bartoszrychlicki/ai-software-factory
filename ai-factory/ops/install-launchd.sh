@@ -35,8 +35,30 @@ for svc in com.ai-factory.server com.ai-factory.poller; do
   launchctl bootout "gui/$UID_NUM/$svc" 2>/dev/null || true
 done
 
+# bootout jest asynchroniczny. Natychmiastowy bootstrap tego samego labela potrafi
+# zwrócić EIO, podczas gdy launchd raportuje „Operation already in progress”.
+# Czekamy na domknięcie poprzedniej operacji i uznajemy już załadowaną usługę za sukces.
+bootstrap_agent() {
+  local service="$1"
+  local plist="$2"
+  local output=""
+  for attempt in {1..20}; do
+    if output="$(launchctl bootstrap "gui/$UID_NUM" "$plist" 2>&1)"; then
+      return 0
+    fi
+    if launchctl print "gui/$UID_NUM/$service" >/dev/null 2>&1; then
+      return 0
+    fi
+    if [[ "$attempt" == "20" ]]; then
+      echo "Nie udało się załadować $service: $output" >&2
+      return 1
+    fi
+    sleep 1
+  done
+}
+
 cp "$OPS_DIR/com.ai-factory.server.plist" "$AGENTS_DIR/com.ai-factory.server.plist"
-launchctl bootstrap "gui/$UID_NUM" "$AGENTS_DIR/com.ai-factory.server.plist"
+bootstrap_agent "com.ai-factory.server" "$AGENTS_DIR/com.ai-factory.server.plist"
 echo "✓ com.ai-factory.server załadowany"
 
 # Poller nie może claimować ticketów, dopóki API nowego bundle'a nie odpowiada.
@@ -52,7 +74,7 @@ for attempt in {1..30}; do
 done
 
 cp "$OPS_DIR/com.ai-factory.poller.plist" "$AGENTS_DIR/com.ai-factory.poller.plist"
-launchctl bootstrap "gui/$UID_NUM" "$AGENTS_DIR/com.ai-factory.poller.plist"
+bootstrap_agent "com.ai-factory.poller" "$AGENTS_DIR/com.ai-factory.poller.plist"
 echo "✓ com.ai-factory.poller załadowany"
 
 echo
