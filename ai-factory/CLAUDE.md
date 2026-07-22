@@ -18,6 +18,7 @@ Fabryka software: ticket → intake → plan (+gate niejasności) → human gate
 - `src/pipeline/workspace.ts` — worktree per ticket w `~/.ai-factory/worktrees/<repo>/<ticket>`; `createCheckout` = świeży detached checkout SHA dla verify.
 - `src/pipeline/projects.ts` — rejestr projektów (`projects.yaml`); `findUpFile` szuka configów w górę drzewa (mastra dev ma cwd w `src/mastra/public`!).
 - `src/pipeline/routing.ts` — `resolveRoute(etap, ticket, domena?)`; kolejność: label `engine:*` > `projects.<p>.<etap[.domena]>` > `defaults.<etap.domena>` > `defaults.<etap>`; spec = `silnik[/model]`.
+- `src/pipeline/signature.ts` — jednolity podpis akcji fabryki: agent, harness CLI, model i profil roli; używany w commitach, PR-ach, review i artefaktach runa.
 - `routing.yaml`, `projects.yaml` — konfiguracja (checks weryfikacyjne są per projekt w projects.yaml).
 - Projekty fabryki: pilot-app (`~/Development/Edu/ai-sdlc/pilot-app`, publiczny, main chroniony) i **br-budget** (`~/Development/Clients/Bartosz/br-budget`, Next.js, PRYWATNY — bez branch protection na free planie, checks: ci+lint+build+test, bez screenshotu bo next wymaga env/bazy).
 - Repo pilotowe: `~/Development/Edu/ai-sdlc/pilot-app` (przeniesione do wnętrza ai-sdlc, w `.gitignore`; GitHub `bartoszrychlicki/pilot-app`, `main` chroniony: wymagany PR, enforce_admins, bez force-push).
