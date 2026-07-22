@@ -328,8 +328,10 @@ async function watchRun(
         // porażka INFRASTRUKTURALNA (nie-BLOCKED: timeout/spawn/silnik) → auto-retry dokładnie raz;
         // merytoryczny BLOCKED zawsze czeka na człowieka (retry bez zmiany wejścia = te same pytania za te same tokeny)
         if (!blocked) {
-          const alreadyRetried = (await src.listComments(id).catch(() => []))
-            .some((c) => c.body.includes("[auto-retry]"));
+          const st = registry.readState(id);
+          const alreadyRetried = st?.runId === runId
+            ? st.autoRetry.count > 0
+            : (await src.listComments(id).catch(() => [])).some((c) => c.body.includes("[auto-retry]"));
           if (!alreadyRetried) {
             registry.updateState(id, { project, runId }, (st) => { st.autoRetry = { count: st.autoRetry.count + 1, lastAt: new Date().toISOString() }; });
             await src.comment(id, `🔁 Porażka infrastrukturalna — auto-retry 1/1 [auto-retry] ${marker(id)}\n\n${clip(msg, 2000)}`);
@@ -363,10 +365,32 @@ async function watchRun(
 // --- adopcja sierot po restarcie pollera ----------------------------------
 
 async function adoptOrphans() {
+  // ŹRÓDŁO PRAWDY: rejestr runów (state.json). Deterministyczne, niezależne od
+  // treści komentarzy i od historii poprzednich runów tego samego ticketu.
+  for (const st of registry.listUnfinished()) {
+    if (active.has(st.ticketId)) continue;
+    const entry = sources.find((x) => x.project === st.project);
+    if (!entry || !st.runId) continue;
+    const gates = Object.values(st.gates);
+    const openGate = gates.find((g) => g.decision === undefined);
+    const pendingResume = gates.find((g) => g.decision && !g.decision.resumeSentAt);
+    active.add(st.ticketId);
+    console.log(
+      `[${st.ticketId}] ADOPCJA z rejestru: run ${st.runId}, faza ${st.phase ?? "?"}` +
+        (openGate ? `, bramka ${openGate.kind} otwarta` : pendingResume ? `, decyzja bez resume` : ", decyzje obsłużone")
+    );
+    watchRun(st.project, entry.src, st.ticketId, st.runId, openGate?.openedAt, !openGate && !pendingResume).catch((err) => {
+      console.error(`[${st.ticketId}] adopcja padła:`, err);
+      active.delete(st.ticketId);
+    });
+  }
+
+  // FALLBACK (runy sprzed migracji, bez state.json): stare guardy tekstowe
   for (const { project, src } of sources) {
   const issues = await src.listWithComments("In Progress");
   for (const issue of issues) {
     if (active.has(issue.id)) continue;
+    if (registry.readState(issue.id)?.runId) continue; // rejestr już to obsłużył
     const mine = issue.comments.filter((c) => c.body.includes(marker(issue.id)));
     if (mine.length === 0) continue; // nie nasz ticket
     // runId z najnowszego komentarza z planem (zawiera "run `<uuid>`")
