@@ -13,7 +13,14 @@ import { saveArtifact, artifactHeader } from "./artifacts";
 import { takeScreenshot } from "./screenshot";
 import { recordMetric } from "./metrics";
 import { budgetExceeded } from "./budget";
-import { parsePlanVerdict, parseVerifyVerdict, parseReviewVerdict, verdictInstruction, MISSING_VERDICT } from "./verdicts";
+import {
+  formatClarifyQuestions,
+  parsePlanVerdict,
+  parseVerifyVerdict,
+  parseReviewVerdict,
+  verdictInstruction,
+  MISSING_VERDICT,
+} from "./verdicts";
 import { allQualityCommands, cleanExecutionEnv, fullBranchDiff, QualityGateError, runQualityCommands } from "./quality";
 import { changedFilesInWorkspace, undeclaredChangedFiles } from "./scope";
 import { waitForGithubChecks } from "./github-ci";
@@ -232,7 +239,7 @@ const clarifyGateStep = createStep({
   execute: async ({ inputData, resumeData, suspend, runId }) => {
     const verdict = parsePlanVerdict(inputData.plan);
     if (verdict.ok) return inputData;
-    const questions = verdict.questions;
+    const questions = verdict.questions ? formatClarifyQuestions(verdict.questions) : undefined;
     // BLOCKED bez pytań (np. ticket już zrealizowany) → finalize zablokuje twardo
     if (!questions || inputData.clarifyRound >= inputData.maxClarifyRounds) return inputData;
     if (!resumeData) {
