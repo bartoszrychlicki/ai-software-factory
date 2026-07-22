@@ -31,6 +31,7 @@ import { getProject } from "../pipeline/projects";
 import { breakerOpen, recordRunOutcome, checkHourlySpend } from "../pipeline/breaker";
 import { notify } from "../pipeline/notify";
 import { runProdChecks } from "../pipeline/prod-smoke";
+import * as registry from "../pipeline/run-registry";
 
 const exec = promisify(execFile);
 
@@ -69,8 +70,21 @@ const limitLogged = new Set<string>(); // log limitu równoległości raz na pro
 const marker = (id: string) => `[linear:${id}:v1]`;
 
 /** Fabryka jako jedyny autor stanów procesu (projekty z statuses: extended w projects.yaml). */
-async function setPhase(project: string, src: LinearSource, id: string, stateName: string): Promise<void> {
+const PHASE_BY_STATE: Record<string, registry.FactoryPhase> = {
+  "🧠 Planowanie": "planning",
+  "❓ Pytania do autora": "questions",
+  "🚦 Plan do akceptacji": "plan-approval",
+  "🔨 Build": "build",
+  "🧪 Weryfikacja": "verify",
+  "👀 Code review": "review",
+  "✅ PR do merge": "pr-ready",
+};
+
+async function setPhase(project: string, src: LinearSource, id: string, stateName: string, runId?: string): Promise<void> {
   try {
+    const phase = PHASE_BY_STATE[stateName];
+    const rid = runId ?? registry.readState(id)?.runId;
+    if (phase && rid) registry.recordPhase(id, { project, runId: rid }, phase, stateName);
     const cfg = await getProject(project);
     if (cfg.statuses !== "extended") return;
     await src.setStateByName(id, stateName);
@@ -171,8 +185,17 @@ async function handleTicket(
     : `🤖 ai-factory przyjęła ticket ${marker(id)}. Planner startuje.`);
   notify(`🤖 ${id}: ticket przyjęty`, reusePlan ? "♻️ Reuse zatwierdzonego planu — build od razu." : `Planner startuje (${project}). Plan przyjdzie do akceptacji.`).catch(() => {});
 
-  await setPhase(project, src, id, reusePlan ? "🔨 Build" : "🧠 Planowanie");
   const runId = await createRun();
+  // rejestr: manifest zlecenia czytany RAZ przy claimie (labele = parametry, nie sygnały)
+  registry.updateState(id, { project, runId }, (st) => {
+    st.manifest = {
+      labels,
+      engine: labels.find((l) => l.startsWith("engine:"))?.slice(7),
+      domain: labels.find((l) => l.startsWith("domain:"))?.slice(7),
+      planMode: labels.find((l) => l.startsWith("plan:"))?.slice(5),
+    };
+  });
+  await setPhase(project, src, id, reusePlan ? "🔨 Build" : "🧠 Planowanie");
   await src.comment(id, `🧾 run \`${runId}\` ${marker(id)}`).catch(() => {}); // kotwica adopcji (kluczowa dla reuse — nie ma komentarza z planem)
   fireStart(runId, { id, title, description, project, labels, reusePlan });
   console.log(`[${id}] run ${runId} wystartowany`);
@@ -226,7 +249,8 @@ async function watchRun(
               `(Aprobata w Studio też nadal działa: run \`${runId}\`.)\n\n---\n\n${clip(plan, 16000)}`
           );
           planCommentedAt = new Date().toISOString(); // dopiero PO udanym komentarzu — inaczej czkawka API gubi plan na zawsze (BAR-104)
-          await setPhase(project, src, id, "🚦 Plan do akceptacji");
+          registry.openGateRecord(id, { project, runId }, "plan-approval", 0, "🚦 Plan do akceptacji");
+          await setPhase(project, src, id, "🚦 Plan do akceptacji", runId);
           console.log(`[${id}] plan czeka na decyzję w Linear`);
           notify(`⏳ ${id}: plan do akceptacji`, "Odpowiedz `zatwierdzam` / `odrzuć: powód` w Linear.").catch(() => {});
         } catch (err) {
@@ -241,7 +265,15 @@ async function watchRun(
         }
         if (decision) {
           decisionSent = true;
+          registry.recordDecision(id, { project, runId }, "plan-approval", 0, {
+            kind: decision.approved ? "approve" : "reject",
+            payload: decision.feedback,
+            via: "text-legacy",
+            observedAt: new Date().toISOString(),
+          });
+          registry.markDecisionStep(id, { project, runId }, "plan-approval", 0, "consumedAt");
           fireResume(runId, decision);
+          registry.markDecisionStep(id, { project, runId }, "plan-approval", 0, "resumeSentAt");
           console.log(`[${id}] decyzja z Linear: ${decision.approved ? "ZATWIERDZONO" : "ODRZUCONO"}`);
           // natychmiastowe domknięcie pętli zwrotnej — bez tego wygląda, jakby system nie chwycił decyzji
           if (decision.approved) {
@@ -271,7 +303,9 @@ async function watchRun(
             `${reviewLine}\n\n${clip(review, 4000)}${screenshotMd}\n\nMerge = decyzja człowieka.`
         );
         await src.setStatus(id, "human_review");
-        await setPhase(project, src, id, "✅ PR do merge");
+        registry.updateState(id, { project, runId }, (st) => { st.prUrl = prUrl; });
+        registry.finalize(id, { project, runId }, "success");
+        await setPhase(project, src, id, "✅ PR do merge", runId);
         await recordRunOutcome(true).catch(() => {});
         notify(`✅ ${id}: PR gotowy`, `${prUrl}${verdict === "lgtm" ? " (ready for review)" : " (draft)"}`).catch(() => {});
         console.log(`[${id}] SUKCES → ${prUrl}`);
@@ -297,6 +331,7 @@ async function watchRun(
           const alreadyRetried = (await src.listComments(id).catch(() => []))
             .some((c) => c.body.includes("[auto-retry]"));
           if (!alreadyRetried) {
+            registry.updateState(id, { project, runId }, (st) => { st.autoRetry = { count: st.autoRetry.count + 1, lastAt: new Date().toISOString() }; });
             await src.comment(id, `🔁 Porażka infrastrukturalna — auto-retry 1/1 [auto-retry] ${marker(id)}\n\n${clip(msg, 2000)}`);
             await src.setStatus(id, "needs_clarification"); // Todo — listReady wymaga stanu backlog/unstarted
             await src.relabelReady(id);
@@ -311,6 +346,7 @@ async function watchRun(
             `Uzupełnij ticket i nadaj ponownie label \`agent:ready\`, żeby fabryka spróbowała jeszcze raz.`
         );
         await src.setStatus(id, blocked ? "needs_clarification" : "blocked");
+        registry.finalize(id, { project, runId }, /odrzucony przez człowieka/i.test(msg) ? "rejected" : blocked ? "blocked" : "failed");
         notify(`🛑 ${id}: ${blocked ? "BLOCKED — pytania w tickecie" : "run nieudany"}`, clip(msg, 180)).catch(() => {});
         console.log(`[${id}] FAILED${blocked ? " (BLOCKED)" : ""}`);
         break;
@@ -397,6 +433,7 @@ async function watchMerges() {
         await src.comment(issue.id, `🎉 PR zmergowany ${marker(issue.id)} — ticket zamknięty, workspace posprzątany.`);
         await src.setStatus(issue.id, "done");
       }
+      registry.updateState(issue.id, { project, runId: registry.readState(issue.id)?.runId ?? "" }, (st) => { st.mergeHandledAt = new Date().toISOString(); });
       console.log(`[${issue.id}] MERGED → Done${state === "Done" ? " (dosprzątanie po integracji)" : ""}`);
       prodSmokeGuard(project, src, issue.id).catch((err) =>
         console.error(`[${issue.id}] prod smoke padł:`, err instanceof Error ? err.message : err));
@@ -548,7 +585,8 @@ async function handleClarifySuspend(
       `${qTag} ${marker(id)} — ticket wymaga doprecyzowania przed planem.\n\n` +
         `Odpowiedz krótko w komentarzu (np. \`1A, 2C\` albo własnymi słowami) — doplanuję bez ponownego labelowania.\n\n---\n\n${qBody}`
     ).catch(() => {});
-    await setPhase(project, src, id, "❓ Pytania do autora");
+    registry.openGateRecord(id, { project, runId }, "clarify", qMax, "❓ Pytania do autora");
+    await setPhase(project, src, id, "❓ Pytania do autora", runId);
     notify(`❓ ${id}: pytania do ticketu (runda ${qMax})`, "Odpowiedz w komentarzu — fabryka doplanuje.").catch(() => {});
     console.log(`[${id}] pytania rundy ${qMax} czekają na odpowiedź`);
     return true;
@@ -568,7 +606,12 @@ async function handleClarifySuspend(
   const answer = lastAnswer(comments, qComment);
   if (answer && !answered.has(qMax)) {
     answered.add(qMax);
+    registry.recordDecision(id, { project, runId }, "clarify", qMax, {
+      kind: "answer", payload: answer, via: "text-legacy", observedAt: new Date().toISOString(),
+    });
+    registry.markDecisionStep(id, { project, runId }, "clarify", qMax, "consumedAt");
     fireResumeStep(runId, "clarify-ticket", { answers: answer });
+    registry.markDecisionStep(id, { project, runId }, "clarify", qMax, "resumeSentAt");
     await src.comment(id, `🧠 Odpowiedzi przyjęte ${marker(id)} — doplanowuję (runda ${qMax}).`).catch(() => {});
     await setPhase(project, src, id, "🧠 Planowanie");
     notify(`🧠 ${id}: odpowiedzi przyjęte`, `Doplanowanie (runda ${qMax}).`).catch(() => {});
