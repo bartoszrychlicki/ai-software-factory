@@ -255,6 +255,7 @@ async function watchRun(
         }
       } else if (status === "suspended" && planCommentedAt && !decisionSent) {
         let decision = await readDecision(src, id, planCommentedAt);
+        let via: "state" | "command" | "text-legacy" = decision ? "text-legacy" : "state";
         // aprobata przez PRZECIĄGNIĘCIE karty: 🚦 Plan do akceptacji → 🔨 Build (bezargumentowa, więc status wystarcza)
         if (!decision) {
           // DETERMINISTYCZNY sygnał: przejście stanu wg mapy decyzji (bez regexów na tekście)
@@ -268,7 +269,7 @@ async function watchRun(
           registry.recordDecision(id, { project, runId }, "plan-approval", 0, {
             kind: decision.approved ? "approve" : "reject",
             payload: decision.feedback,
-            via: "text-legacy",
+            via,
             observedAt: new Date().toISOString(),
           });
           registry.markDecisionStep(id, { project, runId }, "plan-approval", 0, "consumedAt");
