@@ -21,6 +21,7 @@ test("macOS wybiera linear:// i dokładne argv terminal-notifier, gdy aplikacja 
     "Treść",
     "https://linear.app/acme/issue/BAR-164/test",
     commandRunner(calls),
+    { cache: false },
   );
 
   assert.deepEqual(calls, [
@@ -47,6 +48,7 @@ test("macOS pozostawia HTTPS, gdy aplikacji Linear nie ma", async () => {
     "Treść",
     "https://linear.app/acme/issue/BAR-164/test",
     commandRunner(calls, (file) => file === "open" ? new Error("Linear app not found") : undefined),
+    { cache: false },
   );
 
   assert.deepEqual(calls.at(-1), {
@@ -74,6 +76,7 @@ test("macOS używa osascript jako awaryjnego fallbacku po ENOENT terminal-notifi
     "Treść",
     "https://linear.app/acme/issue/BAR-164/test",
     commandRunner(calls, failure),
+    { cache: false },
   );
 
   assert.deepEqual(calls.map((call) => call.file), ["open", "terminal-notifier", "osascript"]);
@@ -81,6 +84,36 @@ test("macOS używa osascript jako awaryjnego fallbacku po ENOENT terminal-notifi
     file: "osascript",
     args: ["-e", 'display notification "Treść" with title "Tytuł" sound name "Glass"'],
   });
+});
+
+test("macOS cache'uje wykrycie Linear jawnie i ponawia je po TTL", async () => {
+  const calls: CommandCall[] = [];
+  let now = 1_000;
+  let detectionCount = 0;
+  const dateNowMock = mock.method(Date, "now", () => now);
+  const run = commandRunner(calls, (file) => {
+    if (file !== "open") return undefined;
+    detectionCount += 1;
+    return detectionCount === 1 ? new Error("przejściowy błąd LaunchServices") : undefined;
+  });
+
+  try {
+    const url = "https://linear.app/acme/issue/BAR-164/test";
+    await notifyMacos("Tytuł 1", "Treść", url, run);
+    await notifyMacos("Tytuł 2", "Treść", url, run);
+    now += 5 * 60_000 + 1;
+    await notifyMacos("Tytuł 3", "Treść", url, run);
+
+    assert.equal(detectionCount, 2);
+    assert.deepEqual(
+      calls
+        .filter((call) => call.file === "terminal-notifier")
+        .map((call) => call.args[call.args.indexOf("-open") + 1]),
+      [url, url, "linear://linear.app/acme/issue/BAR-164/test"],
+    );
+  } finally {
+    dateNowMock.mock.restore();
+  }
 });
 
 test("Telegram dodaje inline button z kanonicznym URL-em WWW", async () => {

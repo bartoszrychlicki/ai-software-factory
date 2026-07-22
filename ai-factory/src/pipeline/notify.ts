@@ -3,6 +3,7 @@ import { promisify } from "node:util";
 
 const exec = promisify(execFile);
 type CommandRunner = (file: string, args: readonly string[]) => Promise<unknown>;
+type MacosNotificationOptions = { cache?: boolean };
 
 /**
  * Powiadomienia dla człowieka: „agent czegoś potrzebuje" + finały.
@@ -15,7 +16,8 @@ export async function notify(title: string, message: string, url?: string): Prom
   await Promise.allSettled([notifyMacos(title, message, url), notifyTelegram(title, message, url)]);
 }
 
-let linearAppPresent: Promise<boolean> | undefined;
+const LINEAR_APP_CACHE_TTL_MS = 5 * 60_000;
+let linearAppCache: { expiresAt: number; present: Promise<boolean> } | undefined;
 
 function detectLinearApp(run: CommandRunner): Promise<boolean> {
   return run("open", ["-Ra", "Linear"]).then(
@@ -24,11 +26,16 @@ function detectLinearApp(run: CommandRunner): Promise<boolean> {
   );
 }
 
-async function hasLinearApp(run: CommandRunner): Promise<boolean> {
-  if (run !== exec) return detectLinearApp(run);
-  const detected = linearAppPresent ?? detectLinearApp(run);
-  linearAppPresent = detected;
-  return detected;
+async function hasLinearApp(run: CommandRunner, cache: boolean): Promise<boolean> {
+  if (!cache) return detectLinearApp(run);
+  const now = Date.now();
+  if (!linearAppCache || linearAppCache.expiresAt <= now) {
+    linearAppCache = {
+      expiresAt: now + LINEAR_APP_CACHE_TTL_MS,
+      present: detectLinearApp(run),
+    };
+  }
+  return linearAppCache.present;
 }
 
 export function resolveClickTarget(url: string, appPresent: boolean): string {
@@ -40,10 +47,11 @@ export async function notifyMacos(
   message: string,
   url?: string,
   run: CommandRunner = exec,
+  { cache = true }: MacosNotificationOptions = {},
 ): Promise<void> {
   const args = ["-title", title, "-message", message];
   if (url) {
-    args.push("-open", resolveClickTarget(url, await hasLinearApp(run)));
+    args.push("-open", resolveClickTarget(url, await hasLinearApp(run, cache)));
   }
 
   try {

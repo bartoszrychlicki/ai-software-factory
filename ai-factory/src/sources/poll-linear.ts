@@ -261,7 +261,7 @@ async function watchRun(
   try {
     while (Date.now() < deadline) {
       await sleep(RUN_WATCH_INTERVAL_MS);
-      await notifyPhaseMilestones(project, src, id, runDir, seenArtifacts);
+      await notifyPhaseMilestones(project, src, id, runDir, seenArtifacts, ticketUrl);
 
       // Stan końcowy ustawiony przez człowieka jest nadrzędny. Bez tego Canceled
       // zatrzymywał tylko kartę, a kosztowny builder/reviewer pracował dalej.
@@ -285,7 +285,7 @@ async function watchRun(
       const status = runStatus(run);
 
       // tryb dopytywania: suspend na clarify-ticket obsługujemy PRZED przepływem aprobaty
-      if (status === "suspended" && await handleClarifySuspend(project, src, id, runId, runDir, run, answeredRounds, hintedRounds)) {
+      if (status === "suspended" && await handleClarifySuspend(project, src, id, runId, runDir, run, answeredRounds, hintedRounds, ticketUrl)) {
         continue;
       }
 
@@ -701,7 +701,14 @@ function artifactField(path: string, field: string): string {
 }
 
 /** Nowy artefakt = zakończona faza → notyfikacja z werdyktem (+ stan procesu na tablicy). */
-async function notifyPhaseMilestones(project: string, src: LinearSource, id: string, runDir: string, seen: Set<string>) {
+async function notifyPhaseMilestones(
+  project: string,
+  src: LinearSource,
+  id: string,
+  runDir: string,
+  seen: Set<string>,
+  ticketUrl?: string
+) {
   for (const f of safeReaddir(runDir)) {
     if (seen.has(f)) continue;
     seen.add(f);
@@ -736,7 +743,7 @@ async function notifyPhaseMilestones(project: string, src: LinearSource, id: str
       if (outcome === "pushed") msg = [`🔧 ${id}: poprawki wgrane (runda ${fix[1]})`, "Kolejna runda review."];
     }
 
-    if (msg) notify(msg[0], msg[1], registry.readState(id)?.manifest?.url).catch(() => {});
+    if (msg) notify(msg[0], msg[1], ticketUrl).catch(() => {});
   }
 }
 
@@ -765,9 +772,9 @@ async function handleClarifySuspend(
   runDir: string,
   run: MastraRunSnapshot,
   answered: Set<number>,
-  hintedRounds: Set<number>
+  hintedRounds: Set<number>,
+  ticketUrl?: string
 ): Promise<boolean> {
-  const ticketUrl = registry.readState(id)?.manifest?.url;
   const qFiles = safeReaddir(runDir).filter((f) => /^questions-round-\d+\.md$/.test(f));
   if (!qFiles.length) return false;
   const qMax = Math.max(...qFiles.map((f) => Number(f.match(/\d+/)![0])));
@@ -898,7 +905,9 @@ const smokeRunning = new Set<string>();
  * gdy funkcja jest martwa na prodzie — lekcja z BAR-101/102).
  */
 async function prodSmokeGuard(projectKey: string, src: LinearSource, ticketId: string) {
-  if (registry.readState(ticketId)?.prodSmokeAt || smokeRunning.has(ticketId)) return;
+  const ticketState = registry.readState(ticketId);
+  if (ticketState?.prodSmokeAt || smokeRunning.has(ticketId)) return;
+  const ticketUrl = ticketState?.manifest?.url;
   smokeRunning.add(ticketId);
 
   try {
@@ -927,7 +936,7 @@ async function prodSmokeGuard(projectKey: string, src: LinearSource, ticketId: s
           `Ticket wraca do In Review — zweryfikuj deploy/hosting (por. BAR-77/102).`
       );
       await src.setStatus(ticketId, "human_review");
-      notify(`🚨 ${ticketId}: prod smoke FAILED`, "Merge jest, ale produkcja nie serwuje zmiany — szczegóły w tickecie.", registry.readState(ticketId)?.manifest?.url).catch(() => {});
+      notify(`🚨 ${ticketId}: prod smoke FAILED`, "Merge jest, ale produkcja nie serwuje zmiany — szczegóły w tickecie.", ticketUrl).catch(() => {});
       console.log(`[${ticketId}] PROD SMOKE FAILED`);
     }
     registry.updateState(ticketId, { project: projectKey, runId: registry.readState(ticketId)?.runId ?? "" }, (s) => { s.prodSmokeAt = new Date().toISOString(); });
