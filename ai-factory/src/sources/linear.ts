@@ -2,7 +2,6 @@ import type { FactoryStatus, Ticket, TicketSource } from "./types";
 import { LINEAR_STATE_MAP } from "./state-map";
 
 const API = "https://api.linear.app/graphql";
-const READY_LABEL = "agent:ready";
 
 /** Mapowanie statusów fabryki na TYPY stanów Lineara (nazwy stanów są per team). */
 const STATUS_TO_STATE_TYPE: Record<FactoryStatus, string> = {
@@ -67,17 +66,10 @@ export class LinearSource implements TicketSource {
   /**
    * Tickety oddane fabryce przez człowieka = stan `ready` z mapy (Linear: "Todo").
    * STAN, nie label — sterowanie przepływem jest deterministyczne i widoczne na tablicy.
-   * Fallback: dopóki `FACTORY_LABEL_TRIGGER=1`, stary label `agent:ready` też działa
-   * (okno migracji dla ticketów oznaczonych przed zmianą).
+   * Label-trigger `agent:ready` wycięty w BAR-147 razem z flagą FACTORY_LABEL_TRIGGER.
    */
   async listReady(): Promise<Ticket[]> {
-    const byState = { project: { name: { eq: this.project } }, state: { name: { eq: LINEAR_STATE_MAP.ready } } };
-    const byLabel = {
-      project: { name: { eq: this.project } },
-      labels: { name: { eq: READY_LABEL } },
-      state: { type: { in: ["backlog", "unstarted"] } },
-    };
-    const filter = process.env.FACTORY_LABEL_TRIGGER === "1" ? { or: [byState, byLabel] } : byState;
+    const filter = { project: { name: { eq: this.project } }, state: { name: { eq: LINEAR_STATE_MAP.ready } } };
     const data = await this.gql<{ issues: { nodes: LinearIssue[] } }>(
       `query($filter: IssueFilter) { issues(filter: $filter, first: 25) { nodes { ${this.issueFields} } } }`,
       { filter }
@@ -87,24 +79,23 @@ export class LinearSource implements TicketSource {
       source: this.name,
       title: i.title,
       description: i.description ?? "",
-      labels: i.labels.nodes.map((l) => l.name).filter((n) => n !== READY_LABEL),
+      labels: i.labels.nodes.map((l) => l.name),
       priority: i.priorityLabel ?? undefined,
       url: i.url,
     }));
   }
 
   /**
-   * Zabiera ticket z kolejki: zdejmuje stary label-trigger (higiena po migracji)
-   * i przestawia stan na "started", żeby kolejny poll go nie zobaczył.
+   * Zabiera ticket z kolejki: przestawia stan na "started", żeby kolejny poll go nie
+   * zobaczył. Labeli NIE rusza — są wyłącznie informacyjne (BAR-142/147).
    * Fazę właściwą ustawia poller przez setPhase.
    */
   async claim(id: string): Promise<void> {
     const issue = await this.fetchIssue(id);
-    const labelIds = issue.labels.nodes.filter((l) => l.name !== READY_LABEL).map((l) => l.id);
     const started = pickState(issue.team.states.nodes, "started", "In Progress");
     await this.gql(
       `mutation($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }`,
-      { id: issue.id, input: { labelIds, stateId: started.id } }
+      { id: issue.id, input: { stateId: started.id } }
     );
   }
 
@@ -176,21 +167,6 @@ export class LinearSource implements TicketSource {
       { filter: { project: { name: { eq: this.project } }, state: { type: { eq: "started" } } } }
     );
     return data.issues.nodes.length;
-  }
-
-  /** Przywraca label-trigger (auto-retry porażek infrastrukturalnych). */
-  async relabelReady(id: string): Promise<void> {
-    const label = await this.gql<{ issueLabels: { nodes: { id: string }[] } }>(
-      `query { issueLabels(filter: { name: { eq: "${READY_LABEL}" } }, first: 1) { nodes { id } } }`
-    );
-    const labelId = label.issueLabels.nodes[0]?.id;
-    if (!labelId) throw new Error(`Brak labela ${READY_LABEL} w workspace`);
-    const issue = await this.fetchIssue(id);
-    const labelIds = [...new Set([...issue.labels.nodes.map((l) => l.id), labelId])];
-    await this.gql(
-      `mutation($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }`,
-      { id: issue.id, input: { labelIds } }
-    );
   }
 
   /** Upload pliku do CDN Lineara; zwrócony assetUrl można osadzić w markdownie komentarza. */

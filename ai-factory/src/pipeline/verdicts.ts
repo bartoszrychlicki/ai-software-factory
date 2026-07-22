@@ -1,45 +1,45 @@
 /**
  * Kanał agent → fabryka: JEDEN punkt parsowania werdyktu.
  *
- * Problem: dziś werdykty żyją jako markery rozsiane po tekście raportu
- * (`PLAN: OK`, `VERDICT: PASS`, `REVIEW: FIX`, sekcje `## Pytania do autora`,
- * linie `SCREENSHOT:`), parsowane regexami w 15 miejscach. To ta sama choroba
- * co sterowanie komentarzami: BAR-101 (marker w backtickach), BAR-108 (pytania
- * w zgubionej wiadomości pośredniej), fail-open `REVIEW: FIX`.
+ * Agent kończy raport blokiem `​```factory` z JSON-em. Parsujemy go RAZ, tutaj.
+ * Markerów tekstowych (`PLAN: OK`, `VERDICT: PASS`, `REVIEW: FIX`, nagłówki sekcji
+ * pytań, linie `SCREENSHOT:`) NIE ma — były bezpiecznikiem okresu przejściowego
+ * i zostały wycięte w BAR-147, gdy dane potwierdziły 100% werdyktów strukturalnych
+ * po naprawie transkryptu (BAR-130). Rozpoznawanie przepływu po swobodnym tekście
+ * kosztowało nas BAR-101, BAR-108 i klasę cichych fail-openów — nie wraca.
  *
- * Rozwiązanie: agent kończy raport blokiem `​```factory` z JSON-em. Parsujemy go
- * RAZ, tutaj, do typu. Markery tekstowe zostają wyłącznie jako fallback okresu
- * przejściowego — i są jawnie oznaczone w wyniku (`source: "legacy"`), żeby
- * dało się zmierzyć, kiedy można je wyciąć.
- *
- * Fail-closed: brak parsowalnego werdyktu = NEGATYWNY wynik (nie „przepuść").
+ * Fail-closed: brak parsowalnego bloku = wynik NEGATYWNY, oznaczony `source: "missing"`,
+ * żeby wywołujący mógł to zaraportować jako awarię kontraktu, a nie ciszę.
  */
+
+/** `structured` = agent dotrzymał kontraktu; `missing` = nie oddał bloku (fail-closed). */
+export type VerdictSource = "structured" | "missing";
 
 export interface PlanVerdict {
   kind: "plan";
   ok: boolean;
   /** Pytania do autora (gdy !ok i ticket wymaga doprecyzowania). */
   questions?: string;
-  /** Ścieżki widoków do zrzutów ekranu (dawne linie `SCREENSHOT:`). */
+  /** Ścieżki widoków do zrzutów ekranu. */
   screenshots: string[];
-  /** Domena pracy — pod BAR-133 (routing bez ręcznego labela). */
+  /** Domena pracy — routing buildu (BAR-133). */
   domain?: string;
-  /** Pliki, które ticket zmieni — pod BAR-141 (kolizje plikowe). */
+  /** Pliki, które ticket zmieni — serializacja kolizji (BAR-141). */
   files: string[];
-  source: "structured" | "legacy";
+  source: VerdictSource;
 }
 
 export interface VerifyVerdict {
   kind: "verify";
   pass: boolean;
-  source: "structured" | "legacy";
+  source: VerdictSource;
 }
 
 export interface ReviewVerdict {
   kind: "review";
   /** true = są uwagi do poprawy. FAIL-CLOSED: brak werdyktu ⇒ true. */
   needsFix: boolean;
-  source: "structured" | "legacy";
+  source: VerdictSource;
 }
 
 /** Blok `​```factory {...}​``` z końca raportu — ostatni wygrywa. */
@@ -58,6 +58,11 @@ function structuredBlock(report: string): Record<string, unknown> | undefined {
 const asStringArray = (v: unknown): string[] =>
   Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
 
+/** Komunikat dla człowieka i buildera, gdy agent nie dotrzymał kontraktu wyjścia. */
+export const MISSING_VERDICT =
+  "Agent nie oddał bloku ```factory z werdyktem (kontrakt wyjścia). " +
+  "Traktuję to fail-closed jako wynik negatywny — sprawdź pełny raport w artefaktach runu.";
+
 /** Instrukcja doklejana do promptu roli — kontrakt wyjścia agenta. */
 export function verdictInstruction(kind: "plan" | "verify" | "review"): string {
   const shape =
@@ -72,49 +77,34 @@ export function verdictInstruction(kind: "plan" | "verify" | "review"): string {
     shape,
     "```",
     "Blok MUSI być ostatnim elementem odpowiedzi — po nim NIE dopisuj komentarzy, podsumowań ani uwag o agentach pomocniczych.",
+    "Bez tego bloku Twoja praca zostanie odrzucona: fabryka nie zgaduje werdyktu z treści raportu.",
   ].join("\n");
 }
 
 export function parsePlanVerdict(report: string): PlanVerdict {
   const b = structuredBlock(report);
-  if (b && typeof b.verdict === "string") {
-    return {
-      kind: "plan",
-      ok: b.verdict === "ok",
-      questions: typeof b.questions === "string" && b.questions.trim() ? b.questions : undefined,
-      screenshots: asStringArray(b.screenshots),
-      domain: typeof b.domain === "string" ? b.domain : undefined,
-      files: asStringArray(b.files),
-      source: "structured",
-    };
+  if (!b || typeof b.verdict !== "string") {
+    return { kind: "plan", ok: false, questions: undefined, screenshots: [], files: [], source: "missing" };
   }
-  // fallback okresu przejściowego: markery tekstowe
-  const ok = /^[`*\s]*PLAN:\s*OK\b/m.test(report);
-  const questions =
-    report.match(/^##\s*(Pytania do autora|Niejasności blokujące)[\s\S]*?(?=\n##\s|$)/m)?.[0] ??
-    // bez nagłówka: struktura pytań (numeracja + warianty A)/B) + REKOMENDACJA) — lekcja z BAR-108
-    (/^\s*\d+\.[\s\S]*?^\s*[A-D]\)/m.test(report) && /REKOMENDACJA/i.test(report) ? report : undefined);
   return {
     kind: "plan",
-    ok,
-    questions: ok ? undefined : questions,
-    screenshots: [...report.matchAll(/^SCREENSHOT:\s*(\/\S*)/gm)].map((m) => m[1]),
-    files: [],
-    source: "legacy",
+    ok: b.verdict === "ok",
+    questions: typeof b.questions === "string" && b.questions.trim() ? b.questions : undefined,
+    screenshots: asStringArray(b.screenshots),
+    domain: typeof b.domain === "string" ? b.domain : undefined,
+    files: asStringArray(b.files),
+    source: "structured",
   };
 }
 
 export function parseVerifyVerdict(report: string): VerifyVerdict {
   const b = structuredBlock(report);
-  if (b && typeof b.verdict === "string") return { kind: "verify", pass: b.verdict === "pass", source: "structured" };
-  return { kind: "verify", pass: /^VERDICT:\s*PASS/m.test(report), source: "legacy" };
+  if (!b || typeof b.verdict !== "string") return { kind: "verify", pass: false, source: "missing" };
+  return { kind: "verify", pass: b.verdict === "pass", source: "structured" };
 }
 
 export function parseReviewVerdict(report: string): ReviewVerdict {
   const b = structuredBlock(report);
-  if (b && typeof b.verdict === "string") return { kind: "review", needsFix: b.verdict === "fix", source: "structured" };
-  // FAIL-CLOSED (zmiana względem starego zachowania): brak jednoznacznego LGTM = są uwagi.
-  // Dotąd brak markera znaczył „przepuść", więc zgubiona wiadomość agenta cicho zdejmowała draft z PR-a.
-  const lgtm = /^REVIEW:\s*LGTM/m.test(report);
-  return { kind: "review", needsFix: !lgtm, source: "legacy" };
+  if (!b || typeof b.verdict !== "string") return { kind: "review", needsFix: true, source: "missing" };
+  return { kind: "review", needsFix: b.verdict === "fix", source: "structured" };
 }

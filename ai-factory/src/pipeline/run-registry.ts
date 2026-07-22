@@ -38,7 +38,7 @@ export interface GateRecord {
   decision?: {
     kind: DecisionKind;
     payload?: string;
-    via: "state" | "command" | "text-legacy";
+    via: "state" | "command";
     observedAt: string;
     consumedAt?: string;
     resumeSentAt?: string;
@@ -128,8 +128,7 @@ function writeState(state: TicketState): void {
 
 /**
  * Czyta stan, przepuszcza przez mutator i zapisuje. Zwraca zapisany stan.
- * Awaria zapisu NIGDY nie wywala pollera — rejestr jest wsparciem, nie bramką
- * (w fazie 1 migracji stare guardy tekstowe wciąż działają).
+ * Awaria zapisu NIGDY nie wywala pollera — logujemy i jedziemy dalej.
  */
 export function updateState(
   ticketId: string,
@@ -248,7 +247,7 @@ export type FailureReason = "plan-gate" | "verify" | "budget" | "infra" | "rejec
 export function classifyFailure(message: string): FailureReason {
   if (/odrzucony przez człowieka|Plan odrzucony/i.test(message)) return "rejected";
   if (/budżet ticketu wyczerpany/i.test(message)) return "budget";
-  if (/plan bez PLAN: OK|niejasności blokujące|Pytania do autora|JUŻ ISTNIEJE|już istnieje/i.test(message)) return "plan-gate";
+  if (/plan bez werdyktu ok|nie oddał bloku|niejasności blokujące|Pytania do autora|JUŻ ISTNIEJE|już istnieje/i.test(message)) return "plan-gate";
   if (/BLOCKED po \d+\/\d+ próbach|konflikt semantyczny|konflikt z /i.test(message)) return "verify";
   return "infra";
 }

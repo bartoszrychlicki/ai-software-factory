@@ -13,7 +13,7 @@ import { saveArtifact, artifactHeader } from "./artifacts";
 import { takeScreenshot } from "./screenshot";
 import { recordMetric } from "./metrics";
 import { budgetExceeded } from "./budget";
-import { parsePlanVerdict, parseVerifyVerdict, parseReviewVerdict, verdictInstruction } from "./verdicts";
+import { parsePlanVerdict, parseVerifyVerdict, parseReviewVerdict, verdictInstruction, MISSING_VERDICT } from "./verdicts";
 
 const exec = promisify(execFile);
 
@@ -86,6 +86,10 @@ const ticketDomain = (ticket: { labels?: string[] }, plan?: string): string | un
   }
   return declared;
 };
+
+/** Metryka rozróżnia „planner zablokował" od „planner nie dotrzymał kontraktu" (BAR-147). */
+const planOutcome = (v: { ok: boolean; source: string }) =>
+  v.source === "missing" ? "verdict-missing" : v.ok ? "ok" : "blocked";
 
 const intakeStep = createStep({
   id: "intake",
@@ -173,11 +177,10 @@ const planStep = createStep({
         "- plan zmian plik po pliku",
         "- plan testów",
         "Decyzje kosmetyczne (separator, nazewnictwo, drobny format) podejmij SAM i odnotuj w planie — nie są niejasnością.",
-        "Jeśli zmiana dotyka UI: wypisz w planie 1-4 linie `SCREENSHOT: /ścieżka` (czysty tekst, początek linii) ze ścieżkami widoków, na których zmianę widać — fabryka zrobi z nich zrzuty do oceny przez człowieka.",
-        "Jeśli ticketu NIE DA SIĘ bezpiecznie zaplanować bez odpowiedzi człowieka: PLAN: BLOCKED + sekcja `## Pytania do autora ticketu` — ponumerowane pytania, każde z opcjami A)/B)/C) i dopiskiem (REKOMENDACJA) przy tej, którą byś wybrał. Autor odpowie krótko (np. \"1A, 2C\") i doplanujesz z odpowiedziami w kontekście.",
+        "Jeśli zmiana dotyka UI: podaj w bloku factory 1-4 ścieżki widoków w polu \"screenshots\" — fabryka zrobi z nich zrzuty do oceny przez człowieka.",
+        "Jeśli ticketu NIE DA SIĘ bezpiecznie zaplanować bez odpowiedzi człowieka: verdict \"blocked\" i pytania w polu \"questions\" — ponumerowane, każde z opcjami A)/B)/C) i dopiskiem (REKOMENDACJA) przy tej, którą byś wybrał. Autor odpowie krótko (np. \"1A, 2C\") i doplanujesz z odpowiedziami w kontekście.",
         "Jeśli masz już odpowiedzi autora (sekcja poniżej ticketu) — potraktuj je jako wiążące decyzje i NIE zadawaj tych samych pytań ponownie.",
-        "Jeśli stan opisany w tickecie JUŻ ISTNIEJE w kodzie (ticket spełniony): PLAN: BLOCKED i wyjaśnienie BEZ pytań — nie planuj pustej pracy.",
-        "PIERWSZA linia odpowiedzi CZYSTYM TEKSTEM, bez backticków i formatowania: PLAN: OK albo PLAN: BLOCKED.",
+        "Jeśli stan opisany w tickecie JUŻ ISTNIEJE w kodzie (ticket spełniony): verdict \"blocked\" i wyjaśnienie w raporcie, BEZ pytań — nie planuj pustej pracy.",
         `W bloku factory wypełnij "files" KOMPLETNĄ listą plików, które ticket zmieni (ścieżki względem repo) — fabryka serializuje na ich podstawie równoległe tickety, więc pominięty plik grozi konfliktem merge'a.`,
         `Oraz "domain": frontend | backend | fullstack | ops — na podstawie zakresu zmian; od tego zależy dobór silnika buildu.`,
         verdictInstruction("plan"),
@@ -191,7 +194,7 @@ const planStep = createStep({
     await recordMetric({
       ticket: ticket.id, runId, stage: "plan", engine: route.spec,
       ok: result.ok,
-      outcome: result.ok ? (parsePlanVerdict(result.transcript ?? result.report).ok ? "ok" : "blocked") : "engine-fail",
+      outcome: result.ok ? planOutcome(parsePlanVerdict(result.transcript ?? result.report)) : "engine-fail",
       costUsd: result.costUsd, durationMs: Date.now() - t0,
     });
     await saveArtifact(
@@ -246,17 +249,25 @@ planClarifyCycle.commit();
 
 const finalizePlanStep = createStep({
   id: "finalize-plan",
-  description: "Bramka: plan bez PLAN: OK po rundach dopytywania = twardy BLOCKED (fail-closed)",
+  description: "Bramka: plan bez werdyktu ok po rundach dopytywania = twardy BLOCKED (fail-closed)",
   inputSchema: planCycleSchema,
   outputSchema: planOutputSchema,
   execute: async ({ inputData }) => {
-    const planVerdict = parsePlanVerdict(inputData.plan);
-    if (!planVerdict.ok) {
-      const detail = planVerdict.questions ?? inputData.plan.slice(0, 2000);
-      throw new Error(
-        `BLOCKED: plan bez PLAN: OK${inputData.clarifyRound > 0 ? ` po ${inputData.clarifyRound} rundach dopytywania` : ""}. ` +
-          `Uzupełnij ticket i nadaj label ponownie.\n\n${detail}`
-      );
+    // plan-reuse: treść była już zatwierdzona przez człowieka. Stare plany (sprzed
+    // kontraktu ```factory) nie mają bloku — ponowne sądzenie ich werdyktem zablokowałoby
+    // ticket, którego plan jest ważny. Bramka dotyczy planów ŚWIEŻO wygenerowanych.
+    if (!inputData.ticket.reusePlan) {
+      const planVerdict = parsePlanVerdict(inputData.plan);
+      if (!planVerdict.ok) {
+        const detail =
+          planVerdict.source === "missing"
+            ? `${MISSING_VERDICT}\n\n${inputData.plan.slice(0, 2000)}`
+            : (planVerdict.questions ?? inputData.plan.slice(0, 2000));
+        throw new Error(
+          `BLOCKED: plan bez werdyktu ok${inputData.clarifyRound > 0 ? ` po ${inputData.clarifyRound} rundach dopytywania` : ""}. ` +
+            `Uzupełnij ticket i przenieś go na Todo, żeby fabryka spróbowała ponownie.\n\n${detail}`
+        );
+      }
     }
     return { ticket: inputData.ticket, plan: inputData.plan, planCostUsd: inputData.planCostUsd };
   },
@@ -471,7 +482,7 @@ const verifyStep = createStep({
       }
       // QA runda 1: pełne e2e projektu na tym samym świeżym checkoutcie (po tanich checks — fail fast)
       if (ticket.e2e) {
-        // screenshoty widoków wskazanych przez plannera (linie `SCREENSHOT: /ścieżka`) — tymczasowy spec
+        // screenshoty widoków wskazanych przez plannera (pole "screenshots" w bloku factory)
         // dziedziczy z configu repo zalogowaną sesję i seedowane dane; sprzątany PRZED werdyktem agenta
         const shotTargets = parsePlanVerdict(inputData.plan).screenshots.slice(0, 4);
         const shotsDir = join(co.dir, ".factory-shots");
@@ -551,7 +562,6 @@ const verifyStep = createStep({
           "- każde kryterium akceptacji ma pokrycie w zmianach?",
           "- brak zmian poza zakresem planu?",
           "- jakość: oczywiste błędy, regresje, edge case'y?",
-          "PIERWSZA linia odpowiedzi: `VERDICT: PASS` albo `VERDICT: FAIL`.",
           verdictInstruction("verify"),
           "Potem uzasadnienie punktowo. Bądź surowy — wątpliwość = FAIL.",
         ].join("\n"),
@@ -585,10 +595,13 @@ const verifyStep = createStep({
         };
       }
 
-      const pass = parseVerifyVerdict(result.transcript ?? result.report).pass;
+      const verifyVerdict = parseVerifyVerdict(result.transcript ?? result.report);
+      const pass = verifyVerdict.pass;
+      if (verifyVerdict.source === "missing") console.warn(`[${ticket.id}] verify: ${MISSING_VERDICT}`);
       await recordMetric({
         ticket: ticket.id, runId, stage: "verify", engine: route.spec, attempt: inputData.attempt,
-        ok: true, outcome: pass ? "pass" : "fail", costUsd: result.costUsd, durationMs: Date.now() - t0,
+        ok: true, outcome: verifyVerdict.source === "missing" ? "verdict-missing" : pass ? "pass" : "fail",
+        costUsd: result.costUsd, durationMs: Date.now() - t0,
       });
       await saveVerify(
         { engine: route.spec, costUsd: result.costUsd, outcome: pass ? "pass" : "fail", checks: checksSummary.replace(/\n/g, "; ") },
@@ -598,7 +611,7 @@ const verifyStep = createStep({
         return {
           ...inputData,
           verdict: "fail" as const,
-          feedback: result.report, // pełny raport FAIL = feedback dla następnej próby
+          feedback: (verifyVerdict.source === "missing" ? `${MISSING_VERDICT}\n\n` : "") + result.report, // pełny raport FAIL = feedback dla następnej próby
           verifyReport: result.report,
         };
       }
@@ -767,7 +780,7 @@ const publishStep = createStep({
 /**
  * Pętla review→fix: recenzja PR z werdyktem; przy uwagach builder poprawia
  * w tym samym worktree, checks pilnują regresji, push aktualizuje PR — aż do
- * REVIEW: LGTM albo wyczerpania rund. Werdykt doradczy: po rundach z uwagami
+ * werdyktu lgtm albo wyczerpania rund. Werdykt doradczy: po rundach z uwagami
  * PR zostaje, decyzja przy merge jest ludzka.
  */
 const reviewCycleSchema = publishOutputSchema.extend({
@@ -850,7 +863,7 @@ const initReviewCycleStep = createStep({
 
 const prReviewStep = createStep({
   id: "pr-review",
-  description: "Code review PR-a z werdyktem REVIEW: LGTM / REVIEW: FIX",
+  description: "Code review PR-a z werdyktem lgtm / fix w bloku factory",
   inputSchema: reviewCycleSchema,
   outputSchema: reviewCycleSchema,
   execute: async ({ inputData, runId }) => {
@@ -884,9 +897,8 @@ const prReviewStep = createStep({
           "NIE oceniaj zgodności z ticketem ani kryteriów akceptacji — to zrobił już niezależny verifier.",
           "Skup się wyłącznie na jakości: czytelność, nazewnictwo, struktura, bezpieczeństwo,",
           "wydajność, obsługa błędów, brakujące testy, przyszła utrzymywalność.",
-          "PIERWSZA linia odpowiedzi: `REVIEW: LGTM` (kod w porządku) albo `REVIEW: FIX` (są uwagi do poprawy).",
-          "Po REVIEW: FIX wypisz uwagi: zwięzłe punkty `plik:linia — uwaga`, od najważniejszej, max 8.",
-          "Po REVIEW: LGTM jedno zdanie podsumowania. Zgłaszaj FIX tylko dla uwag wartych iteracji buildera.",
+          "Przy werdykcie \"fix\" wypisz uwagi: zwięzłe punkty `plik:linia — uwaga`, od najważniejszej, max 8.",
+          "Przy werdykcie \"lgtm\" jedno zdanie podsumowania. Zgłaszaj fix tylko dla uwag wartych iteracji buildera.",
           // BAR-125: bez historii runda 3 cofała poprawkę z rundy 2 i sama zgłaszała to jako uwagę (BAR-110)
           ...(inputData.reviewHistory.length
             ? [
@@ -919,7 +931,9 @@ const prReviewStep = createStep({
 
       // FAIL-CLOSED: brak jednoznacznego LGTM = są uwagi (dotąd fail-open zdejmował draft
       // z PR-a, gdy agent zgubił marker w wiadomości pośredniej)
-      const fix = parseReviewVerdict(result.transcript ?? result.report).needsFix;
+      const reviewVerdict = parseReviewVerdict(result.transcript ?? result.report);
+      const fix = reviewVerdict.needsFix;
+      if (reviewVerdict.source === "missing") console.warn(`[${ticket.id}] review runda ${round}: ${MISSING_VERDICT}`);
       const verdict = fix ? ("fix" as const) : ("lgtm" as const);
 
       // BAR-125: uwagi powtórzone z wcześniejszej rundy = pętla nie zbiega. Dalsze rundy
@@ -930,7 +944,8 @@ const prReviewStep = createStep({
         : undefined;
       await recordMetric({
         ticket: ticket.id, runId, stage: "review", engine: route.spec, round,
-        ok: true, outcome: verdict, costUsd: result.costUsd, durationMs: Date.now() - t0,
+        ok: true, outcome: reviewVerdict.source === "missing" ? "verdict-missing" : verdict,
+        costUsd: result.costUsd, durationMs: Date.now() - t0,
       });
 
       await saveArtifact(ticket.id, runId, `review-round-${round}.md`,
@@ -984,7 +999,7 @@ const remediateStep = createStep({
   inputSchema: reviewCycleSchema,
   outputSchema: reviewCycleSchema,
   execute: async ({ inputData, runId }) => {
-    // poprawiamy tylko przy REVIEW: FIX i dopóki są rundy
+    // poprawiamy tylko przy werdykcie fix i dopóki są rundy
     if (inputData.reviewVerdict !== "fix" || inputData.reviewRound >= inputData.maxReviewRounds || inputData.oscillation) {
       return inputData;
     }

@@ -3,12 +3,12 @@
  *
  * Pętla co INTERVAL:
  *  1) health-check API Mastry (serwer w dole = nie claimujemy, tickety czekają),
- *  2) tickety z labelem `agent:ready` (backlog/todo) → claim → run → opiekun,
+ *  2) tickety w stanie `Todo` → claim → run → opiekun,
  *  3) merge-watcher: tickety „In Review" z PR-em fabryki → po merge'u Done +
  *     sprzątnięcie worktree/gałęzi + ff-pull lokalnego maina; PR zamknięty bez
  *     merge'a → Todo z komentarzem.
- * Na starcie: adopcja sierot — tickety „In Progress" z runId w komentarzach
- * odzyskują opiekuna po restarcie pollera.
+ * Na starcie i w każdym cyklu: adopcja sierot z rejestru runów (runs/<ticket>/state.json)
+ * — ticket z niedokończonym runem odzyskuje opiekuna po restarcie pollera.
  *
  * STEROWANIE = PRZEJŚCIA STANÓW (BAR-142): claim `Backlog → Todo`, aprobata
  * `👤 🚦 Plan do akceptacji → 🔨 Build`, odrzucenie `→ Backlog/Canceled/⛔`,
@@ -19,7 +19,7 @@
  * Uruchomienie:  npx tsx src/sources/poll-linear.ts [--once]
  * Produkcyjnie: usługa launchd (ops/install-launchd.sh).
  * Wymaga: LINEAR_API_KEY (env lub .env), działającego `mastra dev`.
- * Idempotencja: marker `[linear:<ISSUE>:v1]` w komentarzach + zdjęcie labela.
+ * Idempotencja: rejestr runów + marker `[linear:<ISSUE>:v1]` w komentarzach.
  */
 import { readFileSync, readdirSync, existsSync, statSync } from "node:fs";
 import { rm } from "node:fs/promises";
@@ -105,7 +105,7 @@ async function main() {
   do {
     try {
       if (!(await serverUp())) {
-        console.error("API Mastry nie odpowiada — pomijam cykl (tickety poczekają z labelem)");
+        console.error("API Mastry nie odpowiada — pomijam cykl (tickety poczekają w Todo)");
       } else {
         await checkHourlySpend().catch(() => {});
         const breakerReason = await breakerOpen().catch(() => null);
@@ -134,7 +134,7 @@ async function main() {
               free = Math.max(0, limit - inFlight);
               if (free === 0) {
                 if (!limitLogged.has(project)) {
-                  console.log(`[${project}] limit równoległości ${limit} osiągnięty (${inFlight} w toku) — ${tickets.length} ticket(ów) czeka z labelem`);
+                  console.log(`[${project}] limit równoległości ${limit} osiągnięty (${inFlight} w toku) — ${tickets.length} ticket(ów) czeka w Todo`);
                   limitLogged.add(project);
                 }
                 continue;
@@ -367,15 +367,11 @@ async function watchRun(
         // porażka INFRASTRUKTURALNA (nie-BLOCKED: timeout/spawn/silnik) → auto-retry dokładnie raz;
         // merytoryczny BLOCKED zawsze czeka na człowieka (retry bez zmiany wejścia = te same pytania za te same tokeny)
         if (!blocked) {
-          const st = registry.readState(id);
-          const alreadyRetried = st?.runId === runId
-            ? st.autoRetry.count > 0
-            : (await src.listComments(id).catch(() => [])).some((c) => c.body.includes("[auto-retry]"));
+          const alreadyRetried = (registry.readState(id)?.autoRetry.count ?? 0) > 0;
           if (!alreadyRetried) {
             registry.updateState(id, { project, runId }, (st) => { st.autoRetry = { count: st.autoRetry.count + 1, lastAt: new Date().toISOString() }; });
-            await src.comment(id, `🔁 Porażka infrastrukturalna — auto-retry 1/1 [auto-retry] ${marker(id)}\n\n${clip(msg, 2000)}`);
-            await src.setStatus(id, "needs_clarification"); // Todo — listReady wymaga stanu backlog/unstarted
-            await src.relabelReady(id);
+            await src.comment(id, `🔁 Porażka infrastrukturalna — auto-retry 1/1 ${marker(id)}\n\n${clip(msg, 2000)}`);
+            await src.setStatus(id, "needs_clarification"); // Todo = trigger claimu (BAR-147: koniec labela)
             console.log(`[${id}] FAILED (infra) → AUTO-RETRY`);
             break;
           }
@@ -384,7 +380,7 @@ async function watchRun(
         await src.comment(
           id,
           `${blocked ? "🛑 BLOCKED" : "❌ Run nieudany (auto-retry wyczerpany)"} ${marker(id)}\n\n${clip(msg, 6000)}\n\n` +
-            `Uzupełnij ticket i nadaj ponownie label \`agent:ready\`, żeby fabryka spróbowała jeszcze raz.`
+            `Uzupełnij ticket i przenieś go na *${MAP.ready}*, żeby fabryka spróbowała jeszcze raz.`
         );
         await setPhase(project, src, id, "blocked", runId);
         registry.finalize(id, { project, runId }, reason === "rejected" ? "rejected" : blocked ? "blocked" : "failed", reason);
@@ -424,36 +420,6 @@ async function adoptOrphans() {
     });
   }
 
-  // FALLBACK (runy sprzed migracji, bez state.json): stare guardy tekstowe
-  for (const { project, src } of sources) {
-  const issues = await src.listWithComments("In Progress");
-  for (const issue of issues) {
-    if (active.has(issue.id)) continue;
-    if (registry.readState(issue.id)?.runId) continue; // rejestr już to obsłużył
-    const mine = issue.comments.filter((c) => c.body.includes(marker(issue.id)));
-    if (mine.length === 0) continue; // nie nasz ticket
-    // runId z najnowszego komentarza z planem (zawiera "run `<uuid>`")
-    const runId = mine
-      .map((c) => c.body.match(/run `([0-9a-f-]{36})`/)?.[1])
-      .filter(Boolean)
-      .pop();
-    if (!runId) continue;
-    const finalized = mine.some((c) =>
-      c.body.includes("Zbudowane i zweryfikowane") || c.body.includes("🛑 BLOCKED") || c.body.includes("Run nieudany"));
-    if (finalized) continue; // run zakończony przed restartem — nie dublujemy finału
-    const planComment = mine.filter((c) => c.body.includes("Plan gotowy")).pop();
-    // decyzja obsłużona przed restartem → NIE strzelamy resume drugi raz (BAR-104: ponowny
-    // resume zdublował egzekucję Mastry i podwoił spalanie budżetu)
-    const decisionHandled = mine.some((c) =>
-      c.body.includes("Aprobata przyjęta") || c.body.includes("Odrzucenie przyjęte"));
-    active.add(issue.id);
-    console.log(`[${issue.id}] ADOPCJA sieroconego runa ${runId}${decisionHandled ? " (decyzja już obsłużona)" : ""}`);
-    watchRun(project, src, issue.id, runId, planComment?.createdAt, decisionHandled).catch((err) => {
-      console.error(`[${issue.id}] adopcja padła:`, err);
-      active.delete(issue.id);
-    });
-  }
-  }
 }
 
 // --- merge-watcher: domknięcie cyklu ticketu ------------------------------
@@ -506,7 +472,7 @@ async function watchMerges() {
       await src.comment(
         issue.id,
         `↩️ PR zamknięty bez merge'a ${marker(issue.id)} — ticket wraca do Todo. ` +
-          `Uzupełnij wymagania i nadaj label \`agent:ready\`, żeby spróbować ponownie.`
+          `Uzupełnij wymagania i przenieś ticket na *${MAP.ready}*, żeby spróbować ponownie.`
       );
       await src.setStatus(issue.id, "needs_clarification");
       // zamknięty PR też zwalnia pliki (BAR-141) — inaczej kolejka stoi na martwym tickecie
