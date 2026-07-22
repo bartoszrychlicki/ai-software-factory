@@ -363,7 +363,25 @@ function listAll(): TicketState[] {
 
 /** Tickety z niedokończonym runem — podstawa adopcji sierot po restarcie. */
 export function listUnfinished(): TicketState[] {
-  return listAll().filter((s) => s.lifecycle !== "finalized");
+  // mergeHandledAt jest dodatkowym terminalnym bezpiecznikiem dla rekordów
+  // historycznych utworzonych dopiero przez merge-watchera (bez runu Mastry).
+  return listAll().filter((s) => s.lifecycle !== "finalized" && !s.mergeHandledAt);
+}
+
+/** Atomowo domyka stan po decyzji człowieka o PR, także dla ticketu sprzed rejestru runów. */
+export function recordMergeHandled(
+  ticketId: string,
+  seed: { project: string; runId: string },
+  outcome: "merged" | "closed"
+): void {
+  updateState(ticketId, seed, (s) => {
+    const at = new Date().toISOString();
+    s.mergeHandledAt = at;
+    s.lifecycle = "finalized";
+    s.finalized = outcome === "merged"
+      ? { outcome: "success", at }
+      : { outcome: "failed", reason: "infra", at };
+  });
 }
 
 /** Ścieżka porównywalna: bez `./`, bez wiodącego `/`, bez ogona `/`. */

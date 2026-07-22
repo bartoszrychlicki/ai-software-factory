@@ -63,3 +63,22 @@ test("stary plan bez listy plików blokuje projekt wildcardem", () => {
     delete process.env.FACTORY_RUNS_ROOT;
   }
 });
+
+test("merge watcher tworzy od razu terminalny rekord dla historycznego ticketu", () => {
+  const root = mkdtempSync(join(tmpdir(), "factory-merge-state-"));
+  process.env.FACTORY_RUNS_ROOT = root;
+  try {
+    registry.recordMergeHandled(
+      "TEST-MERGED",
+      { project: "pilot-app", runId: "legacy-merge:TEST-MERGED" },
+      "merged"
+    );
+    const state = registry.readState("TEST-MERGED");
+    assert.equal(state?.lifecycle, "finalized");
+    assert.equal(state?.finalized?.outcome, "success");
+    assert.deepEqual(registry.listUnfinished(), []);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    delete process.env.FACTORY_RUNS_ROOT;
+  }
+});

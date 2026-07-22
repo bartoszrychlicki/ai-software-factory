@@ -527,7 +527,11 @@ async function watchMerges() {
         await src.comment(issue.id, `🎉 PR zmergowany ${marker(issue.id)} — ticket zamknięty, workspace posprzątany.`);
         await src.setStatus(issue.id, "done");
       }
-      registry.updateState(issue.id, { project, runId: registry.readState(issue.id)?.runId ?? "" }, (st) => { st.mergeHandledAt = new Date().toISOString(); });
+      registry.recordMergeHandled(
+        issue.id,
+        { project, runId: registry.readState(issue.id)?.runId || `legacy-merge:${issue.id}` },
+        "merged"
+      );
       mergeHandled.add(issue.id);
       console.log(`[${issue.id}] MERGED → Done${state === "Done" ? " (dosprzątanie po integracji)" : ""}`);
       prodSmokeGuard(project, src, issue.id).catch((err) => {
@@ -543,7 +547,11 @@ async function watchMerges() {
       );
       await src.setStatus(issue.id, "needs_clarification");
       // zamknięty PR też zwalnia pliki (BAR-141) — inaczej kolejka stoi na martwym tickecie
-      registry.updateState(issue.id, { project, runId: registry.readState(issue.id)?.runId ?? "" }, (st) => { st.mergeHandledAt = new Date().toISOString(); });
+      registry.recordMergeHandled(
+        issue.id,
+        { project, runId: registry.readState(issue.id)?.runId || `legacy-close:${issue.id}` },
+        "closed"
+      );
       mergeHandled.add(issue.id);
       console.log(`[${issue.id}] PR CLOSED → Todo`);
     } else if (pr.state === "OPEN") {
