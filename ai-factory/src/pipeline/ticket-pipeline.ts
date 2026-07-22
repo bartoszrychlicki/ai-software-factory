@@ -10,6 +10,7 @@ import { createWorkspace, createCheckout, removeCheckout } from "./workspace";
 import { getProject } from "./projects";
 import { resolveRoute } from "./routing";
 import { saveArtifact, artifactHeader } from "./artifacts";
+import { buildSignature, signatureLine, signatureMeta, signatureTrailer } from "./signature";
 import { takeScreenshot } from "./screenshot";
 import { recordMetric } from "./metrics";
 import { budgetExceeded } from "./budget";
@@ -79,6 +80,7 @@ const cycleSchema = z.object({
   verifiedSha: z.string(),
   changedFiles: z.array(z.string()),
   buildReport: z.string(),
+  buildSignatureLine: z.string(),
   verifyReport: z.string(),
 });
 
@@ -170,15 +172,22 @@ const planStep = createStep({
 
     // plan-reuse: retry po porażce infra/budżetu nie pali tokenów na replan zatwierdzonej treści
     if (ticket.reusePlan && !inputData.plan) {
+      const signature = {
+        agent: "ai-factory",
+        harness: "reuse",
+        model: "reuse",
+        profile: "planner" as const,
+      };
       await recordMetric({ ticket: ticket.id, runId, stage: "plan", engine: "reuse", ok: true, outcome: "reused", costUsd: 0, durationMs: 0 });
       await saveArtifact(ticket.id, runId, "plan.md",
-        artifactHeader({ step: "plan", engine: "reuse", reused: "true" }) + ticket.reusePlan);
+        artifactHeader({ step: "plan", ...signatureMeta(signature), engine: "reuse", reused: "true" }) + ticket.reusePlan);
       return { ...inputData, plan: ticket.reusePlan };
     }
     // plan już OK (wejście kolejnej iteracji) — nie przeplanowujemy
     if (inputData.plan && parsePlanVerdict(inputData.plan).ok) return inputData;
 
     const route = await resolveRoute("plan", ticket);
+    const signature = buildSignature("plan", route);
     const t0 = Date.now();
     const answersBlock = inputData.answers.length
       ? "\n\n# Odpowiedzi autora ticketu na Twoje wcześniejsze pytania\n" +
@@ -220,7 +229,14 @@ const planStep = createStep({
       ticket.id,
       runId,
       "plan.md",
-      artifactHeader({ step: "plan", engine: route.spec, costUsd: result.costUsd, ok: String(result.ok), round: inputData.clarifyRound }) + (result.transcript ?? result.report)
+      artifactHeader({
+        step: "plan",
+        ...signatureMeta(signature),
+        engine: route.spec,
+        costUsd: result.costUsd,
+        ok: String(result.ok),
+        round: inputData.clarifyRound,
+      }) + (result.transcript ?? result.report)
     );
     if (!result.ok) throw new Error(`Planner (${route.spec}) nie dostarczył planu: ${result.report}`);
 
@@ -346,6 +362,7 @@ const initCycleStep = createStep({
     verifiedSha: "",
     changedFiles: [],
     buildReport: "",
+    buildSignatureLine: "",
     verifyReport: "",
   }),
 });
@@ -362,8 +379,6 @@ const buildStep = createStep({
     // twardy budżet ticketu — deterministyczny kod, nie agent (fail-closed = BLOCKED)
     const overBudget = await budgetExceeded(ticket, runId);
     if (overBudget) throw new Error(`BLOCKED: budżet ticketu wyczerpany przed próbą ${attempt} builda — ${overBudget}`);
-    const saveBuild = (meta: Record<string, string | number | undefined>, body: string) =>
-      saveArtifact(ticket.id, runId, `build-attempt-${attempt}.md`, artifactHeader({ step: "build", attempt, ...meta }) + body);
 
     const slug = ticket.title
       .toLowerCase()
@@ -380,6 +395,14 @@ const buildStep = createStep({
       : "";
 
     const route = await resolveRoute("build", ticket, ticketDomain(ticket, inputData.plan));
+    const signature = buildSignature("build", route);
+    const saveBuild = (meta: Record<string, string | number | undefined>, body: string) =>
+      saveArtifact(
+        ticket.id,
+        runId,
+        `build-attempt-${attempt}.md`,
+        artifactHeader({ step: "build", attempt, ...signatureMeta(signature), ...meta }) + body
+      );
     const t0 = Date.now();
     const buildMetric = (ok: boolean, outcome: string, costUsd?: number) =>
       recordMetric({ ticket: ticket.id, runId, stage: "build", engine: route.spec, attempt, ok, outcome, costUsd, durationMs: Date.now() - t0 });
@@ -443,7 +466,7 @@ const buildStep = createStep({
 
     await exec("git", ["-C", ws.dir, "add", "-A"]);
     await exec("git", ["-C", ws.dir, "commit", "-m",
-      `feat(${ticket.id}): ${ticket.title} (próba ${attempt})\n\n[ai-factory build]`]);
+      `feat(${ticket.id}): ${ticket.title} (próba ${attempt})\n\n[ai-factory build]\n\n${signatureTrailer(signature)}`]);
     const { stdout: sha } = await exec("git", ["-C", ws.dir, "rev-parse", "HEAD"]);
     await buildMetric(true, "committed", result.costUsd);
     await saveBuild(
@@ -462,6 +485,7 @@ const buildStep = createStep({
       verifiedSha: "",
       changedFiles,
       buildReport: result.report,
+      buildSignatureLine: signatureLine(signature),
     };
   },
 });
@@ -476,12 +500,21 @@ const verifyStep = createStep({
     if (inputData.verdict === "fail") return inputData;
 
     const { ticket, sha } = inputData;
+    let verifySignature: ReturnType<typeof buildSignature> | undefined;
     const saveVerify = (meta: Record<string, string | number | undefined>, body: string) =>
       saveArtifact(ticket.id, runId, `verify-attempt-${inputData.attempt}.md`,
-        artifactHeader({ step: "verify", attempt: inputData.attempt, sha, ...meta }) + body);
+        artifactHeader({
+          step: "verify",
+          attempt: inputData.attempt,
+          sha,
+          ...(verifySignature ? signatureMeta(verifySignature) : {}),
+          ...meta,
+        }) + body);
     const co = await createCheckout(ticket.repoPath, sha, `${ticket.id}-verify`);
 
     try {
+      const route = await resolveRoute("verify", ticket);
+      verifySignature = buildSignature("verify", route);
       // 1) Deterministycznie: checks PROJEKTU (z rejestru) na czystym env.
       const checks = ticket.checks ?? [];
       const checkResults: string[] = [];
@@ -568,7 +601,6 @@ const verifyStep = createStep({
       // 3) Niezależny werdykt: osobny run, read-only, czysty katalog
       const overBudget = await budgetExceeded(ticket, runId);
       if (overBudget) throw new Error(`BLOCKED: budżet ticketu wyczerpany przed werdyktem verify — ${overBudget}`);
-      const route = await resolveRoute("verify", ticket);
       const t0 = Date.now();
       const result = await route.engine.run({
         role: "verify",
@@ -667,9 +699,13 @@ async function reverifyExactSha(
 ): Promise<CycleState> {
   if (inputData.sha === inputData.verifiedSha) return inputData;
   const { ticket, sha } = inputData;
+  let verifySignature: ReturnType<typeof buildSignature> | undefined;
   const co = await createCheckout(ticket.repoPath, sha, `${ticket.id}-final-${reason}`);
   const artifactName = `verify-final-${reason}-${sha.slice(0, 8)}.md`;
   try {
+    const route = await resolveRoute("verify", ticket);
+    const signature = buildSignature("verify", route);
+    verifySignature = signature;
     const cleanEnv = cleanExecutionEnv();
     const commands = allQualityCommands(ticket);
     await runQualityCommands(co.dir, commands, { env: cleanEnv, timeoutMs: 20 * 60_000 });
@@ -679,7 +715,6 @@ async function reverifyExactSha(
     const overBudget = await budgetExceeded(ticket, runId);
     if (overBudget) throw new Error(`budżet ticketu wyczerpany przed finalnym verify — ${overBudget}`);
 
-    const route = await resolveRoute("verify", ticket);
     const startedAt = Date.now();
     const result = await route.engine.run({
       role: "verify",
@@ -728,7 +763,14 @@ async function reverifyExactSha(
       ticket.id,
       runId,
       artifactName,
-      artifactHeader({ step: "verify-final", reason, sha, engine: route.spec, outcome: pass ? "pass" : "fail" }) +
+      artifactHeader({
+        step: "verify-final",
+        reason,
+        sha,
+        ...signatureMeta(signature),
+        engine: route.spec,
+        outcome: pass ? "pass" : "fail",
+      }) +
         `${result.report}\n\n# Checks\n${checksSummary}`
     );
     if (!pass) {
@@ -751,7 +793,13 @@ async function reverifyExactSha(
         ticket.id,
         runId,
         artifactName,
-        artifactHeader({ step: "verify-final", reason, sha, outcome: "infra-error" }) +
+        artifactHeader({
+          step: "verify-final",
+          reason,
+          sha,
+          ...(verifySignature ? signatureMeta(verifySignature) : {}),
+          outcome: "infra-error",
+        }) +
           (err instanceof Error ? err.message : String(err))
       ).catch(() => {});
     }
@@ -868,6 +916,9 @@ const publishStep = createStep({
       "",
       "## Zmienione pliki",
       ...inputData.changedFiles.map((f) => `- ${f}`),
+      "",
+      "## Podpis",
+      `Etap build: ${inputData.buildSignatureLine}`,
       "",
       "_Wygenerowane przez ai-factory._",
     ].join("\n"));
@@ -1074,6 +1125,7 @@ const prReviewStep = createStep({
 
     try {
       const route = await resolveRoute("review", ticket);
+      const signature = buildSignature("review", route);
       const project = await getProject(ticket.project);
       const diff = await fullBranchDiff(workspaceDir, project.default_branch ?? "main");
 
@@ -1139,12 +1191,19 @@ const prReviewStep = createStep({
       });
 
       await saveArtifact(ticket.id, runId, `review-round-${round}.md`,
-        artifactHeader({ step: "review", round, engine: route.spec, costUsd: result.costUsd, verdict }) + result.report);
+        artifactHeader({
+          step: "review",
+          round,
+          ...signatureMeta(signature),
+          engine: route.spec,
+          costUsd: result.costUsd,
+          verdict,
+        }) + result.report);
 
       // recenzja trafia tam, gdzie czyta ją człowiek: do PR-a (comment, nie approve/reject)
       const reviewFile = join(tmpdir(), `review-${ticket.id}-${round}.md`);
       await writeFile(reviewFile,
-        `## AI code review — runda ${round}/${inputData.maxReviewRounds} (${route.spec} — doradczo)\n\n${result.report}`);
+        `## AI code review — runda ${round}/${inputData.maxReviewRounds} (${signatureLine(signature)} — doradczo)\n\n${result.report}`);
       await exec(
         "gh",
         ["pr", "review", branch, "--comment", "--body-file", reviewFile],
@@ -1205,11 +1264,24 @@ const remediateStep = createStep({
         reviewSummary: `${inputData.reviewSummary}\n\n(iteracje naprawcze przerwane: budżet ticketu wyczerpany — ${overBudgetFix})`,
       };
     }
+    let fixSignature: ReturnType<typeof buildSignature> | undefined;
     const saveFix = (meta: Record<string, string | number | undefined>, body: string) =>
-      saveArtifact(ticket.id, runId, `fix-round-${round}.md`, artifactHeader({ step: "fix", round, ...meta }) + body);
+      saveArtifact(
+        ticket.id,
+        runId,
+        `fix-round-${round}.md`,
+        artifactHeader({
+          step: "fix",
+          round,
+          ...(fixSignature ? signatureMeta(fixSignature) : {}),
+          ...meta,
+        }) + body
+      );
 
     try {
       const route = await resolveRoute("build", ticket, ticketDomain(ticket, inputData.plan));
+      const signature = buildSignature("build", route);
+      fixSignature = signature;
       const t0 = Date.now();
       const fixMetric = (ok: boolean, outcome: string, costUsd?: number) =>
         recordMetric({ ticket: ticket.id, runId, stage: "fix", engine: route.spec, round, ok, outcome, costUsd, durationMs: Date.now() - t0 });
@@ -1266,7 +1338,7 @@ const remediateStep = createStep({
 
       await exec("git", ["-C", workspaceDir, "add", "-A"]);
       await exec("git", ["-C", workspaceDir, "commit", "-m",
-        `fix(${ticket.id}): poprawki po code review (runda ${round})\n\n[ai-factory review-fix]`]);
+        `fix(${ticket.id}): poprawki po code review (runda ${round})\n\n[ai-factory review-fix]\n\n${signatureTrailer(signature)}`]);
       const { stdout: newShaRaw } = await exec("git", ["-C", workspaceDir, "rev-parse", "HEAD"]);
       const newSha = newShaRaw.trim();
 
