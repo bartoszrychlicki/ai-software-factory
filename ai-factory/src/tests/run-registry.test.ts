@@ -82,3 +82,20 @@ test("merge watcher tworzy od razu terminalny rekord dla historycznego ticketu",
     delete process.env.FACTORY_RUNS_ROOT;
   }
 });
+
+test("manifest zachowuje kanoniczny URL ticketu po ponownym odczycie stanu", () => {
+  const root = mkdtempSync(join(tmpdir(), "factory-manifest-url-"));
+  process.env.FACTORY_RUNS_ROOT = root;
+  try {
+    const canonicalUrl = "https://linear.app/acme/issue/BAR-164/test";
+    registry.updateState("BAR-164", { project: "ai-factory", runId: "run-164" }, (state) => {
+      state.manifest = { labels: ["domain:ops"], domain: "ops", url: canonicalUrl };
+    });
+
+    const restored = registry.readState("BAR-164");
+    assert.equal(restored?.manifest?.url, canonicalUrl);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    delete process.env.FACTORY_RUNS_ROOT;
+  }
+});

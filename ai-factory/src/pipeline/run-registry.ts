@@ -82,7 +82,7 @@ export interface TicketState {
   /** Trwały outbox komend do Mastry. Brak odpowiedzi HTTP nigdy nie gubi start/resume. */
   outbox: Record<string, OutboxCommand>;
   /** Parametry zlecenia z labeli — czytane RAZ przy claimie, potem niezmienne. */
-  manifest?: { labels: string[]; engine?: string; domain?: string; planMode?: string };
+  manifest?: { labels: string[]; engine?: string; domain?: string; planMode?: string; url?: string };
   autoRetry: { count: number; lastAt?: string };
   /**
    * Pliki zadeklarowane przez plannera (BAR-141). Ticket „trzyma" je od aprobaty
