@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import type { EngineAdapter, EngineRunInput, EngineRunResult } from "./types";
+import { engineEnv } from "./env";
 
 const CLAUDE_BIN = process.env.CLAUDE_BIN ?? "claude";
 
@@ -36,6 +37,7 @@ export const claudeCode: EngineAdapter = {
           cwd: input.workspace,                    // świat agenta = worktree
           timeout: input.budget.minutes * 60_000,  // budżet = twardy limit
           maxBuffer: 50 * 1024 * 1024,             // JSON bywa duży
+          env: engineEnv(),
         },
         (error, stdout, stderr) => {
           if (error && !stdout) {
@@ -77,12 +79,16 @@ export const claudeCode: EngineAdapter = {
             resolve({ ok: false, report: `Brak treści od agenta:\n${stdout.slice(0, 2000)}`, raw: { stderr } });
             return;
           }
+          // Sam częściowy stdout NIE jest sukcesem. Timeout/buffer overflow potrafi
+          // zostawić kilka wiadomości bez końcowego eventu `result` (BAR-28); dawniej
+          // `!final?.is_error` dawało wtedy true i builder commitował pół implementacji.
+          const ok = !error && !!final && !final.is_error;
           resolve({
-            ok: !final?.is_error,
+            ok,
             report,
             transcript: texts.join("\n\n"),
             costUsd: final?.total_cost_usd,
-            raw: { events: texts.length },
+            raw: { events: texts.length, error: error ? String(error) : undefined },
           });
         }
       );

@@ -7,9 +7,9 @@
 
   <key>ProgramArguments</key>
   <array>
-    <string>/Users/senioraiconsultant/.local/bin/npx</string>
-    <string>tsx</string>
-    <string>src/sources/poll-linear.ts</string>
+    <string>/Users/senioraiconsultant/.local/bin/npm</string>
+    <string>run</string>
+    <string>poller</string>
   </array>
 
   <key>WorkingDirectory</key>

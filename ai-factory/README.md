@@ -1,30 +1,49 @@
 # ai-factory
 
-Welcome to your new [Mastra](https://mastra.ai/) project! We're excited to see what you'll build.
+Lokalna fabryka software: Linear jest kolejką i interfejsem bramek człowieka,
+Mastra prowadzi trwały workflow ticketu, a adaptery CLI realizują role planner,
+builder, verifier i reviewer w izolowanych worktree.
 
-## Getting Started
+Pełny, aktualny diagram i opis stanów: [docs/ticket-flow.md](docs/ticket-flow.md).
 
-Start the development server:
+## Uruchomienie
+
+Produkcja działa z wcześniej zbudowanego bundle'a, bez hot reloadu:
 
 ```shell
-npm run dev
+npm ci
+npm run check
+npm test
+npm run build
+bash ops/install-launchd.sh
 ```
 
-Open [http://localhost:4111](http://localhost:4111) in your browser to access [Mastra Studio](https://mastra.ai/docs/studio/overview). It provides an interactive UI for building and testing your agents, along with a REST API that exposes your Mastra application as a local service. This lets you start building without worrying about integration right away.
+Instalator nie przełączy usług, jeśli rejestr zawiera niedokończone runy. Najpierw
+uruchamia serwer i czeka na health check; poller startuje dopiero po gotowości API.
 
-You can start editing files inside the `src/mastra` directory. The development server will automatically reload whenever you make changes.
+Tryb developerski (`npm run dev`) jest wyłącznie do pracy lokalnej. Hot reload
+nie może być używany podczas aktywnego runu ticketu.
 
-## Learn more
+## Najważniejsze pliki
 
-To learn more about Mastra, visit our [documentation](https://mastra.ai/docs/). Your bootstrapped project includes example code for [agents](https://mastra.ai/docs/agents/overview), [tools](https://mastra.ai/docs/agents/using-tools), [workflows](https://mastra.ai/docs/workflows/overview), [scorers](https://mastra.ai/docs/evals/overview), and [observability](https://mastra.ai/docs/observability/overview).
+- `src/pipeline/ticket-pipeline.ts` — graf workflow i bramki jakościowe,
+- `src/sources/poll-linear.ts` — orkiestracja Lineara, adopcja runów i merge watcher,
+- `src/sources/mastra-client.ts` — sprawdzany klient start/resume/cancel,
+- `src/pipeline/run-registry.ts` — trwały stan ticketu i outbox komend,
+- `src/pipeline/quality.ts` — wspólny runner checks/e2e i pełny diff brancha,
+- `projects.yaml` — repozytoria, limity, checks i prod smoke,
+- `routing.yaml` — routing ról do adapterów silników,
+- `runs/<ticket>/<run>/` — artefakty audytowe konkretnego przebiegu.
 
-If you're new to AI agents, check out our [course](https://mastra.ai/learn) and [YouTube videos](https://youtube.com/@mastra-ai). You can also join our [Discord](https://discord.gg/BTYqqHKUrf) community to get help and share your projects.
+## Zasady bezpieczeństwa
 
-## Deploy to the Mastra platform
-
-The [Mastra platform](https://projects.mastra.ai) provides two products for deploying and managing AI applications built with the Mastra framework:
-
-- **Studio**: A hosted visual environment for testing agents, running workflows, and inspecting traces
-- **Server**: A production deployment target that runs your Mastra application as an API server
-
-Learn more in the [Mastra platform documentation](https://mastra.ai/docs/mastra-platform/overview).
+- Plan, verify i review kończą się ścisłym blokiem `factory`; brak/niepoprawny
+  kontrakt jest wynikiem negatywnym.
+- Build działa w osobnym worktree. Codex ma sandbox `workspace-write`; role
+  read-only dostają sandbox/whitelistę narzędzi.
+- Procesy agentów dostają allowlistę zmiennych środowiskowych, bez tokenów
+  Lineara, storage i powiadomień.
+- Niesandboxowany Kimi jest domyślnie wyłączony i wymaga jawnego
+  `FACTORY_ALLOW_UNSANDBOXED_KIMI=1`.
+- Merge pozostaje decyzją człowieka. Fabryka publikuje draft PR, wykonuje review,
+  re-verify po przesunięciu `main` i sprząta dopiero po merge/zamknięciu.

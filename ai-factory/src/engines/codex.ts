@@ -3,6 +3,7 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { EngineAdapter, EngineRunInput, EngineRunResult } from "./types";
+import { engineEnv } from "./env";
 
 const CODEX_BIN = process.env.CODEX_BIN ?? "codex";
 
@@ -34,6 +35,7 @@ export const codex: EngineAdapter = {
           cwd: input.workspace,
           timeout: input.budget.minutes * 60_000,
           maxBuffer: 50 * 1024 * 1024,
+          env: engineEnv(),
         },
         async (error, stdout, stderr) => {
           let report = "";

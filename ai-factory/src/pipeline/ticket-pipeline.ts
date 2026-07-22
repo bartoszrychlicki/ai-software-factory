@@ -14,6 +14,7 @@ import { takeScreenshot } from "./screenshot";
 import { recordMetric } from "./metrics";
 import { budgetExceeded } from "./budget";
 import { parsePlanVerdict, parseVerifyVerdict, parseReviewVerdict, verdictInstruction, MISSING_VERDICT } from "./verdicts";
+import { allQualityCommands, cleanExecutionEnv, fullBranchDiff, QualityGateError, runQualityCommands } from "./quality";
 
 const exec = promisify(execFile);
 
@@ -450,23 +451,14 @@ const verifyStep = createStep({
       // 1) Deterministycznie: checks PROJEKTU (z rejestru) na czystym env.
       const checks = ticket.checks ?? [];
       const checkResults: string[] = [];
-      const cleanEnv = Object.fromEntries(
-        Object.entries(process.env).filter(
-          ([k]) => !k.startsWith("npm_") && k !== "NODE_ENV"
-        )
-      ) as NodeJS.ProcessEnv;
+      const cleanEnv = cleanExecutionEnv();
 
       for (const cmd of checks) {
         try {
-          await exec("bash", ["-c", cmd], {
-            cwd: co.dir,
-            env: cleanEnv,
-            timeout: 10 * 60_000,
-            maxBuffer: 50 * 1024 * 1024,
-          });
+          await runQualityCommands(co.dir, [cmd], { env: cleanEnv, timeoutMs: 10 * 60_000 });
         } catch (err) {
-          const e = err as Error & { stdout?: string; stderr?: string };
-          const tail = [e.stdout, e.stderr].filter(Boolean).join("\n").slice(-3000);
+          const e = err instanceof QualityGateError ? err : new QualityGateError(cmd, String(err), 0, err);
+          const tail = e.outputTail.slice(-3000);
           await recordMetric({
             ticket: ticket.id, runId, stage: "verify-checks", attempt: inputData.attempt,
             ok: false, outcome: `check-fail: ${cmd}`,
@@ -503,12 +495,7 @@ const verifyStep = createStep({
         }
         const t0e2e = Date.now();
         try {
-          await exec("bash", ["-c", ticket.e2e], {
-            cwd: co.dir,
-            env: cleanEnv,
-            timeout: 20 * 60_000,
-            maxBuffer: 50 * 1024 * 1024,
-          });
+          await runQualityCommands(co.dir, [ticket.e2e], { env: cleanEnv, timeoutMs: 20 * 60_000 });
           for (const [i] of shotTargets.entries()) {
             const png = await readFile(join(shotsDir, `screenshot-${i + 1}.png`)).catch(() => undefined);
             if (png) await saveArtifact(ticket.id, runId, `screenshot-${i + 1}.png`, png);
@@ -523,8 +510,8 @@ const verifyStep = createStep({
         } catch (err) {
           await rm(shotSpec, { force: true }).catch(() => {});
           await rm(shotsDir, { recursive: true, force: true }).catch(() => {});
-          const e = err as Error & { stdout?: string; stderr?: string };
-          const tail = [e.stdout, e.stderr].filter(Boolean).join("\n").slice(-4000);
+          const e = err instanceof QualityGateError ? err : new QualityGateError(ticket.e2e, String(err), 0, err);
+          const tail = e.outputTail.slice(-4000);
           await recordMetric({
             ticket: ticket.id, runId, stage: "verify-e2e", attempt: inputData.attempt,
             ok: false, outcome: "fail", durationMs: Date.now() - t0e2e,
@@ -622,7 +609,6 @@ const verifyStep = createStep({
         if (png) await saveArtifact(ticket.id, runId, "screenshot.png", png);
       }
 
-      await removeCheckout(ticket.repoPath, co.dir);
       return { ...inputData, verdict: "pass" as const, verifyReport: result.report };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -631,6 +617,8 @@ const verifyStep = createStep({
         verdict: "fail" as const,
         feedback: `Błąd infrastruktury verify: ${msg}\n(checkout: ${co.dir})`,
       };
+    } finally {
+      await removeCheckout(ticket.repoPath, co.dir);
     }
   },
 });
@@ -694,16 +682,14 @@ const publishStep = createStep({
       }
 
       // re-verify na scalonym drzewie: checks projektu + e2e (jeśli skonfigurowane)
-      const cleanEnv = Object.fromEntries(
-        Object.entries(process.env).filter(([k]) => !k.startsWith("npm_") && k !== "NODE_ENV")
-      ) as NodeJS.ProcessEnv;
+      const cleanEnv = cleanExecutionEnv();
       const t0mq = Date.now();
       for (const cmd of [...(ticket.checks ?? []), ...(ticket.e2e ? [ticket.e2e] : [])]) {
         try {
-          await exec("bash", ["-c", cmd], { cwd: workspaceDir, env: cleanEnv, timeout: 20 * 60_000, maxBuffer: 50 * 1024 * 1024 });
+          await runQualityCommands(workspaceDir, [cmd], { env: cleanEnv, timeoutMs: 20 * 60_000 });
         } catch (err) {
-          const e = err as Error & { stdout?: string; stderr?: string };
-          const tail = [e.stdout, e.stderr].filter(Boolean).join("\n").slice(-3000);
+          const e = err instanceof QualityGateError ? err : new QualityGateError(cmd, String(err), 0, err);
+          const tail = e.outputTail.slice(-3000);
           await recordMetric({ ticket: ticket.id, runId, stage: "merge-queue", ok: false, outcome: "recheck-fail", durationMs: Date.now() - t0mq });
           await saveArtifact(ticket.id, runId, "merge-queue.md",
             artifactHeader({ step: "merge-queue", outcome: "recheck-fail", check: cmd }) + tail);
@@ -721,7 +707,7 @@ const publishStep = createStep({
       inputData = { ...inputData, sha: newSha.trim() };
     }
 
-    await exec("git", ["-C", workspaceDir, "push", "-u", "--force", "origin", branch]);
+    await exec("git", ["-C", workspaceDir, "push", "-u", "--force-with-lease", "origin", branch]);
 
     // opis PR przez plik — omijamy limity długości i escapowanie argumentów
     const bodyFile = join(tmpdir(), `pr-${ticket.id}.md`);
@@ -883,9 +869,8 @@ const prReviewStep = createStep({
 
     try {
       const route = await resolveRoute("review", ticket);
-      const { stdout: diff } = await exec("git", ["-C", workspaceDir, "show", sha], {
-        maxBuffer: 10 * 1024 * 1024,
-      });
+      const project = await getProject(ticket.project);
+      const diff = await fullBranchDiff(workspaceDir, project.default_branch ?? "main");
 
       const t0 = Date.now();
       const result = await route.engine.run({
@@ -1065,16 +1050,12 @@ const remediateStep = createStep({
 
       // fail-closed na regresję: checks projektu na świeżym checkoutcie poprawki
       const co = await createCheckout(ticket.repoPath, newSha, `${ticket.id}-fixcheck`);
-      const cleanEnv = Object.fromEntries(
-        Object.entries(process.env).filter(([k]) => !k.startsWith("npm_") && k !== "NODE_ENV")
-      ) as NodeJS.ProcessEnv;
+      const cleanEnv = cleanExecutionEnv();
       try {
-        for (const cmd of ticket.checks ?? []) {
-          await exec("bash", ["-c", cmd], { cwd: co.dir, env: cleanEnv, timeout: 10 * 60_000, maxBuffer: 50 * 1024 * 1024 });
-        }
+        await runQualityCommands(co.dir, allQualityCommands(ticket), { env: cleanEnv, timeoutMs: 20 * 60_000 });
       } catch (err) {
-        const e = err as Error & { stdout?: string; stderr?: string };
-        const tail = [e.stdout, e.stderr].filter(Boolean).join("\n").slice(-3000);
+        const e = err instanceof QualityGateError ? err : new QualityGateError("quality", String(err), 0, err);
+        const tail = e.outputTail.slice(-3000);
         await exec("git", ["-C", workspaceDir, "reset", "--hard", "HEAD~1"]); // poprawka psuje build → wycofujemy
         await removeCheckout(ticket.repoPath, co.dir);
         await fixMetric(false, "checks-fail-reverted", result.costUsd);
@@ -1084,7 +1065,7 @@ const remediateStep = createStep({
       }
       await removeCheckout(ticket.repoPath, co.dir);
 
-      await exec("git", ["-C", workspaceDir, "push", "--force", "origin", branch]);
+      await exec("git", ["-C", workspaceDir, "push", "--force-with-lease", "origin", branch]);
       await fixMetric(true, "pushed", result.costUsd);
       await saveFix(
         { engine: route.spec, costUsd: result.costUsd, outcome: "pushed", sha: newSha, files: changed.join(", ") },
@@ -1121,7 +1102,7 @@ const finalizeReviewStep = createStep({
   execute: async ({ inputData }) => {
     if (inputData.reviewVerdict === "lgtm") {
       // czysta recenzja = koniec pracy maszyn; draft → ready, merge nadal ludzki
-      await exec("gh", ["pr", "ready", inputData.branch], { cwd: inputData.workspaceDir }).catch(() => {});
+      await exec("gh", ["pr", "ready", inputData.branch], { cwd: inputData.workspaceDir });
     } else if (inputData.reviewVerdict === "fix") {
       await exec(
         "gh",

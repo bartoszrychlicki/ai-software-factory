@@ -21,7 +21,7 @@
  * Wymaga: LINEAR_API_KEY (env lub .env), działającego `mastra dev`.
  * Idempotencja: rejestr runów + marker `[linear:<ISSUE>:v1]` w komentarzach.
  */
-import { readFileSync, readdirSync, existsSync, statSync } from "node:fs";
+import { readFileSync, readdirSync, statSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, dirname, basename } from "node:path";
@@ -35,9 +35,19 @@ import { breakerOpen, recordRunOutcome, checkHourlySpend } from "../pipeline/bre
 import { notify } from "../pipeline/notify";
 import { runProdChecks } from "../pipeline/prod-smoke";
 import * as registry from "../pipeline/run-registry";
-import { LINEAR_STATE_MAP as MAP, phaseOfState, decisionOfState } from "./state-map";
+import { LINEAR_STATE_MAP as MAP, decisionOfState } from "./state-map";
 import { parseCommand, hintFor } from "./commands";
 import { parsePlanVerdict } from "../pipeline/verdicts";
+import { allQualityCommands, QualityGateError, runQualityCommands } from "../pipeline/quality";
+import {
+  acknowledgeOutboxFromRun,
+  dispatchPendingOutbox,
+  MastraWorkflowClient,
+  outboxId,
+  runStatus,
+  suspendedPath,
+  type MastraRunSnapshot,
+} from "./mastra-client";
 
 const exec = promisify(execFile);
 
@@ -62,6 +72,7 @@ const PROJECTS = (process.env.LINEAR_PROJECTS ?? process.env.LINEAR_PROJECT ?? "
   .filter(Boolean);
 const FACTORY_API = process.env.FACTORY_API ?? "http://localhost:4111/api";
 const WORKFLOW = "ticketPipeline";
+const mastraClient = new MastraWorkflowClient(FACTORY_API, WORKFLOW);
 const WORKTREES_ROOT = process.env.FACTORY_WORKTREES ?? join(homedir(), ".ai-factory", "worktrees");
 const POLL_INTERVAL_MS = 60_000;
 const RUN_WATCH_INTERVAL_MS = 20_000;
@@ -104,7 +115,7 @@ async function main() {
 
   do {
     try {
-      if (!(await serverUp())) {
+      if (!(await mastraClient.serverUp())) {
         console.error("API Mastry nie odpowiada — pomijam cykl (tickety poczekają w Todo)");
       } else {
         await checkHourlySpend().catch(() => {});
@@ -181,15 +192,11 @@ async function handleTicket(
 ) {
   console.log(`[${id}] claim (${project}): ${title}`);
   const reusePlan = await findReusablePlan(src, id, description);
+  // Najpierw run Mastry. Jeśli to się nie uda, ticket nadal jest w Todo i nic nie ginie.
+  const runId = await mastraClient.createRun();
   await src.claim(id);
-  await src.comment(id, reusePlan
-    ? `🤖 ai-factory przyjęła ticket ${marker(id)}. ♻️ Reużywam zatwierdzonego planu z poprzedniego runu (porażka infra/budżet) — build startuje od razu, bez bramki.`
-    : `🤖 ai-factory przyjęła ticket ${marker(id)}. Planner startuje.`);
-  notify(`🤖 ${id}: ticket przyjęty`, reusePlan ? "♻️ Reuse zatwierdzonego planu — build od razu." : `Planner startuje (${project}). Plan przyjdzie do akceptacji.`).catch(() => {});
-
-  const runId = await createRun();
   // rejestr: manifest zlecenia czytany RAZ przy claimie (labele = parametry, nie sygnały)
-  registry.updateState(id, { project, runId }, (st) => {
+  const initialized = registry.updateState(id, { project, runId }, (st) => {
     st.manifest = {
       labels,
       engine: labels.find((l) => l.startsWith("engine:"))?.slice(7),
@@ -197,9 +204,28 @@ async function handleTicket(
       planMode: labels.find((l) => l.startsWith("plan:"))?.slice(5),
     };
   });
+  if (!initialized) {
+    await src.setStateByName(id, MAP.ready).catch(() => {});
+    throw new Error(`[${id}] nie udało się zapisać rejestru runu — claim cofnięty do ${MAP.ready}`);
+  }
+  registry.enqueueOutbox(id, { project, runId }, {
+    id: outboxId("start", runId),
+    kind: "start",
+    body: { id, title, description, project, labels, reusePlan },
+  });
+  if (reusePlan) {
+    const files = parsePlanVerdict(reusePlan).files;
+    // Stary, zatwierdzony plan bez kontraktu plików blokuje konserwatywnie cały projekt.
+    registry.recordFiles(id, { project, runId }, files.length ? files : ["*"]);
+  }
+  await src.comment(id, reusePlan
+    ? `🤖 ai-factory przyjęła ticket ${marker(id)}. ♻️ Reużywam zatwierdzonego planu z poprzedniego runu (porażka infra/budżet) — build startuje od razu, bez bramki.`
+    : `🤖 ai-factory przyjęła ticket ${marker(id)}. Planner startuje.`
+  ).catch((err) => console.error(`[${id}] komentarz claimu nieudany:`, err instanceof Error ? err.message : err));
+  notify(`🤖 ${id}: ticket przyjęty`, reusePlan ? "♻️ Reuse zatwierdzonego planu — build od razu." : `Planner startuje (${project}). Plan przyjdzie do akceptacji.`).catch(() => {});
   await setPhase(project, src, id, reusePlan ? "build" : "planning", runId);
   await src.comment(id, `🧾 run \`${runId}\` ${marker(id)}`).catch(() => {}); // kotwica adopcji (kluczowa dla reuse — nie ma komentarza z planem)
-  fireStart(runId, { id, title, description, project, labels, reusePlan });
+  await dispatchPendingOutbox(mastraClient, id, { project, runId });
   console.log(`[${id}] run ${runId} wystartowany`);
   await watchRun(project, src, id, runId);
 }
@@ -228,19 +254,36 @@ async function watchRun(
   const runDir = join(process.cwd(), "runs", id, runId);
   const seenArtifacts = new Set<string>(safeReaddir(runDir));
   const answeredRounds = new Set<number>(); // rundy pytań, dla których resume już poszedł
-  const answeredFallback = new Set<number>(); // drugi strzał z pełną ścieżką kroku (format id w zagnieżdżonym workflow)
   const hintedRounds = new Set<number>(); // podpowiedź „jak zatwierdzić odpowiedzi" raz na rundę
 
   try {
     while (Date.now() < deadline) {
       await sleep(RUN_WATCH_INTERVAL_MS);
       await notifyPhaseMilestones(project, src, id, runDir, seenArtifacts);
-      const run = await getRun(runId).catch(() => undefined);
+
+      // Stan końcowy ustawiony przez człowieka jest nadrzędny. Bez tego Canceled
+      // zatrzymywał tylko kartę, a kosztowny builder/reviewer pracował dalej.
+      const linearState = await src.getStateName(id).catch(() => undefined);
+      if (linearState && MAP.terminal.includes(linearState)) {
+        const current = await mastraClient.getRun(runId).catch(() => undefined);
+        const currentStatus = current ? runStatus(current) : "unknown";
+        if (!["success", "failed", "canceled", "bailed", "tripwire"].includes(currentStatus)) {
+          await mastraClient.cancelRun(runId).catch((err) =>
+            console.error(`[${id}] anulowanie runu po stanie ${linearState} nieudane:`, err instanceof Error ? err.message : err));
+        }
+        registry.finalize(id, { project, runId }, linearState === "Canceled" ? "rejected" : "orphan", "rejected");
+        console.log(`[${id}] run zatrzymany — Linear ma stan końcowy ${linearState}`);
+        break;
+      }
+
+      await dispatchPendingOutbox(mastraClient, id, { project, runId });
+      const run = await mastraClient.getRun(runId).catch(() => undefined);
       if (!run) continue; // serwer chwilowo w dole — czekamy, run w Mastrze nie znika
+      acknowledgeOutboxFromRun(id, { project, runId }, run);
       const status = runStatus(run);
 
       // tryb dopytywania: suspend na clarify-ticket obsługujemy PRZED przepływem aprobaty
-      if (status === "suspended" && await handleClarifySuspend(project, src, id, runId, runDir, answeredRounds, answeredFallback, hintedRounds)) {
+      if (status === "suspended" && await handleClarifySuspend(project, src, id, runId, runDir, run, answeredRounds, hintedRounds)) {
         continue;
       }
 
@@ -310,8 +353,15 @@ async function watchRun(
             observedAt: new Date().toISOString(),
           });
           registry.markDecisionStep(id, { project, runId }, "plan-approval", 0, "consumedAt");
-          fireResume(runId, decision);
-          registry.markDecisionStep(id, { project, runId }, "plan-approval", 0, "resumeSentAt");
+          registry.enqueueOutbox(id, { project, runId }, {
+            id: outboxId("resume", "plan-approval:0"),
+            kind: "resume",
+            step: suspendedPath(run) ?? "approve-plan",
+            body: decision,
+            gate: "plan-approval",
+            round: 0,
+          });
+          await dispatchPendingOutbox(mastraClient, id, { project, runId });
           console.log(`[${id}] decyzja z Linear: ${decision.approved ? "ZATWIERDZONO" : "ODRZUCONO"}`);
           // natychmiastowe domknięcie pętli zwrotnej — bez tego wygląda, jakby system nie chwycił decyzji
           if (decision.approved) {
@@ -353,7 +403,7 @@ async function watchRun(
         }
       }
 
-      if (status === "failed") {
+      if (["failed", "canceled", "bailed", "tripwire"].includes(status)) {
         try {
         const msg = errorMessage(run);
         const reason = registry.classifyFailure(msg);
@@ -382,6 +432,8 @@ async function watchRun(
           `${blocked ? "🛑 BLOCKED" : "❌ Run nieudany (auto-retry wyczerpany)"} ${marker(id)}\n\n${clip(msg, 6000)}\n\n` +
             `Uzupełnij ticket i przenieś go na *${MAP.ready}*, żeby fabryka spróbowała jeszcze raz.`
         );
+        const projectConfig = await getProject(project).catch(() => undefined);
+        if (projectConfig?.statuses !== "extended") await src.setStatus(id, "blocked");
         await setPhase(project, src, id, "blocked", runId);
         registry.finalize(id, { project, runId }, reason === "rejected" ? "rejected" : blocked ? "blocked" : "failed", reason);
         notify(`🛑 ${id}: ${blocked ? "BLOCKED — pytania w tickecie" : "run nieudany"}`, clip(msg, 180)).catch(() => {});
@@ -408,13 +460,21 @@ async function adoptOrphans() {
     if (!entry || !st.runId) continue;
     const gates = Object.values(st.gates);
     const openGate = gates.find((g) => g.decision === undefined);
-    const pendingResume = gates.find((g) => g.decision && !g.decision.resumeSentAt);
+    const recordedDecision = gates.find((g) => g.decision !== undefined);
+    const pendingCommands = Object.values(st.outbox ?? {}).filter((command) => command.state === "pending");
     active.add(st.ticketId);
     console.log(
       `[${st.ticketId}] ADOPCJA z rejestru: run ${st.runId}, faza ${st.phase ?? "?"}` +
-        (openGate ? `, bramka ${openGate.kind} otwarta` : pendingResume ? `, decyzja bez resume` : ", decyzje obsłużone")
+        (openGate ? `, bramka ${openGate.kind} otwarta` : pendingCommands.length ? `, ${pendingCommands.length} komend outbox oczekuje` : ", decyzje obsłużone")
     );
-    watchRun(st.project, entry.src, st.ticketId, st.runId, openGate?.openedAt, !openGate && !pendingResume).catch((err) => {
+    watchRun(
+      st.project,
+      entry.src,
+      st.ticketId,
+      st.runId,
+      openGate?.openedAt ?? recordedDecision?.openedAt,
+      !!recordedDecision
+    ).catch((err) => {
       console.error(`[${st.ticketId}] adopcja padła:`, err);
       active.delete(st.ticketId);
     });
@@ -428,24 +488,30 @@ async function watchMerges() {
   for (const { project, src } of sources) {
   // "Done" też: integracja Linear↔GitHub przestawia status natychmiast po merge'u i wygrywa
   // wyścig z watcherem — ticket znika z "In Review" zanim zdążymy posprzątać (BAR-91/92)
-  // stany procesu (statuses: extended) — ticket po publish siedzi w "✅ PR do merge", nie w "In Review";
+  // stany procesu (statuses: extended) — ticket po publish siedzi w stanie
+  // MAP.phases["pr-ready"], nie w "In Review";
   // bez tego merge-watcher nigdy nie zobaczy zmergowanego PR-a (bug wykryty 2026-07-22)
-  for (const state of ["In Review", "✅ PR do merge", "👀 Code review", "Done"] as const) {
+  for (const state of ["In Review", MAP.phases["pr-ready"], MAP.phases.review, "Done"]) {
   const issues = await src.listWithComments(state);
   for (const issue of issues) {
     if (mergeHandled.has(issue.id)) continue;
+    const persisted = registry.readState(issue.id);
+    if (persisted?.mergeHandledAt) {
+      mergeHandled.add(issue.id);
+      if (!persisted.prodSmokeAt) {
+        prodSmokeGuard(project, src, issue.id).catch((err) => {
+          mergeHandled.delete(issue.id);
+          console.error(`[${issue.id}] prod smoke padł:`, err instanceof Error ? err.message : err);
+        });
+      }
+      continue;
+    }
     const mine = issue.comments.filter((c) => c.body.includes(marker(issue.id)));
     const prUrl = mine
       .map((c) => c.body.match(/https:\/\/github\.com\/\S+\/pull\/\d+/)?.[0])
       .filter(Boolean)
       .pop();
     if (!prUrl) continue;
-
-    // ticket już Done (integracja) — nasza rola to tylko dosprzątanie, o ile worktree jeszcze istnieje
-    if (state === "Done") {
-      const project_ = await getProject(project).catch(() => undefined);
-      if (!project_ || !existsSync(join(WORKTREES_ROOT, basename(project_.repo), issue.id))) continue;
-    }
 
     let pr: { state: string; headRefName: string };
     try {
@@ -456,18 +522,19 @@ async function watchMerges() {
     }
 
     if (pr.state === "MERGED") {
-      mergeHandled.add(issue.id);
       await cleanupAfterMerge(project, issue.id, pr.headRefName);
-      if (state === "In Review") {
+      if (state !== "Done") {
         await src.comment(issue.id, `🎉 PR zmergowany ${marker(issue.id)} — ticket zamknięty, workspace posprzątany.`);
         await src.setStatus(issue.id, "done");
       }
       registry.updateState(issue.id, { project, runId: registry.readState(issue.id)?.runId ?? "" }, (st) => { st.mergeHandledAt = new Date().toISOString(); });
-      console.log(`[${issue.id}] MERGED → Done${state === "Done" ? " (dosprzątanie po integracji)" : ""}`);
-      prodSmokeGuard(project, src, issue.id).catch((err) =>
-        console.error(`[${issue.id}] prod smoke padł:`, err instanceof Error ? err.message : err));
-    } else if (pr.state === "CLOSED" && state === "In Review") {
       mergeHandled.add(issue.id);
+      console.log(`[${issue.id}] MERGED → Done${state === "Done" ? " (dosprzątanie po integracji)" : ""}`);
+      prodSmokeGuard(project, src, issue.id).catch((err) => {
+        mergeHandled.delete(issue.id);
+        console.error(`[${issue.id}] prod smoke padł:`, err instanceof Error ? err.message : err);
+      });
+    } else if (pr.state === "CLOSED" && state !== "Done") {
       await cleanupAfterMerge(project, issue.id, pr.headRefName);
       await src.comment(
         issue.id,
@@ -477,6 +544,7 @@ async function watchMerges() {
       await src.setStatus(issue.id, "needs_clarification");
       // zamknięty PR też zwalnia pliki (BAR-141) — inaczej kolejka stoi na martwym tickecie
       registry.updateState(issue.id, { project, runId: registry.readState(issue.id)?.runId ?? "" }, (st) => { st.mergeHandledAt = new Date().toISOString(); });
+      mergeHandled.add(issue.id);
       console.log(`[${issue.id}] PR CLOSED → Todo`);
     } else if (pr.state === "OPEN") {
       // BAR-124: PR czeka na człowieka, a main w tym czasie jedzie dalej. Weryfikacja
@@ -516,7 +584,7 @@ async function preMergeGuard(project: string, src: LinearSource, ticketId: strin
   if (!mainSha || !headSha) return;
 
   const st = registry.readState(ticketId);
-  if (st?.preMerge?.mainSha === mainSha) return; // ten main już sprawdzony
+  if (st?.preMerge?.mainSha === mainSha && st.preMerge.headSha === headSha) return; // ta para base+head już sprawdzona
   const { stdout: behind } = await exec("git", ["-C", repo, "rev-list", "--count", `${headSha}..${mainSha}`]).catch(() => ({ stdout: "0" }));
   if (Number(behind.trim()) === 0) return; // PR aktualny — nie ma czego scalać
 
@@ -524,10 +592,10 @@ async function preMergeGuard(project: string, src: LinearSource, ticketId: strin
   const dir = join(WORKTREES_ROOT, basename(repo), `premerge-${ticketId}`);
   const seed = { project, runId: st?.runId ?? "" };
   const fail = async (body: string) => {
-    await exec("gh", ["pr", "ready", prUrl, "--undo"], { timeout: 30_000 }).catch(() => {});
+    await exec("gh", ["pr", "ready", prUrl, "--undo"], { timeout: 30_000 });
     await src.comment(ticketId, `${body} ${marker(ticketId)}`).catch(() => {});
     notify(`⚠️ ${ticketId}: PR nie przechodzi po scaleniu z ${def}`, "PR wrócił do draftu — wymaga poprawki.").catch(() => {});
-    registry.updateState(ticketId, seed, (s) => { s.preMerge = { mainSha, ok: false, at: new Date().toISOString() }; });
+    registry.updateState(ticketId, seed, (s) => { s.preMerge = { mainSha, headSha, ok: false, at: new Date().toISOString() }; });
   };
 
   try {
@@ -547,26 +615,26 @@ async function preMergeGuard(project: string, src: LinearSource, ticketId: strin
       return;
     }
 
-    const cleanEnv = Object.fromEntries(
-      Object.entries(process.env).filter(([k]) => !k.startsWith("npm_") && k !== "NODE_ENV")
-    ) as NodeJS.ProcessEnv;
-    for (const cmd of [...(cfg.checks ?? []), ...(cfg.qa?.e2e ? [cfg.qa.e2e] : [])]) {
-      try {
-        await exec("bash", ["-c", cmd], { cwd: dir, env: cleanEnv, timeout: 20 * 60_000, maxBuffer: 50 * 1024 * 1024 });
-      } catch (err) {
-        const e = err as Error & { stdout?: string; stderr?: string };
-        const tail = [e.stdout, e.stderr].filter(Boolean).join("\n").slice(-2500);
-        console.error(`[${ticketId}] pre-merge FAIL na "${cmd}" po scaleniu z ${def}`);
-        await fail(
-          `⚠️ **Pre-merge check: konflikt semantyczny** — po scaleniu z \`${def}\` (${behind.trim()} nowych commitów) check \`${cmd}\` nie przechodzi.\n\n` +
-            `Osobno gałąź jest zielona; czerwone jest dopiero połączenie. PR wrócił do draftu — nie merguj.\n` +
-            `Przenieś ticket na *Todo*, żeby fabryka poprawiła go na świeżym mainie.\n\n\`\`\`\n${tail}\n\`\`\``
-        );
-        return;
-      }
+    try {
+      await runQualityCommands(
+        dir,
+        allQualityCommands({ checks: cfg.checks, e2e: cfg.qa?.e2e }),
+        { timeoutMs: 20 * 60_000 }
+      );
+    } catch (err) {
+      const gate = err instanceof QualityGateError ? err : undefined;
+      const command = gate?.command ?? "nieznany check";
+      const tail = gate?.outputTail ?? (err instanceof Error ? err.message : String(err));
+      console.error(`[${ticketId}] pre-merge FAIL na "${command}" po scaleniu z ${def}`);
+      await fail(
+        `⚠️ **Pre-merge check: konflikt semantyczny** — po scaleniu z \`${def}\` (${behind.trim()} nowych commitów) check \`${command}\` nie przechodzi.\n\n` +
+          `Osobno gałąź jest zielona; czerwone jest dopiero połączenie. PR wrócił do draftu — nie merguj.\n` +
+          `Przenieś ticket na *Todo*, żeby fabryka poprawiła go na świeżym mainie.\n\n\`\`\`\n${tail.slice(-2500)}\n\`\`\``
+      );
+      return;
     }
 
-    registry.updateState(ticketId, seed, (s) => { s.preMerge = { mainSha, ok: true, at: new Date().toISOString() }; });
+    registry.updateState(ticketId, seed, (s) => { s.preMerge = { mainSha, headSha, ok: true, at: new Date().toISOString() }; });
     console.log(`[${ticketId}] pre-merge OK po scaleniu z ${def} (${behind.trim()} nowych commitów)`);
   } finally {
     preMergeRunning.delete(ticketId);
@@ -685,8 +753,8 @@ async function handleClarifySuspend(
   id: string,
   runId: string,
   runDir: string,
+  run: MastraRunSnapshot,
   answered: Set<number>,
-  answeredFallback: Set<number>,
   hintedRounds: Set<number>
 ): Promise<boolean> {
   const qFiles = safeReaddir(runDir).filter((f) => /^questions-round-\d+\.md$/.test(f));
@@ -694,7 +762,7 @@ async function handleClarifySuspend(
   const qMax = Math.max(...qFiles.map((f) => Number(f.match(/\d+/)![0])));
   // plan już OK → pytania rozstrzygnięte, ten suspend to bramka aprobaty
   const planBody = artifactBody(join(runDir, "plan.md")) ?? "";
-  if (/^[`*\s]*PLAN:\s*OK\b/m.test(planBody)) return false;
+  if (parsePlanVerdict(planBody).ok) return false;
 
   const comments = await src.listComments(id).catch(() => undefined);
   if (!comments) return true; // czkawka API — następny tick
@@ -718,12 +786,7 @@ async function handleClarifySuspend(
 
   // idempotencja: znacznik z REJESTRU, nie fraza w komentarzu
   const gateRec = registry.readState(id)?.gates[registry.gateId("clarify", qMax)];
-  if (gateRec?.decision?.resumeSentAt) {
-    if (answered.has(qMax) && !answeredFallback.has(qMax)) {
-      // wciąż suspended tick później — spróbuj pełnej ścieżki kroku w zagnieżdżonym workflow
-      answeredFallback.add(qMax);
-      fireResumeStep(runId, ["plan-clarify-cycle", "clarify-ticket"], { answers: gateRec.decision.payload ?? "" });
-    }
+  if (gateRec?.decision) {
     answered.add(qMax);
     return true;
   }
@@ -749,8 +812,15 @@ async function handleClarifySuspend(
       kind: "answer", payload: answer, via: byState ? "state" : "command", observedAt: new Date().toISOString(),
     });
     registry.markDecisionStep(id, { project, runId }, "clarify", qMax, "consumedAt");
-    fireResumeStep(runId, "clarify-ticket", { answers: answer });
-    registry.markDecisionStep(id, { project, runId }, "clarify", qMax, "resumeSentAt");
+    registry.enqueueOutbox(id, { project, runId }, {
+      id: outboxId("resume", `clarify:${qMax}`),
+      kind: "resume",
+      step: suspendedPath(run) ?? ["plan-clarify-cycle", "clarify-ticket"],
+      body: { answers: answer },
+      gate: "clarify",
+      round: qMax,
+    });
+    await dispatchPendingOutbox(mastraClient, id, { project, runId });
     await src.comment(id, `🧠 Odpowiedzi przyjęte ${marker(id)} — doplanowuję (runda ${qMax}).`).catch(() => {});
     await setPhase(project, src, id, "planning", runId);
     notify(`🧠 ${id}: odpowiedzi przyjęte`, `Doplanowanie (runda ${qMax}).`).catch(() => {});
@@ -796,25 +866,18 @@ async function findReusablePlan(src: LinearSource, id: string, description: stri
             approval.descriptionHash !== createHash("sha256").update(description).digest("hex")) return undefined;
         const raw = readFileSync(join(dir, "plan.md"), "utf8");
         const body = raw.split(/^---\s*$/m).slice(2).join("---").trim() || raw;
-        if (/^[`*\s]*PLAN:\s*OK\b/m.test(body)) return body;
+        // approval.json jest źródłem prawdy: plan został zaakceptowany przez człowieka.
+        // Stare plany mogą nie mieć kontraktu factory; pipeline świadomie pozwala je reużyć.
+        return body;
       } catch { /* katalog bez kompletu artefaktów — próbujemy starszy */ }
     }
   } catch { /* brak katalogu runs — brak reuse */ }
   return undefined;
 }
 
-/** resume-async dowolnego kroku (clarify-ticket / approve-plan) — 504-odporny fire-and-forget. */
-function fireResumeStep(runId: string, step: string | string[], resumeData: Record<string, unknown>) {
-  fetch(`${FACTORY_API}/workflows/${WORKFLOW}/resume-async?runId=${runId}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ step, resumeData }),
-  }).catch(() => {});
-}
-
 // --- prod smoke po merge (QA runda 2) -------------------------------------
 
-const smokeDone = new Set<string>(); // jeden smoke per ticket per proces
+const smokeRunning = new Set<string>();
 
 /**
  * Po merge'u: poczekaj na deploy i sprawdź, czy zmiana ŻYJE na produkcji.
@@ -822,33 +885,41 @@ const smokeDone = new Set<string>(); // jeden smoke per ticket per proces
  * gdy funkcja jest martwa na prodzie — lekcja z BAR-101/102).
  */
 async function prodSmokeGuard(projectKey: string, src: LinearSource, ticketId: string) {
-  if (smokeDone.has(ticketId)) return;
-  smokeDone.add(ticketId);
+  if (registry.readState(ticketId)?.prodSmokeAt || smokeRunning.has(ticketId)) return;
+  smokeRunning.add(ticketId);
 
-  const project = await getProject(projectKey).catch(() => undefined);
-  const checks = project?.qa?.prodChecks;
-  if (!checks?.length) return; // projekt bez configu QA — smoke nie dotyczy
+  try {
+    const project = await getProject(projectKey).catch(() => undefined);
+    const checks = project?.qa?.prodChecks;
+    if (!checks?.length) {
+      registry.updateState(ticketId, { project: projectKey, runId: registry.readState(ticketId)?.runId ?? "" }, (s) => { s.prodSmokeAt = new Date().toISOString(); });
+      return;
+    }
 
-  await sleep(90_000); // deploy potrzebuje chwili (Vercel po merge'u na main)
+    await sleep(90_000); // deploy potrzebuje chwili (Vercel po merge'u na main)
 
-  let result = await runProdChecks(checks);
-  for (let retry = 0; !result.ok && retry < 4; retry++) {
-    await sleep(60_000); // może deploy jeszcze się propaguje
-    result = await runProdChecks(checks);
-  }
+    let result = await runProdChecks(checks);
+    for (let retry = 0; !result.ok && retry < 4; retry++) {
+      await sleep(60_000); // może deploy jeszcze się propaguje
+      result = await runProdChecks(checks);
+    }
 
-  if (result.ok) {
-    await src.comment(ticketId, `🟢 Prod smoke OK ${marker(ticketId)} — zmiana żyje na produkcji:\n${result.report}`);
-    console.log(`[${ticketId}] PROD SMOKE OK`);
-  } else {
-    await src.comment(
-      ticketId,
-      `🚨 Prod smoke FAILED ${marker(ticketId)} — merge jest, ale produkcja NIE serwuje zmiany:\n${result.report}\n\n` +
-        `Ticket wraca do In Review — zweryfikuj deploy/hosting (por. BAR-77/102).`
-    );
-    await src.setStatus(ticketId, "human_review");
-    notify(`🚨 ${ticketId}: prod smoke FAILED`, "Merge jest, ale produkcja nie serwuje zmiany — szczegóły w tickecie.").catch(() => {});
-    console.log(`[${ticketId}] PROD SMOKE FAILED`);
+    if (result.ok) {
+      await src.comment(ticketId, `🟢 Prod smoke OK ${marker(ticketId)} — zmiana żyje na produkcji:\n${result.report}`);
+      console.log(`[${ticketId}] PROD SMOKE OK`);
+    } else {
+      await src.comment(
+        ticketId,
+        `🚨 Prod smoke FAILED ${marker(ticketId)} — merge jest, ale produkcja NIE serwuje zmiany:\n${result.report}\n\n` +
+          `Ticket wraca do In Review — zweryfikuj deploy/hosting (por. BAR-77/102).`
+      );
+      await src.setStatus(ticketId, "human_review");
+      notify(`🚨 ${ticketId}: prod smoke FAILED`, "Merge jest, ale produkcja nie serwuje zmiany — szczegóły w tickecie.").catch(() => {});
+      console.log(`[${ticketId}] PROD SMOKE FAILED`);
+    }
+    registry.updateState(ticketId, { project: projectKey, runId: registry.readState(ticketId)?.runId ?? "" }, (s) => { s.prodSmokeAt = new Date().toISOString(); });
+  } finally {
+    smokeRunning.delete(ticketId);
   }
 }
 
@@ -888,58 +959,7 @@ async function collectPayload(src: LinearSource, id: string, sinceIso: string): 
   return human.length ? human.join("\n\n") : undefined;
 }
 
-// --- Mastra HTTP API ------------------------------------------------------
-
-async function serverUp(): Promise<boolean> {
-  try {
-    const res = await fetch(`${FACTORY_API}/workflows`, { signal: AbortSignal.timeout(3_000) });
-    return res.ok;
-  } catch {
-    return false;
-  }
-}
-
-async function createRun(): Promise<string> {
-  const res = await fetch(`${FACTORY_API}/workflows/${WORKFLOW}/create-run`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: "{}",
-  });
-  if (!res.ok) throw new Error(`create-run: HTTP ${res.status}`);
-  const { runId } = (await res.json()) as { runId: string };
-  return runId;
-}
-
-/** start-async trzyma połączenie i po 180 s dostaje 504 — run i tak leci; stan śledzimy pollingiem. */
-function fireStart(runId: string, inputData: Record<string, unknown>) {
-  fetch(`${FACTORY_API}/workflows/${WORKFLOW}/start-async?runId=${runId}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ inputData }),
-  }).catch(() => {});
-}
-
-/** resume-async jak start-async: 504-odporny fire-and-forget. */
-function fireResume(runId: string, resumeData: { approved: boolean; feedback?: string }) {
-  fetch(`${FACTORY_API}/workflows/${WORKFLOW}/resume-async?runId=${runId}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ step: "approve-plan", resumeData }),
-  }).catch(() => {});
-}
-
-async function getRun(runId: string): Promise<unknown> {
-  const res = await fetch(`${FACTORY_API}/workflows/${WORKFLOW}/runs/${runId}`);
-  if (!res.ok) throw new Error(`get run: HTTP ${res.status}`);
-  return res.json();
-}
-
 // --- odczyt stanu runa (kształt snapshotu bywa niestabilny — czytamy defensywnie) ---
-
-function runStatus(run: unknown): string {
-  const r = run as { status?: string; snapshot?: { status?: string } };
-  return r.status ?? r.snapshot?.status ?? "unknown";
-}
 
 function errorMessage(run: unknown): string {
   const found = findString(run, "message", (path) => path.includes("error"));

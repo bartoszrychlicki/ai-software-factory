@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import type { EngineAdapter, EngineRunInput, EngineRunResult } from "./types";
+import { engineEnv } from "./env";
 
 const KIMI_BIN = process.env.KIMI_BIN ?? "kimi";
 
@@ -20,6 +21,13 @@ export const kimiCode: EngineAdapter = {
         report: `kimi-code obsługuje wyłącznie rolę build — tryb headless nie ma read-only, a rola "${input.role}" go wymaga. Popraw routing.`,
       };
     }
+    if (process.env.FACTORY_ALLOW_UNSANDBOXED_KIMI !== "1") {
+      return {
+        ok: false,
+        report:
+          "kimi-code jest niesandboxowany i domyślnie wyłączony. Użyj sandboxowanego buildera albo ustaw świadomie FACTORY_ALLOW_UNSANDBOXED_KIMI=1 dla zaufanego projektu.",
+      };
+    }
     const prompt = `${input.instructions}\n\n${input.context}`;
 
     const args: string[] = [];
@@ -34,7 +42,7 @@ export const kimiCode: EngineAdapter = {
           cwd: input.workspace,
           timeout: input.budget.minutes * 60_000,
           maxBuffer: 50 * 1024 * 1024,
-          env: process.env,
+          env: engineEnv(),
         },
         (error, stdout, stderr) => {
           const report = stdout.trim();

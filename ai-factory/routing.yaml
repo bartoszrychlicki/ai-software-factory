@@ -5,7 +5,7 @@ defaults:
   build: codex              # bez modelu = default CLI
   verify: claude-code/sonnet
   review: claude-code/sonnet   # doradcze; niezależny od buildera (codex)
-  build.frontend: kimi-code    # domena z labela domain:frontend na tickecie; bez modelu = default CLI
+  build.frontend: codex        # sandboxowany default; Kimi wymaga jawnego FACTORY_ALLOW_UNSANDBOXED_KIMI=1
 
 # spec: silnik[/model[@effort]]; effort: low/medium/high/xhigh (claude --effort, codex -c model_reasoning_effort)
 projects:

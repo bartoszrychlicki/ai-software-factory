@@ -7,9 +7,9 @@
 
   <key>ProgramArguments</key>
   <array>
-    <string>/Users/senioraiconsultant/.local/bin/npx</string>
-    <string>mastra</string>
-    <string>dev</string>
+    <string>/Users/senioraiconsultant/.local/bin/npm</string>
+    <string>run</string>
+    <string>start</string>
   </array>
 
   <key>WorkingDirectory</key>

@@ -101,7 +101,15 @@ export class LinearSource implements TicketSource {
 
   async setStatus(id: string, status: FactoryStatus): Promise<void> {
     const issue = await this.fetchIssue(id);
-    const preferredName = status === "human_review" ? "In Review" : status === "in_progress" ? "In Progress" : undefined;
+    const preferredName = status === "human_review"
+      ? "In Review"
+      : status === "in_progress"
+        ? "In Progress"
+        : status === "needs_clarification"
+          ? LINEAR_STATE_MAP.ready
+          : status === "blocked"
+            ? "Backlog"
+            : undefined;
     const state = pickState(issue.team.states.nodes, STATUS_TO_STATE_TYPE[status], preferredName);
     await this.gql(
       `mutation($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }`,
@@ -199,7 +207,7 @@ export class LinearSource implements TicketSource {
   }
 }
 
-function pickState(
+export function pickState(
   states: { id: string; name: string; type: string }[],
   type: string,
   preferredName?: string

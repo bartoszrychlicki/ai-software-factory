@@ -13,7 +13,8 @@ import { findUpFile } from "./projects";
  * - jeden plik per ticket (zero kontencji przy równoległych ticketach),
  * - zapis atomowy (tmp → fsync → rename) + kopia .bak (uszkodzony JSON nie kasuje stanu),
  * - znaczniki decyzji są MONOTONICZNE (observed → consumed → resumeSent → resumeAcked),
- *   co daje at-most-once resume bez czytania czegokolwiek z trackera.
+ * - start/resume przechodzą przez trwały outbox; odpowiedź HTTP Mastry jest
+ *   potwierdzeniem przyjęcia, a snapshot potwierdzeniem postępu wykonania.
  */
 
 export type FactoryPhase =
@@ -28,6 +29,24 @@ export type FactoryPhase =
 
 export type Gate = "claim" | "plan-approval" | "clarify";
 export type DecisionKind = "start" | "approve" | "reject" | "answer";
+export type OutboxCommandKind = "start" | "resume";
+
+export interface OutboxCommand {
+  id: string;
+  kind: OutboxCommandKind;
+  state: "pending" | "dispatched" | "acknowledged";
+  body: Record<string, unknown>;
+  /** Docelowa ścieżka suspendu; służy do potwierdzenia, że snapshot ruszył dalej. */
+  step?: string | string[];
+  gate?: Gate;
+  round?: number;
+  attempts: number;
+  createdAt: string;
+  updatedAt: string;
+  dispatchedAt?: string;
+  acknowledgedAt?: string;
+  lastError?: string;
+}
 
 export interface GateRecord {
   kind: Gate;
@@ -60,6 +79,8 @@ export interface TicketState {
   /** Ostatnie zapisy faz (do okna tłumienia, gdy tracker nie daje atrybucji autora). */
   phaseWrites: { phase: FactoryPhase; state?: string; at: string }[];
   gates: Record<string, GateRecord>;
+  /** Trwały outbox komend do Mastry. Brak odpowiedzi HTTP nigdy nie gubi start/resume. */
+  outbox: Record<string, OutboxCommand>;
   /** Parametry zlecenia z labeli — czytane RAZ przy claimie, potem niezmienne. */
   manifest?: { labels: string[]; engine?: string; domain?: string; planMode?: string };
   autoRetry: { count: number; lastAt?: string };
@@ -70,7 +91,7 @@ export interface TicketState {
   files?: string[];
   prUrl?: string;
   /** Ostatni pre-merge re-verify (BAR-124) — raz na przesunięcie maina, nie co tick. */
-  preMerge?: { mainSha: string; ok: boolean; at: string };
+  preMerge?: { mainSha: string; headSha: string; ok: boolean; at: string };
   mergeHandledAt?: string;
   prodSmokeAt?: string;
   finalized?: {
@@ -82,7 +103,7 @@ export interface TicketState {
 }
 
 function runsRoot(): string {
-  return join(dirname(findUpFile("package.json")), "runs");
+  return process.env.FACTORY_RUNS_ROOT ?? join(dirname(findUpFile("package.json")), "runs");
 }
 
 function statePath(ticketId: string): string {
@@ -147,12 +168,16 @@ export function updateState(
       lifecycle: "running",
       phaseWrites: [],
       gates: {},
+      outbox: {},
       autoRetry: { count: 0 },
     };
+    state.outbox ??= {};
+    state.autoRetry ??= { count: 0 };
     // nowy run tego samego ticketu = czysty przebieg (bramki starych runów nie mogą zatruwać guardów)
     if (state.runId !== seed.runId) {
       state.runId = seed.runId;
       state.gates = {};
+      state.outbox = {};
       state.phase = undefined;
       state.expectedState = undefined;
       state.phaseWrites = [];
@@ -161,6 +186,8 @@ export function updateState(
       state.prUrl = undefined;
       state.mergeHandledAt = undefined;
       state.files = undefined;
+      state.preMerge = undefined;
+      state.prodSmokeAt = undefined;
       state.createdAt = now;
     }
     mutate(state);
@@ -172,6 +199,66 @@ export function updateState(
     console.error(`[${ticketId}] rejestr runów — zapis nieudany:`, err instanceof Error ? err.message : err);
     return undefined;
   }
+}
+
+/** Dodaje komendę idempotentnie. Ten sam identyfikator nigdy nie tworzy drugiego side-effectu. */
+export function enqueueOutbox(
+  ticketId: string,
+  seed: { project: string; runId: string },
+  command: Pick<OutboxCommand, "id" | "kind" | "body" | "step" | "gate" | "round">
+): OutboxCommand | undefined {
+  let saved: OutboxCommand | undefined;
+  updateState(ticketId, seed, (s) => {
+    const now = new Date().toISOString();
+    s.outbox ??= {};
+    saved = s.outbox[command.id] ?? {
+      ...command,
+      state: "pending",
+      attempts: 0,
+      createdAt: now,
+      updatedAt: now,
+    };
+    s.outbox[command.id] = saved;
+  });
+  return saved;
+}
+
+export function markOutboxAttempt(
+  ticketId: string,
+  seed: { project: string; runId: string },
+  commandId: string,
+  result: { dispatched: boolean; error?: string }
+): void {
+  updateState(ticketId, seed, (s) => {
+    const command = s.outbox?.[commandId];
+    if (!command || command.state === "acknowledged") return;
+    command.attempts += 1;
+    command.updatedAt = new Date().toISOString();
+    command.lastError = result.error;
+    if (result.dispatched) {
+      command.state = "dispatched";
+      command.dispatchedAt = command.updatedAt;
+    }
+  });
+}
+
+export function acknowledgeOutbox(
+  ticketId: string,
+  seed: { project: string; runId: string },
+  commandId: string
+): void {
+  updateState(ticketId, seed, (s) => {
+    const command = s.outbox?.[commandId];
+    if (!command) return;
+    command.state = "acknowledged";
+    command.acknowledgedAt = new Date().toISOString();
+    command.updatedAt = command.acknowledgedAt;
+    command.lastError = undefined;
+  });
+}
+
+export function pendingOutbox(ticketId: string): OutboxCommand[] {
+  return Object.values(readState(ticketId)?.outbox ?? {}).filter((command) => command.state === "pending");
 }
 
 export function recordPhase(
@@ -219,7 +306,7 @@ export function recordDecision(
   });
 }
 
-/** Znacznik etapu konsumpcji — daje at-most-once resume po restarcie. */
+/** Znacznik etapu konsumpcji decyzji i dostarczenia komendy przez trwały outbox. */
 export function markDecisionStep(
   ticketId: string,
   seed: { project: string; runId: string },
@@ -310,6 +397,13 @@ export function fileCollisions(ticketId: string, files: string[]): { ticketId: s
   if (!wanted.size) return [];
   return listAll()
     .filter((s) => s.ticketId !== ticketId && holdsFiles(s))
-    .map((s) => ({ ticketId: s.ticketId, files: (s.files ?? []).filter((f) => wanted.has(f)) }))
+    .map((s) => {
+      const held = s.files ?? [];
+      const wildcard = wanted.has("*") || held.includes("*");
+      return {
+        ticketId: s.ticketId,
+        files: wildcard ? ["*"] : held.filter((f) => wanted.has(f)),
+      };
+    })
     .filter((c) => c.files.length > 0);
 }

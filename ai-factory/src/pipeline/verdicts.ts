@@ -12,8 +12,35 @@
  * żeby wywołujący mógł to zaraportować jako awarię kontraktu, a nie ciszę.
  */
 
+import { z } from "zod";
+
 /** `structured` = agent dotrzymał kontraktu; `missing` = nie oddał bloku (fail-closed). */
 export type VerdictSource = "structured" | "missing";
+
+const domainSchema = z.enum(["frontend", "backend", "fullstack", "ops"]);
+const pathSchema = z.string().trim().min(1).refine((value) => !value.startsWith("/") && !value.includes(".."), {
+  message: "ścieżka musi być względna wobec repo i nie może zawierać '..'",
+});
+
+const planContractSchema = z.discriminatedUnion("verdict", [
+  z.object({
+    verdict: z.literal("ok"),
+    questions: z.never().optional(),
+    screenshots: z.array(z.string().trim().min(1)).max(4).default([]),
+    files: z.array(pathSchema).min(1).max(200),
+    domain: domainSchema,
+  }).strict(),
+  z.object({
+    verdict: z.literal("blocked"),
+    questions: z.string().trim().min(1).optional(),
+    screenshots: z.array(z.string().trim().min(1)).max(4).default([]),
+    files: z.array(pathSchema).max(200).default([]),
+    domain: domainSchema.optional(),
+  }).strict(),
+]);
+
+const verifyContractSchema = z.object({ verdict: z.enum(["pass", "fail"]) }).strict();
+const reviewContractSchema = z.object({ verdict: z.enum(["lgtm", "fix"]) }).strict();
 
 export interface PlanVerdict {
   kind: "plan";
@@ -55,9 +82,6 @@ function structuredBlock(report: string): Record<string, unknown> | undefined {
   }
 }
 
-const asStringArray = (v: unknown): string[] =>
-  Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
-
 /** Komunikat dla człowieka i buildera, gdy agent nie dotrzymał kontraktu wyjścia. */
 export const MISSING_VERDICT =
   "Agent nie oddał bloku ```factory z werdyktem (kontrakt wyjścia). " +
@@ -83,28 +107,32 @@ export function verdictInstruction(kind: "plan" | "verify" | "review"): string {
 
 export function parsePlanVerdict(report: string): PlanVerdict {
   const b = structuredBlock(report);
-  if (!b || typeof b.verdict !== "string") {
+  const parsed = planContractSchema.safeParse(b);
+  if (!parsed.success) {
     return { kind: "plan", ok: false, questions: undefined, screenshots: [], files: [], source: "missing" };
   }
+  const contract = parsed.data;
   return {
     kind: "plan",
-    ok: b.verdict === "ok",
-    questions: typeof b.questions === "string" && b.questions.trim() ? b.questions : undefined,
-    screenshots: asStringArray(b.screenshots),
-    domain: typeof b.domain === "string" ? b.domain : undefined,
-    files: asStringArray(b.files),
+    ok: contract.verdict === "ok",
+    questions: contract.questions,
+    screenshots: contract.screenshots,
+    domain: contract.domain,
+    files: contract.files,
     source: "structured",
   };
 }
 
 export function parseVerifyVerdict(report: string): VerifyVerdict {
   const b = structuredBlock(report);
-  if (!b || typeof b.verdict !== "string") return { kind: "verify", pass: false, source: "missing" };
-  return { kind: "verify", pass: b.verdict === "pass", source: "structured" };
+  const parsed = verifyContractSchema.safeParse(b);
+  if (!parsed.success) return { kind: "verify", pass: false, source: "missing" };
+  return { kind: "verify", pass: parsed.data.verdict === "pass", source: "structured" };
 }
 
 export function parseReviewVerdict(report: string): ReviewVerdict {
   const b = structuredBlock(report);
-  if (!b || typeof b.verdict !== "string") return { kind: "review", needsFix: true, source: "missing" };
-  return { kind: "review", needsFix: b.verdict === "fix", source: "structured" };
+  const parsed = reviewContractSchema.safeParse(b);
+  if (!parsed.success) return { kind: "review", needsFix: true, source: "missing" };
+  return { kind: "review", needsFix: parsed.data.verdict === "fix", source: "structured" };
 }

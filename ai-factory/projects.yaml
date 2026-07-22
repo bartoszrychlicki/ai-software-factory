@@ -7,6 +7,7 @@ pilot-app:
   checks:
     - npm ci
     - npm run build
+    - npm test
   screenshot:
     start: npx vite preview --port 4173 --strictPort
     url: http://localhost:4173/
