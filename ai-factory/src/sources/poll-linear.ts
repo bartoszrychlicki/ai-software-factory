@@ -335,12 +335,13 @@ async function watchRun(
       if (status === "failed") {
         try {
         const msg = errorMessage(run);
+        const reason = registry.classifyFailure(msg);
         const blocked = /BLOCKED|odrzucony/i.test(msg);
         // serii bezpiecznika NIE nabijają: odrzucenie planu przez człowieka ani poprawny
         // BLOCKED na bramce planu (tani, pożądany fail-closed — np. ticket już zrobiony,
         // pytania do autora); liczą się porażki wykonania (verify FAIL po próbach, infra, budżet)
-        const planGateBlocked = /plan bez PLAN: OK|niejasności blokujące|Pytania do autora|JUŻ ISTNIEJE|już istnieje/i.test(msg);
-        if (!/odrzucony przez człowieka/i.test(msg) && !planGateBlocked) await recordRunOutcome(false).catch(() => {});
+        // serii bezpiecznika nie nabijają: decyzja człowieka ani poprawny BLOCKED bramki planu
+        if (reason !== "rejected" && reason !== "plan-gate") await recordRunOutcome(false).catch(() => {});
 
         // porażka INFRASTRUKTURALNA (nie-BLOCKED: timeout/spawn/silnik) → auto-retry dokładnie raz;
         // merytoryczny BLOCKED zawsze czeka na człowieka (retry bez zmiany wejścia = te same pytania za te same tokeny)
@@ -365,7 +366,7 @@ async function watchRun(
             `Uzupełnij ticket i nadaj ponownie label \`agent:ready\`, żeby fabryka spróbowała jeszcze raz.`
         );
         await setPhase(project, src, id, "blocked", runId);
-        registry.finalize(id, { project, runId }, /odrzucony przez człowieka/i.test(msg) ? "rejected" : blocked ? "blocked" : "failed");
+        registry.finalize(id, { project, runId }, reason === "rejected" ? "rejected" : blocked ? "blocked" : "failed", reason);
         notify(`🛑 ${id}: ${blocked ? "BLOCKED — pytania w tickecie" : "run nieudany"}`, clip(msg, 180)).catch(() => {});
         console.log(`[${id}] FAILED${blocked ? " (BLOCKED)" : ""}`);
         break;
@@ -689,11 +690,15 @@ async function handleClarifySuspend(
 async function findReusablePlan(src: LinearSource, id: string, description: string): Promise<string | undefined> {
   try {
     const comments = await src.listComments(id);
-    const lastFinal = [...comments].reverse().find((c) =>
-      c.body.includes(marker(id)) && (c.body.includes("🛑 BLOCKED") || c.body.includes("Run nieudany") || c.body.includes("Plan odrzucony")));
-    const meritorious = lastFinal &&
-      /BLOCKED po \d+\/\d+ próbach|plan bez PLAN: OK|niejasności blokujące|Pytania do autora|Plan odrzucony/.test(lastFinal.body);
-    if (meritorious) return undefined; // plan się zdezaktualizował — świeże planowanie ma wartość
+    // przyczyna z REJESTRU (deterministyczna); komentarze tylko dla runów sprzed migracji
+    const prev = registry.readState(id)?.finalized;
+    if (prev?.reason) {
+      if (prev.reason === "plan-gate" || prev.reason === "verify" || prev.reason === "rejected") return undefined;
+    } else {
+      const lastFinal = [...comments].reverse().find((c) =>
+        c.body.includes(marker(id)) && (c.body.includes("🛑 BLOCKED") || c.body.includes("Run nieudany") || c.body.includes("Plan odrzucony")));
+      if (lastFinal && registry.classifyFailure(lastFinal.body) !== "budget" && registry.classifyFailure(lastFinal.body) !== "infra") return undefined;
+    }
 
     const base = join(process.cwd(), "runs", id);
     const dirs = readdirSync(base)

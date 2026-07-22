@@ -66,7 +66,12 @@ export interface TicketState {
   prUrl?: string;
   mergeHandledAt?: string;
   prodSmokeAt?: string;
-  finalized?: { outcome: "success" | "blocked" | "failed" | "rejected" | "orphan"; at: string };
+  finalized?: {
+    outcome: "success" | "blocked" | "failed" | "rejected" | "orphan";
+    /** Klasyfikacja przyczyny — decyduje o reuse planu i o serii bezpiecznika. */
+    reason?: FailureReason;
+    at: string;
+  };
 }
 
 function runsRoot(): string {
@@ -221,14 +226,34 @@ export function markDecisionStep(
   });
 }
 
+/**
+ * Przyczyny porażki runa. Klasyfikowane RAZ, przy finalizacji, z komunikatu
+ * rzuconego przez NASZ pipeline (protokół wewnętrzny, nie swobodny tekst).
+ * - plan-gate: bramka planu (ticket zrobiony / pytania) — tanie i pożądane,
+ *   nie nabija serii bezpiecznika i NIE unieważnia zatwierdzonego planu,
+ * - verify: merytoryczna porażka po próbach — plan wymaga przemyślenia,
+ * - budget / infra: nic nie mówi o jakości planu — reuse jak najbardziej,
+ * - rejected: decyzja człowieka.
+ */
+export type FailureReason = "plan-gate" | "verify" | "budget" | "infra" | "rejected";
+
+export function classifyFailure(message: string): FailureReason {
+  if (/odrzucony przez człowieka|Plan odrzucony/i.test(message)) return "rejected";
+  if (/budżet ticketu wyczerpany/i.test(message)) return "budget";
+  if (/plan bez PLAN: OK|niejasności blokujące|Pytania do autora|JUŻ ISTNIEJE|już istnieje/i.test(message)) return "plan-gate";
+  if (/BLOCKED po \d+\/\d+ próbach|konflikt semantyczny|konflikt z /i.test(message)) return "verify";
+  return "infra";
+}
+
 export function finalize(
   ticketId: string,
   seed: { project: string; runId: string },
-  outcome: NonNullable<TicketState["finalized"]>["outcome"]
+  outcome: NonNullable<TicketState["finalized"]>["outcome"],
+  reason?: FailureReason
 ): void {
   updateState(ticketId, seed, (s) => {
     s.lifecycle = "finalized";
-    s.finalized = { outcome, at: new Date().toISOString() };
+    s.finalized = { outcome, reason, at: new Date().toISOString() };
   });
 }
 

@@ -13,6 +13,7 @@ import { saveArtifact, artifactHeader } from "./artifacts";
 import { takeScreenshot } from "./screenshot";
 import { recordMetric } from "./metrics";
 import { budgetExceeded } from "./budget";
+import { parsePlanVerdict, parseVerifyVerdict, parseReviewVerdict, verdictInstruction } from "./verdicts";
 
 const exec = promisify(execFile);
 
@@ -105,8 +106,6 @@ const planCycleSchema = z.object({
   answers: z.array(z.string()),
 });
 
-const PLAN_OK_RE = /^[`*\s]*PLAN:\s*OK\b/m;
-
 const initPlanCycleStep = createStep({
   id: "init-plan-cycle",
   description: "Inicjalizacja pętli plan↔dopytywanie (deterministyczny kod)",
@@ -137,7 +136,7 @@ const planStep = createStep({
       return { ...inputData, plan: ticket.reusePlan };
     }
     // plan już OK (wejście kolejnej iteracji) — nie przeplanowujemy
-    if (PLAN_OK_RE.test(inputData.plan)) return inputData;
+    if (inputData.plan && parsePlanVerdict(inputData.plan).ok) return inputData;
 
     const route = await resolveRoute("plan", ticket);
     const t0 = Date.now();
@@ -162,6 +161,7 @@ const planStep = createStep({
         "Jeśli masz już odpowiedzi autora (sekcja poniżej ticketu) — potraktuj je jako wiążące decyzje i NIE zadawaj tych samych pytań ponownie.",
         "Jeśli stan opisany w tickecie JUŻ ISTNIEJE w kodzie (ticket spełniony): PLAN: BLOCKED i wyjaśnienie BEZ pytań — nie planuj pustej pracy.",
         "PIERWSZA linia odpowiedzi CZYSTYM TEKSTEM, bez backticków i formatowania: PLAN: OK albo PLAN: BLOCKED.",
+        verdictInstruction("plan"),
       ].join("\n"),
       context: `# Ticket ${ticket.id}: ${ticket.title}\n\n${ticket.description}${answersBlock}`,
       workspace: ticket.repoPath,
@@ -172,7 +172,7 @@ const planStep = createStep({
     await recordMetric({
       ticket: ticket.id, runId, stage: "plan", engine: route.spec,
       ok: result.ok,
-      outcome: result.ok ? (PLAN_OK_RE.test(result.report) ? "ok" : "blocked") : "engine-fail",
+      outcome: result.ok ? (parsePlanVerdict(result.report).ok ? "ok" : "blocked") : "engine-fail",
       costUsd: result.costUsd, durationMs: Date.now() - t0,
     });
     await saveArtifact(
@@ -195,8 +195,9 @@ const clarifyGateStep = createStep({
   suspendSchema: z.object({ questions: z.string() }),
   resumeSchema: z.object({ answers: z.string() }),
   execute: async ({ inputData, resumeData, suspend, runId }) => {
-    if (PLAN_OK_RE.test(inputData.plan)) return inputData;
-    const questions = inputData.plan.match(/^##\s*Pytania do autora[\s\S]*?(?=\n##\s|$)/m)?.[0];
+    const verdict = parsePlanVerdict(inputData.plan);
+    if (verdict.ok) return inputData;
+    const questions = verdict.questions;
     // BLOCKED bez pytań (np. ticket już zrealizowany) → finalize zablokuje twardo
     if (!questions || inputData.clarifyRound >= inputData.maxClarifyRounds) return inputData;
     if (!resumeData) {
@@ -229,10 +230,9 @@ const finalizePlanStep = createStep({
   inputSchema: planCycleSchema,
   outputSchema: planOutputSchema,
   execute: async ({ inputData }) => {
-    if (!PLAN_OK_RE.test(inputData.plan)) {
-      const detail =
-        inputData.plan.match(/^##\s*(Pytania do autora|Niejasności blokujące)[\s\S]*?(?=\n##\s|$)/m)?.[0] ??
-        inputData.plan.slice(0, 2000);
+    const planVerdict = parsePlanVerdict(inputData.plan);
+    if (!planVerdict.ok) {
+      const detail = planVerdict.questions ?? inputData.plan.slice(0, 2000);
       throw new Error(
         `BLOCKED: plan bez PLAN: OK${inputData.clarifyRound > 0 ? ` po ${inputData.clarifyRound} rundach dopytywania` : ""}. ` +
           `Uzupełnij ticket i nadaj label ponownie.\n\n${detail}`
@@ -453,7 +453,7 @@ const verifyStep = createStep({
       if (ticket.e2e) {
         // screenshoty widoków wskazanych przez plannera (linie `SCREENSHOT: /ścieżka`) — tymczasowy spec
         // dziedziczy z configu repo zalogowaną sesję i seedowane dane; sprzątany PRZED werdyktem agenta
-        const shotTargets = [...inputData.plan.matchAll(/^SCREENSHOT:\s*(\/\S*)/gm)].map((m) => m[1]).slice(0, 4);
+        const shotTargets = parsePlanVerdict(inputData.plan).screenshots.slice(0, 4);
         const shotsDir = join(co.dir, ".factory-shots");
         const shotSpec = join(co.dir, "e2e", "__factory-screens.spec.ts");
         if (shotTargets.length) {
@@ -532,6 +532,7 @@ const verifyStep = createStep({
           "- brak zmian poza zakresem planu?",
           "- jakość: oczywiste błędy, regresje, edge case'y?",
           "PIERWSZA linia odpowiedzi: `VERDICT: PASS` albo `VERDICT: FAIL`.",
+          verdictInstruction("verify"),
           "Potem uzasadnienie punktowo. Bądź surowy — wątpliwość = FAIL.",
         ].join("\n"),
         context: [
@@ -564,7 +565,7 @@ const verifyStep = createStep({
         };
       }
 
-      const pass = /^VERDICT:\s*PASS/m.test(result.report);
+      const pass = parseVerifyVerdict(result.report).pass;
       await recordMetric({
         ticket: ticket.id, runId, stage: "verify", engine: route.spec, attempt: inputData.attempt,
         ok: true, outcome: pass ? "pass" : "fail", costUsd: result.costUsd, durationMs: Date.now() - t0,
@@ -809,6 +810,7 @@ const prReviewStep = createStep({
           "PIERWSZA linia odpowiedzi: `REVIEW: LGTM` (kod w porządku) albo `REVIEW: FIX` (są uwagi do poprawy).",
           "Po REVIEW: FIX wypisz uwagi: zwięzłe punkty `plik:linia — uwaga`, od najważniejszej, max 8.",
           "Po REVIEW: LGTM jedno zdanie podsumowania. Zgłaszaj FIX tylko dla uwag wartych iteracji buildera.",
+          verdictInstruction("review"),
         ].join("\n"),
         context: `# Diff (git show ${sha.slice(0, 8)}, runda review ${round}/${inputData.maxReviewRounds})\n${diff.slice(0, 60_000)}`,
         workspace: workspaceDir,
@@ -828,8 +830,9 @@ const prReviewStep = createStep({
         };
       }
 
-      const fix = /^REVIEW:\s*FIX/m.test(result.report);
-      // fail-open na brak markera: recenzja bez werdyktu nie może zapętlić fabryki — traktujemy jak LGTM z notką
+      // FAIL-CLOSED: brak jednoznacznego LGTM = są uwagi (dotąd fail-open zdejmował draft
+      // z PR-a, gdy agent zgubił marker w wiadomości pośredniej)
+      const fix = parseReviewVerdict(result.report).needsFix;
       const verdict = fix ? ("fix" as const) : ("lgtm" as const);
       await recordMetric({
         ticket: ticket.id, runId, stage: "review", engine: route.spec, round,
@@ -1009,10 +1012,11 @@ export const ticketPipeline = createWorkflow({
   .then(initPlanCycleStep)
   .dountil(
     planClarifyCycle,
-    async ({ inputData }) =>
-      PLAN_OK_RE.test(inputData.plan) ||
-      (!inputData.plan.match(/^##\s*Pytania do autora/m)) && inputData.plan !== "" ||
-      inputData.clarifyRound >= inputData.maxClarifyRounds
+    async ({ inputData }) => {
+      if (!inputData.plan) return false;
+      const v = parsePlanVerdict(inputData.plan);
+      return v.ok || !v.questions || inputData.clarifyRound >= inputData.maxClarifyRounds;
+    }
   )
   .then(finalizePlanStep)
   .then(approvePlanStep)
