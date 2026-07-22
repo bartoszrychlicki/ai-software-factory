@@ -10,6 +10,7 @@ Fabryka software: ticket → intake → plan (+gate niejasności) → human gate
 - `src/engines/claude-code.ts` — `claude -p --output-format stream-json --verbose`; zwraca `report` (ostatnia wiadomość, dla człowieka) i `transcript` (WSZYSTKIE wiadomości — z niego parsujemy werdykty); role ≠ build dostają tylko `Read,Glob,Grep`.
 - `src/engines/codex.ts` — `codex exec`, sandbox `read-only`/`workspace-write` wg roli; **musi mieć `child.stdin.end()`**.
 - `src/engines/kimi-code.ts` — `kimi -p` (headless). **TYLKO rola build**: tryb -p zawsze auto-zatwierdza zapisy i nie ma read-only (`--plan`/`--yolo`/`--auto` nie łączą się z `-p`) — inne role dostają odmowę fail-closed. Label `engine:*` działa przez to wyłącznie na build (routing.ts). Bez raportu kosztów.
+- `src/engines/pi.ts` — `pi -p --provider lm-studio --model <jawny model> --no-session`; **TYLKO rola verify**, prompt wyłącznie przez stdin, narzędzia ograniczone do read-only; brak modelu i inne role dostają odmowę fail-closed.
 - `src/engines/index.ts` — rejestr silników (nowy silnik = adapter + wpis + linijka w routing.yaml).
 - `src/sources/types.ts` — kontrakt `TicketSource`.
 - `src/sources/linear.ts` — `LinearSource` (GraphQL API; klucz w `.env` jako `LINEAR_API_KEY`, projekt `LINEAR_PROJECT`). Nazwa projektu w Linear == klucz w projects.yaml.

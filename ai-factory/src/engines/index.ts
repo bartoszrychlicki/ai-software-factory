@@ -1,6 +1,7 @@
 import { claudeCode } from "./claude-code";
 import { codex } from "./codex";
 import { kimiCode } from "./kimi-code";
+import { pi } from "./pi";
 import type { EngineAdapter } from "./types";
 
 /**
@@ -11,4 +12,5 @@ export const engines: Record<string, EngineAdapter> = {
   [claudeCode.name]: claudeCode,
   [codex.name]: codex,
   [kimiCode.name]: kimiCode,
+  [pi.name]: pi,
 };

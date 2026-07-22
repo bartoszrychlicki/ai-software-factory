@@ -1,4 +1,5 @@
 import { claudeCode } from "./claude-code";
+import { pi } from "./pi";
 
 async function main() {
   const result = await claudeCode.run({
@@ -41,7 +42,46 @@ async function main() {
 
     console.log("\n== test codex ==");
     console.log("ok:", codexResult.ok);
-    console.log("report:", codexResult.report.slice(0, 200));   
+    console.log("report:", codexResult.report.slice(0, 200));
+
+  // test pi z lokalnym qwen przez LM Studio
+  const piResult = await pi.run({
+    role: "verify",
+    instructions: "Odpowiedz dokładnie: PI_OK",
+    context: "To jest hostowy smoke test adaptera pi.",
+    workspace: process.cwd(),
+    budget: { minutes: 3 },
+    model: "qwen/qwen3.6-27b",
+  });
+
+  console.log("\n== test pi ==");
+  console.log("ok:", piResult.ok);
+  console.log("report:", piResult.report.slice(0, 200));
+
+  const piWrongRole = await pi.run({
+    role: "build",
+    instructions: "Nie uruchamiaj procesu.",
+    context: "",
+    workspace: process.cwd(),
+    budget: { minutes: 1 },
+    model: "qwen/qwen3.6-27b",
+  });
+
+  console.log("\n== test negatywny pi: rola build ==");
+  console.log("ok:", piWrongRole.ok, "(oczekiwane: false)");
+  console.log("report:", piWrongRole.report);
+
+  const piWithoutModel = await pi.run({
+    role: "verify",
+    instructions: "Nie uruchamiaj procesu.",
+    context: "",
+    workspace: process.cwd(),
+    budget: { minutes: 1 },
+  });
+
+  console.log("\n== test negatywny pi: brak modelu ==");
+  console.log("ok:", piWithoutModel.ok, "(oczekiwane: false)");
+  console.log("report:", piWithoutModel.report);
 }
 
 

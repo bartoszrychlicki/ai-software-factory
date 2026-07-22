@@ -9,6 +9,9 @@ defaults:
 
 # spec: silnik[/model[@effort]]; effort: low/medium/high/xhigh (claude --effort, codex -c model_reasoning_effort)
 projects:
+  pilot-app:
+    verify: pi/qwen/qwen3.6-27b
+
   br-budget:
     plan: claude-code/claude-fable-5@high
     build: codex/gpt-5.6-sol@xhigh
