@@ -8,6 +8,8 @@ export interface EngineRunInput {
   budget: { minutes: number };
   model?: string;          // np. claude-fable-5, gpt-5.6-sol
   effort?: string;         // reasoning effort: low/medium/high/xhigh (mapowany per CLI)
+  /** Wznowienie bieżącej sesji CLI; w MVP obsługiwane tylko przez claude-code w roli plan. */
+  sessionId?: string;
 }
 
 export interface EngineRunResult {
@@ -20,6 +22,8 @@ export interface EngineRunResult {
    */
   transcript?: string;
   costUsd?: number;
+  /** Id sesji zwrócone przez CLI; inne adaptery mogą je pominąć. */
+  sessionId?: string;
   raw?: unknown;
 }
 

@@ -109,6 +109,62 @@ const ticketDomain = (ticket: { labels?: string[] }, plan?: string): string | un
 const planOutcome = (v: { ok: boolean; source: string }) =>
   v.source === "missing" ? "verdict-missing" : v.ok ? "ok" : "blocked";
 
+const PLAN_INSTRUCTIONS = [
+  "Jesteś plannerem w fabryce software.",
+  "Przygotuj implementowalny plan dla poniższego ticketu:",
+  "- zakres i poza zakresem",
+  "- kryteria akceptacji i sposób weryfikacji każdego",
+  "- plan zmian plik po pliku",
+  "- plan testów",
+  "Decyzje kosmetyczne (separator, nazewnictwo, drobny format) podejmij SAM i odnotuj w planie — nie są niejasnością.",
+  "Jeśli zmiana dotyka UI: podaj w bloku factory 1-4 ścieżki widoków w polu \"screenshots\" — fabryka zrobi z nich zrzuty do oceny przez człowieka.",
+  "Jeśli ticketu NIE DA SIĘ bezpiecznie zaplanować bez odpowiedzi człowieka: verdict \"blocked\" i pytania w polu \"questions\" — ponumerowane, każde z opcjami A)/B)/C) i dopiskiem (REKOMENDACJA) przy tej, którą byś wybrał. Autor odpowie krótko (np. \"1A, 2C\") i doplanujesz z odpowiedziami w kontekście.",
+  "Jeśli masz już odpowiedzi autora (sekcja poniżej ticketu) — potraktuj je jako wiążące decyzje i NIE zadawaj tych samych pytań ponownie.",
+  "Jeśli stan opisany w tickecie JUŻ ISTNIEJE w kodzie (ticket spełniony): verdict \"blocked\" i wyjaśnienie w raporcie, BEZ pytań — nie planuj pustej pracy.",
+  `W bloku factory wypełnij "files" KOMPLETNĄ listą plików, które ticket zmieni (ścieżki względem repo) — fabryka serializuje na ich podstawie równoległe tickety, więc pominięty plik grozi konfliktem merge'a.`,
+  `Oraz "domain": frontend | backend | fullstack | ops — na podstawie zakresu zmian; od tego zależy dobór silnika buildu.`,
+  verdictInstruction("plan"),
+].join("\n");
+
+interface PlanPromptState {
+  ticket: { id: string; title: string; description: string };
+  clarifyRound: number;
+  answers: readonly string[];
+  sessionId?: string;
+}
+
+/** Jeden builder promptu dla pipeline'u i kontrolowanego benchmarku A/B. */
+export function buildPlanEnginePrompt(input: PlanPromptState): {
+  instructions: string;
+  context: string;
+  sessionId?: string;
+  resumed: boolean;
+} {
+  const resumed = input.clarifyRound > 0 && !!input.sessionId;
+  if (resumed) {
+    return {
+      instructions: [
+        "Wznawiasz wcześniejszą sesję planowania tego samego ticketu.",
+        "Uwzględnij wiążącą odpowiedź autora poniżej i zwróć zaktualizowany, kompletny plan.",
+        verdictInstruction("plan"),
+      ].join("\n"),
+      context: `# Odpowiedź autora ticketu — runda ${input.clarifyRound}\n\n${input.answers.at(-1) ?? ""}`,
+      sessionId: input.sessionId,
+      resumed: true,
+    };
+  }
+
+  const answersBlock = input.answers.length
+    ? "\n\n# Odpowiedzi autora ticketu na Twoje wcześniejsze pytania\n" +
+      input.answers.map((answer, index) => `\n## Runda ${index + 1}\n${answer}`).join("\n")
+    : "";
+  return {
+    instructions: PLAN_INSTRUCTIONS,
+    context: `# Ticket ${input.ticket.id}: ${input.ticket.title}\n\n${input.ticket.description}${answersBlock}`,
+    resumed: false,
+  };
+}
+
 const intakeStep = createStep({
   id: "intake",
   description: "Intake: rozwiązanie projektu z rejestru (deterministyczny kod)",
@@ -146,6 +202,7 @@ const planCycleSchema = z.object({
   clarifyRound: z.number(),
   maxClarifyRounds: z.number(),
   answers: z.array(z.string()),
+  sessionId: z.string().optional(),
 });
 
 const initPlanCycleStep = createStep({
@@ -159,6 +216,7 @@ const initPlanCycleStep = createStep({
     clarifyRound: 0,
     maxClarifyRounds: 2,
     answers: [],
+    sessionId: undefined,
   }),
 });
 
@@ -178,9 +236,9 @@ const planStep = createStep({
         model: "reuse",
         profile: "planner" as const,
       };
-      await recordMetric({ ticket: ticket.id, runId, stage: "plan", engine: "reuse", ok: true, outcome: "reused", costUsd: 0, durationMs: 0 });
+      await recordMetric({ ticket: ticket.id, runId, stage: "plan", engine: "reuse", ok: true, outcome: "reused", costUsd: 0, durationMs: 0, resumed: false });
       await saveArtifact(ticket.id, runId, "plan.md",
-        artifactHeader({ step: "plan", ...signatureMeta(signature), engine: "reuse", reused: "true" }) + ticket.reusePlan);
+        artifactHeader({ step: "plan", ...signatureMeta(signature), engine: "reuse", reused: "true", resumed: "false" }) + ticket.reusePlan);
       return { ...inputData, plan: ticket.reusePlan };
     }
     // plan już OK (wejście kolejnej iteracji) — nie przeplanowujemy
@@ -188,43 +246,44 @@ const planStep = createStep({
 
     const route = await resolveRoute("plan", ticket);
     const signature = buildSignature("plan", route);
-    const t0 = Date.now();
-    const answersBlock = inputData.answers.length
-      ? "\n\n# Odpowiedzi autora ticketu na Twoje wcześniejsze pytania\n" +
-        inputData.answers.map((a, i) => `\n## Runda ${i + 1}\n${a}`).join("\n")
-      : "";
-    const result = await route.engine.run({
-      role: "plan",
-      model: route.model,
-      effort: route.effort,
-      instructions: [
-        "Jesteś plannerem w fabryce software.",
-        "Przygotuj implementowalny plan dla poniższego ticketu:",
-        "- zakres i poza zakresem",
-        "- kryteria akceptacji i sposób weryfikacji każdego",
-        "- plan zmian plik po pliku",
-        "- plan testów",
-        "Decyzje kosmetyczne (separator, nazewnictwo, drobny format) podejmij SAM i odnotuj w planie — nie są niejasnością.",
-        "Jeśli zmiana dotyka UI: podaj w bloku factory 1-4 ścieżki widoków w polu \"screenshots\" — fabryka zrobi z nich zrzuty do oceny przez człowieka.",
-        "Jeśli ticketu NIE DA SIĘ bezpiecznie zaplanować bez odpowiedzi człowieka: verdict \"blocked\" i pytania w polu \"questions\" — ponumerowane, każde z opcjami A)/B)/C) i dopiskiem (REKOMENDACJA) przy tej, którą byś wybrał. Autor odpowie krótko (np. \"1A, 2C\") i doplanujesz z odpowiedziami w kontekście.",
-        "Jeśli masz już odpowiedzi autora (sekcja poniżej ticketu) — potraktuj je jako wiążące decyzje i NIE zadawaj tych samych pytań ponownie.",
-        "Jeśli stan opisany w tickecie JUŻ ISTNIEJE w kodzie (ticket spełniony): verdict \"blocked\" i wyjaśnienie w raporcie, BEZ pytań — nie planuj pustej pracy.",
-        `W bloku factory wypełnij "files" KOMPLETNĄ listą plików, które ticket zmieni (ścieżki względem repo) — fabryka serializuje na ich podstawie równoległe tickety, więc pominięty plik grozi konfliktem merge'a.`,
-        `Oraz "domain": frontend | backend | fullstack | ops — na podstawie zakresu zmian; od tego zależy dobór silnika buildu.`,
-        verdictInstruction("plan"),
-      ].join("\n"),
-      context: `# Ticket ${ticket.id}: ${ticket.title}\n\n${ticket.description}${answersBlock}`,
-      workspace: ticket.repoPath,
-      // 5 min ubiło Fable@high na produkcyjnym repo (BAR-91: kill w 301 s) — mocne modele myślą dłużej
-      budget: { minutes: 20 },
-    });
+    const attemptCosts: number[] = [];
+    const runPlanner = async (candidate: ReturnType<typeof buildPlanEnginePrompt>) => {
+      const startedAt = Date.now();
+      const attempt = await route.engine.run({
+        role: "plan",
+        model: route.model,
+        effort: route.effort,
+        instructions: candidate.instructions,
+        context: candidate.context,
+        sessionId: candidate.sessionId,
+        workspace: ticket.repoPath,
+        // 5 min ubiło Fable@high na produkcyjnym repo (BAR-91: kill w 301 s) — mocne modele myślą dłużej
+        budget: { minutes: 20 },
+      });
+      if (attempt.costUsd !== undefined) attemptCosts.push(attempt.costUsd);
+      await recordMetric({
+        ticket: ticket.id, runId, stage: "plan", engine: route.spec,
+        ok: attempt.ok,
+        outcome: attempt.ok ? planOutcome(parsePlanVerdict(attempt.transcript ?? attempt.report)) : "engine-fail",
+        costUsd: attempt.costUsd, durationMs: Date.now() - startedAt,
+        resumed: candidate.resumed,
+      });
+      return attempt;
+    };
 
-    await recordMetric({
-      ticket: ticket.id, runId, stage: "plan", engine: route.spec,
-      ok: result.ok,
-      outcome: result.ok ? planOutcome(parsePlanVerdict(result.transcript ?? result.report)) : "engine-fail",
-      costUsd: result.costUsd, durationMs: Date.now() - t0,
-    });
+    let prompt = buildPlanEnginePrompt(inputData);
+    let result = await runPlanner(prompt);
+    const resumeFallback = prompt.resumed && !result.ok;
+    if (resumeFallback) {
+      // Sesja CLI mogła wygasnąć podczas wielogodzinnego oczekiwania na odpowiedź autora.
+      // Pełny cold prompt pozwala dokończyć rundę bez zależności od tej sesji.
+      prompt = buildPlanEnginePrompt({ ...inputData, sessionId: undefined });
+      result = await runPlanner(prompt);
+    }
+
+    const totalCostUsd = attemptCosts.length
+      ? attemptCosts.reduce((sum, cost) => sum + cost, 0)
+      : undefined;
     await saveArtifact(
       ticket.id,
       runId,
@@ -233,15 +292,22 @@ const planStep = createStep({
         step: "plan",
         ...signatureMeta(signature),
         engine: route.spec,
-        costUsd: result.costUsd,
+        costUsd: totalCostUsd,
         ok: String(result.ok),
         round: inputData.clarifyRound,
+        resumed: String(prompt.resumed),
+        resumeFallback: String(resumeFallback),
       }) + (result.transcript ?? result.report)
     );
     if (!result.ok) throw new Error(`Planner (${route.spec}) nie dostarczył planu: ${result.report}`);
 
     // do dalszych kroków idzie PEŁNY transkrypt: werdykt/pytania mogą siedzieć w wiadomości pośredniej
-    return { ...inputData, plan: result.transcript ?? result.report, planCostUsd: (inputData.planCostUsd ?? 0) + (result.costUsd ?? 0) };
+    return {
+      ...inputData,
+      plan: result.transcript ?? result.report,
+      planCostUsd: (inputData.planCostUsd ?? 0) + (totalCostUsd ?? 0),
+      sessionId: result.sessionId ?? (resumeFallback ? undefined : inputData.sessionId),
+    };
   },
 });
 
