@@ -10,8 +10,11 @@
  * Na starcie: adopcja sierot — tickety „In Progress" z runId w komentarzach
  * odzyskują opiekuna po restarcie pollera.
  *
- * Aprobata planu: komentarz `zatwierdzam` / `odrzuć: powód` w Linear
- * (polling co RUN_WATCH_INTERVAL; Studio działa równolegle jako fallback).
+ * STEROWANIE = PRZEJŚCIA STANÓW (BAR-142): claim `Backlog → Todo`, aprobata
+ * `👤 🚦 Plan do akceptacji → 🔨 Build`, odrzucenie `→ Backlog/Canceled/⛔`,
+ * odpowiedzi `👤 ❓ Pytania → 🧠 Planowanie`. Furtka z telefonu: ścisłe komendy
+ * `/approve`, `/reject <powód>`, `/answer <treść>`. Żaden regex na swobodnym
+ * tekście nie decyduje o przepływie — komentarze są wyłącznie danymi.
  *
  * Uruchomienie:  npx tsx src/sources/poll-linear.ts [--once]
  * Produkcyjnie: usługa launchd (ops/install-launchd.sh).
@@ -33,6 +36,7 @@ import { notify } from "../pipeline/notify";
 import { runProdChecks } from "../pipeline/prod-smoke";
 import * as registry from "../pipeline/run-registry";
 import { LINEAR_STATE_MAP as MAP, phaseOfState, decisionOfState } from "./state-map";
+import { parseCommand, hintFor } from "./commands";
 
 const exec = promisify(execFile);
 
@@ -214,6 +218,7 @@ async function watchRun(
 ) {
   let planCommentedAt = planCommentedAtInit;
   let decisionSent = decisionSentInit;
+  let hintSent = false;
   const deadline = Date.now() + RUN_WATCH_MAX_MS;
 
   // fazy śledzimy po ARTEFAKTACH (snapshot Mastry po resume jest stale — bug guarda, patrz CLAUDE.md);
@@ -222,6 +227,7 @@ async function watchRun(
   const seenArtifacts = new Set<string>(safeReaddir(runDir));
   const answeredRounds = new Set<number>(); // rundy pytań, dla których resume już poszedł
   const answeredFallback = new Set<number>(); // drugi strzał z pełną ścieżką kroku (format id w zagnieżdżonym workflow)
+  const hintedRounds = new Set<number>(); // podpowiedź „jak zatwierdzić odpowiedzi" raz na rundę
 
   try {
     while (Date.now() < deadline) {
@@ -232,7 +238,7 @@ async function watchRun(
       const status = runStatus(run);
 
       // tryb dopytywania: suspend na clarify-ticket obsługujemy PRZED przepływem aprobaty
-      if (status === "suspended" && await handleClarifySuspend(project, src, id, runId, runDir, answeredRounds, answeredFallback)) {
+      if (status === "suspended" && await handleClarifySuspend(project, src, id, runId, runDir, answeredRounds, answeredFallback, hintedRounds)) {
         continue;
       }
 
@@ -242,28 +248,38 @@ async function watchRun(
           await src.comment(
             id,
             `📋 Plan gotowy ${marker(id)} — czeka na Twoją decyzję.\n\n` +
-              `**Odpowiedz komentarzem:** \`zatwierdzam\` — buduję, albo \`odrzuć: <powód>\` — przerywam.\n` +
-              `(Aprobata w Studio też nadal działa: run \`${runId}\`.)\n\n---\n\n${clip(plan, 16000)}`
+              `**Przeciągnij kartę:** na *${MAP.phases.build}* — buduję, albo na *Backlog / Canceled* — odrzucam (powód w komentarzu).\n` +
+              `Z telefonu: komenda \`/approve\` albo \`/reject <powód>\`.\n\n---\n\n${clip(plan, 16000)}`
           );
           planCommentedAt = new Date().toISOString(); // dopiero PO udanym komentarzu — inaczej czkawka API gubi plan na zawsze (BAR-104)
           registry.openGateRecord(id, { project, runId }, "plan-approval", 0, "🚦 Plan do akceptacji");
           await setPhase(project, src, id, "plan-approval", runId);
           console.log(`[${id}] plan czeka na decyzję w Linear`);
-          notify(`⏳ ${id}: plan do akceptacji`, "Odpowiedz `zatwierdzam` / `odrzuć: powód` w Linear.").catch(() => {});
+          notify(`⏳ ${id}: plan do akceptacji`, `Przeciągnij kartę na „${MAP.phases.build}" albo napisz /approve.`).catch(() => {});
         } catch (err) {
           console.error(`[${id}] komentarz z planem nieudany (retry w następnym ticku):`, err instanceof Error ? err.message : err);
         }
       } else if (status === "suspended" && planCommentedAt && !decisionSent) {
-        let decision = await readDecision(src, id, planCommentedAt);
-        let via: "state" | "command" | "text-legacy" = decision ? "text-legacy" : "state";
-        // aprobata przez PRZECIĄGNIĘCIE karty: 🚦 Plan do akceptacji → 🔨 Build (bezargumentowa, więc status wystarcza)
-        if (!decision) {
-          // DETERMINISTYCZNY sygnał: przejście stanu wg mapy decyzji (bez regexów na tekście)
-          const state = await src.getStateName(id).catch(() => undefined);
-          const kind = state ? decisionOfState(MAP, "plan-approval", state) : undefined;
-          if (kind === "approve") decision = { approved: true };
-          else if (kind === "reject") decision = { approved: false, feedback: "odrzucone przeniesieniem karty" };
+        // 1) KANONICZNIE: przejście stanu (przeciągnięcie karty) wg mapy decyzji
+        const state = await src.getStateName(id).catch(() => undefined);
+        let kind = state ? decisionOfState(MAP, "plan-approval", state) : undefined;
+        let via: "state" | "command" = "state";
+        // 2) FURTKA: ścisła komenda w komentarzu (`/approve`, `/reject <powód>`)
+        const cmd = kind ? undefined : await readCommandDecision(src, id, planCommentedAt);
+        if (!kind && cmd?.decision) {
+          kind = cmd.decision.kind;
+          via = "command";
         }
+        // 3) komentarz bez sygnału przy otwartej bramce → jednorazowa podpowiedź (koniec cichych porażek)
+        if (!kind && cmd?.strayComment && !hintSent) {
+          hintSent = true;
+          await src.comment(id, `${hintFor("plan-approval", { approve: MAP.decisions["plan-approval"]?.approve?.[0] })} ${marker(id)}`).catch(() => {});
+        }
+        const decision = kind === "approve"
+          ? { approved: true }
+          : kind === "reject"
+            ? { approved: false, feedback: cmd?.decision?.payload ?? (await collectPayload(src, id, planCommentedAt)) ?? "odrzucone bez powodu" }
+            : undefined;
         if (decision) {
           decisionSent = true;
           registry.recordDecision(id, { project, runId }, "plan-approval", 0, {
@@ -589,7 +605,8 @@ async function handleClarifySuspend(
   runId: string,
   runDir: string,
   answered: Set<number>,
-  answeredFallback: Set<number>
+  answeredFallback: Set<number>,
+  hintedRounds: Set<number>
 ): Promise<boolean> {
   const qFiles = safeReaddir(runDir).filter((f) => /^questions-round-\d+\.md$/.test(f));
   if (!qFiles.length) return false;
@@ -608,7 +625,8 @@ async function handleClarifySuspend(
     await src.comment(
       id,
       `${qTag} ${marker(id)} — ticket wymaga doprecyzowania przed planem.\n\n` +
-        `Odpowiedz krótko w komentarzu (np. \`1A, 2C\` albo własnymi słowami) — doplanuję bez ponownego labelowania.\n\n---\n\n${qBody}`
+        `Odpowiedz w komentarzu (np. \`1A, 2C\`), a potem **przeciągnij kartę na *${MAP.phases.planning}*** — doplanuję z Twoimi odpowiedziami.\n` +
+          `Z telefonu: \`/answer 1A, 2C\`.\n\n---\n\n${qBody}`
     ).catch(() => {});
     registry.openGateRecord(id, { project, runId }, "clarify", qMax, "❓ Pytania do autora");
     await setPhase(project, src, id, "questions", runId);
@@ -617,22 +635,37 @@ async function handleClarifySuspend(
     return true;
   }
 
-  // idempotencja po restarcie: potwierdzenie przyjęcia odpowiedzi = resume już był
-  if (comments.some((c) => c.body.includes("🧠 Odpowiedzi przyjęte") && c.body.includes(`(runda ${qMax})`))) {
+  // idempotencja: znacznik z REJESTRU, nie fraza w komentarzu
+  const gateRec = registry.readState(id)?.gates[registry.gateId("clarify", qMax)];
+  if (gateRec?.decision?.resumeSentAt) {
     if (answered.has(qMax) && !answeredFallback.has(qMax)) {
       // wciąż suspended tick później — spróbuj pełnej ścieżki kroku w zagnieżdżonym workflow
       answeredFallback.add(qMax);
-      fireResumeStep(runId, ["plan-clarify-cycle", "clarify-ticket"], { answers: lastAnswer(comments, qComment) ?? "" });
+      fireResumeStep(runId, ["plan-clarify-cycle", "clarify-ticket"], { answers: gateRec.decision.payload ?? "" });
     }
     answered.add(qMax);
     return true;
   }
 
-  const answer = lastAnswer(comments, qComment);
+  // SYGNAŁ: przeciągnięcie karty ❓ Pytania → 🧠 Planowanie (kanonicznie) albo komenda /answer
+  const state = await src.getStateName(id).catch(() => undefined);
+  const byState = state ? decisionOfState(MAP, "clarify", state) === "answer" : false;
+  const cmd = byState ? undefined : await readCommandDecision(src, id, qComment.createdAt);
+  const byCommand = cmd?.decision?.kind === "answer";
+  const answer = byState || byCommand
+    ? (await collectPayload(src, id, qComment.createdAt)) ?? cmd?.decision?.payload
+    : undefined;
+
+  // komentarz z odpowiedziami bez sygnału → jednorazowa podpowiedź, jak je zatwierdzić
+  if (!answer && cmd?.strayComment && !hintedRounds.has(qMax)) {
+    hintedRounds.add(qMax);
+    await src.comment(id, `${hintFor("clarify", { answer: MAP.phases.planning })} ${marker(id)}`).catch(() => {});
+  }
+
   if (answer && !answered.has(qMax)) {
     answered.add(qMax);
     registry.recordDecision(id, { project, runId }, "clarify", qMax, {
-      kind: "answer", payload: answer, via: "text-legacy", observedAt: new Date().toISOString(),
+      kind: "answer", payload: answer, via: byState ? "state" : "command", observedAt: new Date().toISOString(),
     });
     registry.markDecisionStep(id, { project, runId }, "clarify", qMax, "consumedAt");
     fireResumeStep(runId, "clarify-ticket", { answers: answer });
@@ -643,10 +676,6 @@ async function handleClarifySuspend(
     console.log(`[${id}] odpowiedzi rundy ${qMax} → resume clarify`);
   }
   return true;
-}
-
-function lastAnswer(comments: { body: string; createdAt: string }[], after: { createdAt: string }): string | undefined {
-  return comments.find((c) => c.createdAt > after.createdAt && !c.body.includes("[linear:"))?.body;
 }
 
 // --- plan-reuse ------------------------------------------------------------
@@ -741,25 +770,37 @@ async function prodSmokeGuard(projectKey: string, src: LinearSource, ticketId: s
 // --- decyzja człowieka w Linear -------------------------------------------
 
 /**
- * `zatwierdzam` / `odrzuć: powód` w komentarzach. Bramka pozostaje LUDZKA —
- * fabryka tylko czyta komentarz napisany ręcznie w Linear. Komentarze fabryki
- * niosą marker i są pomijane; liczą się tylko nowsze niż komentarz z planem.
  */
-async function readDecision(
+/**
+ * Decyzja z komentarza — WYŁĄCZNIE ścisła komenda (`/approve`, `/reject`, `/answer`).
+ * Rozpoznawanie fraz („zatwierdzam", „odrzuć") zostało usunięte: sterowanie
+ * przepływem idzie przez przejścia stanów, a komenda jest jedyną furtką tekstową.
+ * Zwraca też komentarze, które NIE były komendą — do wysłania podpowiedzi.
+ */
+async function readCommandDecision(
   src: LinearSource,
   id: string,
   sinceIso: string
-): Promise<{ approved: boolean; feedback?: string } | undefined> {
+): Promise<{ decision?: { kind: registry.DecisionKind; payload?: string }; strayComment: boolean }> {
   const comments = await src.listComments(id).catch(() => []);
+  let stray = false;
   for (const c of comments) {
     if (c.createdAt <= sinceIso || c.body.includes(marker(id))) continue;
-    const body = c.body.trim();
-    // (?![\p{L}\p{N}]) zamiast \b — granice słów w JS są ASCII-only i "odrzuć:"/"akceptuję" nigdy nie matchowały
-    if (/^(zatwierdzam|akceptuję|akceptuje|zgoda|approve|approved|ok|lgtm)(?![\p{L}\p{N}])/iu.test(body)) return { approved: true };
-    const reject = body.match(/^(odrzuć|odrzucam|reject)(?![\p{L}\p{N}])[:\s]*([\s\S]*)/iu);
-    if (reject) return { approved: false, feedback: reject[2].trim() || "odrzucone w Linear bez powodu" };
+    const cmd = parseCommand(c.body);
+    if (cmd) return { decision: { kind: cmd.kind, payload: cmd.payload }, strayComment: false };
+    stray = true; // komentarz człowieka bez sygnału — payload dla decyzji ze stanu albo powód podpowiedzi
   }
-  return undefined;
+  return { strayComment: stray };
+}
+
+/** Komentarze człowieka od otwarcia bramki — payload decyzji (dane, nie sterowanie). */
+async function collectPayload(src: LinearSource, id: string, sinceIso: string): Promise<string | undefined> {
+  const comments = await src.listComments(id).catch(() => []);
+  const human = comments
+    .filter((c) => c.createdAt > sinceIso && !c.body.includes(marker(id)))
+    .map((c) => c.body.trim())
+    .filter(Boolean);
+  return human.length ? human.join("\n\n") : undefined;
 }
 
 // --- Mastra HTTP API ------------------------------------------------------
