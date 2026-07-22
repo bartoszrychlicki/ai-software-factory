@@ -25,7 +25,10 @@ const pathSchema = z.string().trim().min(1).refine((value) => !value.startsWith(
 const planContractSchema = z.discriminatedUnion("verdict", [
   z.object({
     verdict: z.literal("ok"),
-    questions: z.never().optional(),
+    // Starsze prompty pokazywały pole `questions` także dla verdict=ok, więc
+    // poprawny agent potrafił zwrócić pusty string. Akceptujemy wyłącznie tę
+    // pustą wartość; każde realne pytanie przy `ok` nadal łamie kontrakt.
+    questions: z.literal("").optional(),
     screenshots: z.array(z.string().trim().min(1)).max(4).default([]),
     files: z.array(pathSchema).min(1).max(200),
     domain: domainSchema,
@@ -89,16 +92,18 @@ export const MISSING_VERDICT =
 
 /** Instrukcja doklejana do promptu roli — kontrakt wyjścia agenta. */
 export function verdictInstruction(kind: "plan" | "verify" | "review"): string {
-  const shape =
+  const shapes =
     kind === "plan"
-      ? `{"verdict":"ok"|"blocked","questions":"<pytania A/B/C gdy blocked>","screenshots":["/sciezka"],"files":["src/x.ts"],"domain":"frontend|backend|fullstack|ops"}`
-      : kind === "verify"
-        ? `{"verdict":"pass"|"fail"}`
-        : `{"verdict":"lgtm"|"fix"}`;
+      ? [
+          `Gdy plan jest gotowy: {"verdict":"ok","screenshots":["/sciezka"],"files":["src/x.ts"],"domain":"frontend|backend|fullstack|ops"}`,
+          `Gdy potrzebujesz odpowiedzi człowieka: {"verdict":"blocked","questions":"<pytania A/B/C>","screenshots":[],"files":[],"domain":"frontend|backend|fullstack|ops"}`,
+          "Przy verdict=ok pomiń pole questions.",
+        ]
+      : [kind === "verify" ? `{"verdict":"pass"|"fail"}` : `{"verdict":"lgtm"|"fix"}`];
   return [
     "ZAKOŃCZ odpowiedź blokiem kodu (dokładnie taki nagłówek) z werdyktem maszynowym:",
     "```factory",
-    shape,
+    ...shapes,
     "```",
     "Blok MUSI być ostatnim elementem odpowiedzi — po nim NIE dopisuj komentarzy, podsumowań ani uwag o agentach pomocniczych.",
     "Bez tego bloku Twoja praca zostanie odrzucona: fabryka nie zgaduje werdyktu z treści raportu.",

@@ -14,8 +14,18 @@ test("plan wymaga kompletnego, ścisłego kontraktu", () => {
   assert.equal(valid.ok, true);
   assert.deepEqual(valid.files, ["src/App.tsx"]);
 
+  const compatible = parsePlanVerdict(factory({
+    verdict: "ok",
+    questions: "",
+    screenshots: [],
+    files: ["src/counter.ts"],
+    domain: "frontend",
+  }));
+  assert.equal(compatible.ok, true);
+
   assert.equal(parsePlanVerdict(factory({ verdict: "ok", files: [], domain: "frontend", screenshots: [] })).ok, false);
   assert.equal(parsePlanVerdict(factory({ verdict: "ok", files: ["../secret"], domain: "ops", screenshots: [] })).ok, false);
+  assert.equal(parsePlanVerdict(factory({ verdict: "ok", questions: "pytanie", files: ["x"], domain: "ops", screenshots: [] })).ok, false);
   assert.equal(parsePlanVerdict(factory({ verdict: "ok", files: ["x"], domain: "ops", screenshots: [], extra: true })).ok, false);
 });
 
