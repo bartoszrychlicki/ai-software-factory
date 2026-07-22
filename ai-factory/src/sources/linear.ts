@@ -1,4 +1,5 @@
 import type { FactoryStatus, Ticket, TicketSource } from "./types";
+import { LINEAR_STATE_MAP } from "./state-map";
 
 const API = "https://api.linear.app/graphql";
 const READY_LABEL = "agent:ready";
@@ -63,16 +64,23 @@ export class LinearSource implements TicketSource {
     return data.issue;
   }
 
+  /**
+   * Tickety oddane fabryce przez człowieka = stan `ready` z mapy (Linear: "Todo").
+   * STAN, nie label — sterowanie przepływem jest deterministyczne i widoczne na tablicy.
+   * Fallback: dopóki `FACTORY_LABEL_TRIGGER=1`, stary label `agent:ready` też działa
+   * (okno migracji dla ticketów oznaczonych przed zmianą).
+   */
   async listReady(): Promise<Ticket[]> {
+    const byState = { project: { name: { eq: this.project } }, state: { name: { eq: LINEAR_STATE_MAP.ready } } };
+    const byLabel = {
+      project: { name: { eq: this.project } },
+      labels: { name: { eq: READY_LABEL } },
+      state: { type: { in: ["backlog", "unstarted"] } },
+    };
+    const filter = process.env.FACTORY_LABEL_TRIGGER === "1" ? { or: [byState, byLabel] } : byState;
     const data = await this.gql<{ issues: { nodes: LinearIssue[] } }>(
       `query($filter: IssueFilter) { issues(filter: $filter, first: 25) { nodes { ${this.issueFields} } } }`,
-      {
-        filter: {
-          project: { name: { eq: this.project } },
-          labels: { name: { eq: READY_LABEL } },
-          state: { type: { in: ["backlog", "unstarted"] } },
-        },
-      }
+      { filter }
     );
     return data.issues.nodes.map((i) => ({
       id: i.identifier,
@@ -85,7 +93,11 @@ export class LinearSource implements TicketSource {
     }));
   }
 
-  /** Zdejmuje label-trigger i przestawia na "started" — ponowny poll już ticketu nie zobaczy. */
+  /**
+   * Zabiera ticket z kolejki: zdejmuje stary label-trigger (higiena po migracji)
+   * i przestawia stan na "started", żeby kolejny poll go nie zobaczył.
+   * Fazę właściwą ustawia poller przez setPhase.
+   */
   async claim(id: string): Promise<void> {
     const issue = await this.fetchIssue(id);
     const labelIds = issue.labels.nodes.filter((l) => l.name !== READY_LABEL).map((l) => l.id);
