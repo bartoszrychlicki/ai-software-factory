@@ -279,7 +279,7 @@ const finalizePlanStep = createStep({
           ? `${MISSING_VERDICT}\n\n${inputData.plan.slice(0, 2000)}`
           : !planVerdict.files.length
             ? `Plan nie deklaruje żadnych plików w polu factory.files.\n\n${inputData.plan.slice(0, 2000)}`
-            : (planVerdict.questions ?? inputData.plan.slice(0, 2000));
+            : (planVerdict.questions ? formatClarifyQuestions(planVerdict.questions) : inputData.plan.slice(0, 2000));
       throw new Error(
         `BLOCKED: plan bez kompletnego kontraktu factory${inputData.clarifyRound > 0 ? ` po ${inputData.clarifyRound} rundach dopytywania` : ""}. ` +
           `Uzupełnij ticket i przenieś go na Todo, żeby fabryka spróbowała ponownie.\n\n${detail}`
