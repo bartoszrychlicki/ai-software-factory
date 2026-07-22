@@ -242,6 +242,126 @@ test("planStep przenosi sessionId przez suspend/resume i zapisuje metryki cold/r
   }
 });
 
+test("planStep po błędzie --resume ponawia cold z pełnym kontekstem", async () => {
+  const root = mkdtempSync(join(tmpdir(), "factory-plan-resume-fallback-"));
+  const repo = join(root, "repo");
+  const originalFactoryRoot = process.env.FACTORY_ROOT;
+  mkdirSync(repo, { recursive: true });
+  let runtime: { shutdown(): Promise<void> } | undefined;
+  let restoreEngine: (() => void) | undefined;
+
+  try {
+    writeFileSync(join(root, "package.json"), JSON.stringify({ name: "plan-resume-fallback-test" }));
+    writeFileSync(join(root, "projects.yaml"), [
+      "harness:",
+      `  repo: ${JSON.stringify(repo)}`,
+      "  checks:",
+      "    - \"true\"",
+    ].join("\n"));
+    writeFileSync(join(root, "routing.yaml"), [
+      "defaults:",
+      "  plan: fake/test-model",
+    ].join("\n"));
+    process.env.FACTORY_ROOT = root;
+
+    const [{ engines }, { ticketPipeline }, { Mastra }, { LibSQLStore }, { applyWorkflowPersistencePatch }] = await Promise.all([
+      import("../engines"),
+      import("../pipeline/ticket-pipeline"),
+      import("@mastra/core/mastra"),
+      import("@mastra/libsql"),
+      import("../mastra/workflow-persistence-patch"),
+    ]);
+    const previousEngine = engines.fake;
+    restoreEngine = () => {
+      if (previousEngine) engines.fake = previousEngine;
+      else delete engines.fake;
+    };
+    const calls: EngineRunInput[] = [];
+    engines.fake = {
+      name: "claude-code",
+      async run(input) {
+        calls.push(input);
+        if (calls.length === 1) {
+          return {
+            ok: true,
+            report: "Potrzebuję decyzji.\n\n```factory\n" + JSON.stringify({
+              verdict: "blocked",
+              questions: "1. Tryb? A) Szybki (REKOMENDACJA) B) Pełny C) Ręczny",
+              screenshots: [],
+              files: [],
+              domain: "backend",
+            }) + "\n```",
+            costUsd: 0.1,
+            sessionId: "expired-session",
+          };
+        }
+        if (calls.length === 2) {
+          return {
+            ok: false,
+            report: "Proces zakończył się błędem: sesja nie istnieje",
+            costUsd: 0.01,
+          };
+        }
+        return { ok: true, report: validPlan(), costUsd: 0.2, sessionId: "fresh-session" };
+      },
+    };
+
+    applyWorkflowPersistencePatch();
+    const mastra = new Mastra({
+      workflows: { ticketPipeline },
+      storage: new LibSQLStore({ id: "plan-fallback-storage", url: `file:${join(root, "mastra.db")}` }),
+    });
+    runtime = mastra;
+    const workflow = mastra.getWorkflow("ticketPipeline");
+    const run = await workflow.createRun({ runId: "plan-fallback-run" });
+    const first = await run.start({
+      inputData: {
+        id: "BAR-136",
+        title: "Prompt caching",
+        description: "UNIKALNY_PEŁNY_OPIS_FALLBACKU",
+        project: "harness",
+        labels: [],
+      },
+    });
+    assert.equal(first.status, "suspended");
+
+    const second = await run.resume({
+      step: ["plan-clarify-cycle", "clarify-ticket"],
+      resumeData: { answers: "1A" },
+    });
+    assert.equal(second.status, "suspended", "cold fallback ma doprowadzić workflow do approve-plan");
+    assert.equal(calls.length, 3);
+    assert.equal(calls[1].sessionId, "expired-session");
+    assert.doesNotMatch(calls[1].context, /UNIKALNY_PEŁNY_OPIS_FALLBACKU/);
+    assert.equal(calls[2].sessionId, undefined);
+    assert.match(calls[2].context, /UNIKALNY_PEŁNY_OPIS_FALLBACKU/);
+    assert.match(calls[2].context, /1A/);
+
+    const metrics = readFileSync(join(root, "runs", "metrics.jsonl"), "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { stage: string; resumed?: boolean; ok: boolean });
+    assert.deepEqual(
+      metrics.filter((row) => row.stage === "plan").map((row) => ({ resumed: row.resumed, ok: row.ok })),
+      [
+        { resumed: false, ok: true },
+        { resumed: true, ok: false },
+        { resumed: false, ok: true },
+      ]
+    );
+    const artifact = readFileSync(join(root, "runs", "BAR-136", "plan-fallback-run", "plan.md"), "utf8");
+    assert.match(artifact, /costUsd: 0\.21/);
+    assert.match(artifact, /resumed: false/);
+    assert.match(artifact, /resumeFallback: true/);
+  } finally {
+    restoreEngine?.();
+    await runtime?.shutdown();
+    if (originalFactoryRoot === undefined) delete process.env.FACTORY_ROOT;
+    else process.env.FACTORY_ROOT = originalFactoryRoot;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("report pokazuje rozbicie planu na resumed=false i resumed=true", () => {
   const root = mkdtempSync(join(tmpdir(), "factory-plan-report-"));
   try {

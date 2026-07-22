@@ -246,27 +246,44 @@ const planStep = createStep({
 
     const route = await resolveRoute("plan", ticket);
     const signature = buildSignature("plan", route);
-    const t0 = Date.now();
-    const prompt = buildPlanEnginePrompt(inputData);
-    const result = await route.engine.run({
-      role: "plan",
-      model: route.model,
-      effort: route.effort,
-      instructions: prompt.instructions,
-      context: prompt.context,
-      sessionId: prompt.sessionId,
-      workspace: ticket.repoPath,
-      // 5 min ubiło Fable@high na produkcyjnym repo (BAR-91: kill w 301 s) — mocne modele myślą dłużej
-      budget: { minutes: 20 },
-    });
+    const attemptCosts: number[] = [];
+    const runPlanner = async (candidate: ReturnType<typeof buildPlanEnginePrompt>) => {
+      const startedAt = Date.now();
+      const attempt = await route.engine.run({
+        role: "plan",
+        model: route.model,
+        effort: route.effort,
+        instructions: candidate.instructions,
+        context: candidate.context,
+        sessionId: candidate.sessionId,
+        workspace: ticket.repoPath,
+        // 5 min ubiło Fable@high na produkcyjnym repo (BAR-91: kill w 301 s) — mocne modele myślą dłużej
+        budget: { minutes: 20 },
+      });
+      if (attempt.costUsd !== undefined) attemptCosts.push(attempt.costUsd);
+      await recordMetric({
+        ticket: ticket.id, runId, stage: "plan", engine: route.spec,
+        ok: attempt.ok,
+        outcome: attempt.ok ? planOutcome(parsePlanVerdict(attempt.transcript ?? attempt.report)) : "engine-fail",
+        costUsd: attempt.costUsd, durationMs: Date.now() - startedAt,
+        resumed: candidate.resumed,
+      });
+      return attempt;
+    };
 
-    await recordMetric({
-      ticket: ticket.id, runId, stage: "plan", engine: route.spec,
-      ok: result.ok,
-      outcome: result.ok ? planOutcome(parsePlanVerdict(result.transcript ?? result.report)) : "engine-fail",
-      costUsd: result.costUsd, durationMs: Date.now() - t0,
-      resumed: prompt.resumed,
-    });
+    let prompt = buildPlanEnginePrompt(inputData);
+    let result = await runPlanner(prompt);
+    const resumeFallback = prompt.resumed && !result.ok;
+    if (resumeFallback) {
+      // Sesja CLI mogła wygasnąć podczas wielogodzinnego oczekiwania na odpowiedź autora.
+      // Pełny cold prompt pozwala dokończyć rundę bez zależności od tej sesji.
+      prompt = buildPlanEnginePrompt({ ...inputData, sessionId: undefined });
+      result = await runPlanner(prompt);
+    }
+
+    const totalCostUsd = attemptCosts.length
+      ? attemptCosts.reduce((sum, cost) => sum + cost, 0)
+      : undefined;
     await saveArtifact(
       ticket.id,
       runId,
@@ -275,10 +292,11 @@ const planStep = createStep({
         step: "plan",
         ...signatureMeta(signature),
         engine: route.spec,
-        costUsd: result.costUsd,
+        costUsd: totalCostUsd,
         ok: String(result.ok),
         round: inputData.clarifyRound,
         resumed: String(prompt.resumed),
+        resumeFallback: String(resumeFallback),
       }) + (result.transcript ?? result.report)
     );
     if (!result.ok) throw new Error(`Planner (${route.spec}) nie dostarczył planu: ${result.report}`);
@@ -287,8 +305,8 @@ const planStep = createStep({
     return {
       ...inputData,
       plan: result.transcript ?? result.report,
-      planCostUsd: (inputData.planCostUsd ?? 0) + (result.costUsd ?? 0),
-      sessionId: result.sessionId ?? inputData.sessionId,
+      planCostUsd: (inputData.planCostUsd ?? 0) + (totalCostUsd ?? 0),
+      sessionId: result.sessionId ?? (resumeFallback ? undefined : inputData.sessionId),
     };
   },
 });
