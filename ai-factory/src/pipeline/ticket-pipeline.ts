@@ -775,7 +775,62 @@ const reviewCycleSchema = publishOutputSchema.extend({
   maxReviewRounds: z.number(),
   reviewVerdict: z.enum(["pending", "lgtm", "fix", "skipped"]),
   reviewSummary: z.string(),
+  /** Pamięć pętli (BAR-125): werdykty i uwagi poprzednich rund — trafiają do promptów. */
+  reviewHistory: z.array(z.object({ round: z.number(), verdict: z.string(), notes: z.string() })),
+  /** Ta sama uwaga wróciła = pętla się kręci w kółko; kończymy zamiast palić rundy. */
+  oscillation: z.boolean(),
 });
+
+/**
+ * Uwagi review jako porównywalny zbiór (BAR-125). Normalizacja zdejmuje numery
+ * linii, wielkość liter i interpunkcję — ta sama uwaga sformułowana inaczej
+ * w kolejnej rundzie nadal ma się dopasować.
+ */
+export function noteKeys(report: string): Set<string>[] {
+  return report
+    .replace(/```factory[\s\S]*?```/g, "")
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => /^[-*\d]/.test(l) && l.length > 15)
+    .map(
+      (l) =>
+        new Set(
+          l
+            .toLowerCase()
+            .normalize("NFD")
+            .replace(/\p{M}/gu, "") // bez ogonków: „źródło" i „zrodlo" to ta sama uwaga
+            .replace(/:\d+/g, "") // numer linii się przesuwa między rundami
+            .replace(/[^\p{L}\p{N} ]+/gu, " ")
+            .split(/\s+/)
+            .filter((w) => w.length > 2)
+        )
+    )
+    .filter((s) => s.size >= 3);
+}
+
+/** Jaccard na słowach — dwie uwagi o tym samym, inaczej sformułowane, nadal się dopasowują. */
+function sameNote(a: Set<string>, b: Set<string>): boolean {
+  const inter = [...a].filter((w) => b.has(w)).length;
+  return inter / Math.min(a.size, b.size) >= 0.5;
+}
+
+/** Ile uwag z mniejszej rundy ma odpowiednik w drugiej — odporne na rundę z jedną uwagą. */
+export function noteOverlap(a: Set<string>[], b: Set<string>[]): number {
+  if (!a.length || !b.length) return 0;
+  const matched = a.filter((n) => b.some((m) => sameNote(n, m))).length;
+  return matched / Math.min(a.length, b.length);
+}
+
+const OSCILLATION_THRESHOLD = 0.6;
+
+/** Skrót poprzednich rund doklejany do promptu recenzenta i buildera. */
+function historyBlock(history: { round: number; verdict: string; notes: string }[]): string {
+  if (!history.length) return "";
+  return (
+    "\n\n# Historia poprzednich rund review (kontekst — NIE cofaj wprowadzonych na ich podstawie poprawek)\n" +
+    history.map((h) => `\n## Runda ${h.round} — werdykt: ${h.verdict}\n${h.notes.slice(0, 2500)}`).join("\n")
+  );
+}
 
 const initReviewCycleStep = createStep({
   id: "init-review-cycle",
@@ -788,6 +843,8 @@ const initReviewCycleStep = createStep({
     maxReviewRounds: 3,
     reviewVerdict: "pending" as const,
     reviewSummary: "",
+    reviewHistory: [],
+    oscillation: false,
   }),
 });
 
@@ -830,9 +887,19 @@ const prReviewStep = createStep({
           "PIERWSZA linia odpowiedzi: `REVIEW: LGTM` (kod w porządku) albo `REVIEW: FIX` (są uwagi do poprawy).",
           "Po REVIEW: FIX wypisz uwagi: zwięzłe punkty `plik:linia — uwaga`, od najważniejszej, max 8.",
           "Po REVIEW: LGTM jedno zdanie podsumowania. Zgłaszaj FIX tylko dla uwag wartych iteracji buildera.",
+          // BAR-125: bez historii runda 3 cofała poprawkę z rundy 2 i sama zgłaszała to jako uwagę (BAR-110)
+          ...(inputData.reviewHistory.length
+            ? [
+                "Poniżej masz historię poprzednich rund. Zmiany wprowadzone na ich prośbę są ZAAKCEPTOWANE:",
+                "nie zgłaszaj ich cofnięcia jako uwagi i nie powtarzaj uwag, które builder już zaadresował.",
+                "Jeśli uważasz wcześniejszą decyzję za błędną, napisz wprost `REGRESJA rundy N:` i uzasadnij, dlaczego mimo to trzeba ją odwrócić.",
+              ]
+            : []),
           verdictInstruction("review"),
         ].join("\n"),
-        context: `# Diff (git show ${sha.slice(0, 8)}, runda review ${round}/${inputData.maxReviewRounds})\n${diff.slice(0, 60_000)}`,
+        context:
+          `# Diff (git show ${sha.slice(0, 8)}, runda review ${round}/${inputData.maxReviewRounds})\n${diff.slice(0, 60_000)}` +
+          historyBlock(inputData.reviewHistory),
         workspace: workspaceDir,
         budget: { minutes: 5 },
       });
@@ -854,6 +921,13 @@ const prReviewStep = createStep({
       // z PR-a, gdy agent zgubił marker w wiadomości pośredniej)
       const fix = parseReviewVerdict(result.transcript ?? result.report).needsFix;
       const verdict = fix ? ("fix" as const) : ("lgtm" as const);
+
+      // BAR-125: uwagi powtórzone z wcześniejszej rundy = pętla nie zbiega. Dalsze rundy
+      // to spalony budżet i ryzyko cofania poprawek — kończymy i zostawiamy decyzję człowiekowi.
+      const keys = noteKeys(result.report);
+      const repeat = fix
+        ? inputData.reviewHistory.find((h) => noteOverlap(keys, noteKeys(h.notes)) >= OSCILLATION_THRESHOLD)
+        : undefined;
       await recordMetric({
         ticket: ticket.id, runId, stage: "review", engine: route.spec, round,
         ok: true, outcome: verdict, costUsd: result.costUsd, durationMs: Date.now() - t0,
@@ -872,7 +946,25 @@ const prReviewStep = createStep({
         { cwd: workspaceDir }
       ).catch(() => {}); // brak review w PR nie może wywalić pipeline'u
 
-      return { ...inputData, reviewRound: round, reviewVerdict: verdict, reviewSummary: result.report };
+      if (repeat) {
+        await recordMetric({
+          ticket: ticket.id, runId, stage: "review", engine: route.spec, round,
+          ok: true, outcome: "oscillation", durationMs: 0,
+        });
+        console.warn(`[${ticket.id}] oscylacja pętli review: uwagi z rundy ${round} powtarzają rundę ${repeat.round} — kończę pętlę`);
+      }
+
+      return {
+        ...inputData,
+        reviewRound: round,
+        reviewVerdict: verdict,
+        reviewSummary: repeat
+          ? `${result.report}\n\n---\n⚠️ Pętla review zatrzymana: uwagi z rundy ${round} powtarzają uwagi z rundy ${repeat.round} ` +
+            `(builder ich nie domyka). Dalsze rundy tylko paliłyby budżet — ocena należy do człowieka.`
+          : result.report,
+        reviewHistory: [...inputData.reviewHistory, { round, verdict, notes: result.report.slice(0, 6000) }],
+        oscillation: !!repeat,
+      };
     } catch (err) {
       // review jest doradcze — każdy błąd degraduje się do notki, nie porażki
       const msg = err instanceof Error ? err.message : String(err);
@@ -893,7 +985,7 @@ const remediateStep = createStep({
   outputSchema: reviewCycleSchema,
   execute: async ({ inputData, runId }) => {
     // poprawiamy tylko przy REVIEW: FIX i dopóki są rundy
-    if (inputData.reviewVerdict !== "fix" || inputData.reviewRound >= inputData.maxReviewRounds) {
+    if (inputData.reviewVerdict !== "fix" || inputData.reviewRound >= inputData.maxReviewRounds || inputData.oscillation) {
       return inputData;
     }
     const { ticket, workspaceDir, branch } = inputData;
@@ -924,9 +1016,14 @@ const remediateStep = createStep({
           "Jesteś builderem. Kod w bieżącym katalogu przeszedł werdykt zgodności z ticketem,",
           "ale code review zgłosiło uwagi jakościowe. Zaadresuj WYŁĄCZNIE poniższe uwagi.",
           "Nie zmieniaj zachowania funkcjonalności, nie wykraczaj poza uwagi.",
+          // BAR-125: bez tego zakazu runda 3 potrafiła cofnąć poprawkę z rundy 2 (BAR-110)
+          "NIE cofaj zmian wprowadzonych w poprzednich rundach (historia poniżej). Jeśli uwaga tego wprost wymaga,",
+          "zrób to świadomie i wyjaśnij w raporcie, którą wcześniejszą decyzję odwracasz i dlaczego.",
           "NIE commituj zmian — commit wykonuje fabryka.",
         ].join("\n"),
-        context: `# Ticket ${ticket.id}: ${ticket.title}\n\n# Uwagi z code review (runda ${round})\n\n${inputData.reviewSummary}`,
+        context:
+          `# Ticket ${ticket.id}: ${ticket.title}\n\n# Uwagi z code review (runda ${round})\n\n${inputData.reviewSummary}` +
+          historyBlock(inputData.reviewHistory.slice(0, -1)),
         workspace: workspaceDir,
         budget: { minutes: 10 },
       });
@@ -1053,7 +1150,7 @@ export const ticketPipeline = createWorkflow({
     reviewFixCycle,
     async ({ inputData }) =>
       inputData.reviewVerdict !== "pending" &&
-      (inputData.reviewVerdict !== "fix" || inputData.reviewRound >= inputData.maxReviewRounds)
+      (inputData.reviewVerdict !== "fix" || inputData.reviewRound >= inputData.maxReviewRounds || inputData.oscillation)
   )
   .then(finalizeReviewStep);
 ticketPipeline.commit();

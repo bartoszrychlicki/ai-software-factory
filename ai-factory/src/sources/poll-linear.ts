@@ -910,21 +910,51 @@ function findString(
 
 // --- media / drobnica -----------------------------------------------------
 
-/** Wszystkie screenshoty runu (screenshot.png + screenshot-N.png widoków z planu) → CDN Lineara → markdown. */
+/**
+ * Wszystkie screenshoty runu (screenshot.png + screenshot-N.png widoków z planu) → CDN Lineara → markdown.
+ *
+ * BAR-129: całość siedziała w jednym `catch {}`, więc pojedyncza czkawka uploadu
+ * kasowała podgląd BEZ ŚLADU w logu (BAR-105: zrzut leżał w artefaktach, komentarz
+ * był bez obrazka i nikt nie wiedział dlaczego). Teraz: retry, log per plik i jawna
+ * notka w komentarzu ze ścieżką lokalną, gdy upload nie wyszedł. Cisza jest zakazana.
+ */
 async function uploadScreenshot(src: LinearSource, ticketId: string, runId: string): Promise<string> {
+  const dir = join(process.cwd(), "runs", ticketId, runId);
+  let files: string[];
   try {
-    const dir = join(process.cwd(), "runs", ticketId, runId);
-    const files = readdirSync(dir).filter((f) => /^screenshot(-\d+)?\.png$/.test(f)).sort();
-    const parts: string[] = [];
-    for (const f of files) {
-      const png = readFileSync(join(dir, f));
-      const assetUrl = await src.uploadFile(`${ticketId}-${f}`, "image/png", png);
-      parts.push(`![${f} ${ticketId}](${assetUrl})`);
-    }
-    return parts.length ? `\n\n**Podgląd (oceń UI przed merge):**\n${parts.join("\n")}` : "";
-  } catch {
-    return ""; // brak screenshotów (projekt bez configu / zrzuty się nie udały) — komentarz bez podglądu
+    files = readdirSync(dir).filter((f) => /^screenshot(-\d+)?\.png$/.test(f)).sort();
+  } catch (err) {
+    console.error(`[${ticketId}] brak katalogu runu dla screenshotów (${dir}):`, err instanceof Error ? err.message : err);
+    return "";
   }
+  if (!files.length) return ""; // projekt bez configu screenshotów — nie ma o czym informować
+
+  const parts: string[] = [];
+  const failed: string[] = [];
+  for (const f of files) {
+    let lastErr: unknown;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        const assetUrl = await src.uploadFile(`${ticketId}-${f}`, "image/png", readFileSync(join(dir, f)));
+        parts.push(`![${f} ${ticketId}](${assetUrl})`);
+        lastErr = undefined;
+        break;
+      } catch (err) {
+        lastErr = err;
+        if (attempt < 3) await sleep(2000 * attempt);
+      }
+    }
+    if (lastErr) {
+      failed.push(f);
+      console.error(`[${ticketId}] upload screenshotu ${f} nieudany po 3 próbach:`, lastErr instanceof Error ? lastErr.message : lastErr);
+    }
+  }
+
+  const preview = parts.length ? `\n\n**Podgląd (oceń UI przed merge):**\n${parts.join("\n")}` : "";
+  const note = failed.length
+    ? `\n\n⚠️ Nie udało się wgrać ${failed.length} zrzutu(ów) (${failed.join(", ")}) — pliki są lokalnie w \`runs/${ticketId}/${runId}/\`.`
+    : "";
+  return preview + note;
 }
 
 /**
