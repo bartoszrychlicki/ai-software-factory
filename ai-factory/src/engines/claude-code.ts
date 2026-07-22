@@ -13,7 +13,9 @@ export const claudeCode: EngineAdapter = {
 
     // stream-json: dostajemy KAŻDĄ wiadomość agenta, nie tylko ostatnią — inaczej
     // werdykt oddany w wiadomości pośredniej przepada (BAR-108/130/150)
-    const args = ["-p", prompt, "--output-format", "stream-json", "--verbose"];
+    const args = input.sessionId
+      ? ["--resume", input.sessionId, "-p", prompt, "--output-format", "stream-json", "--verbose"]
+      : ["-p", prompt, "--output-format", "stream-json", "--verbose"];
 
     // najmniejsze uprawnienia: plan i verify nie mogą pisać
     if (input.role === "build") {
@@ -50,7 +52,8 @@ export const claudeCode: EngineAdapter = {
           }
           // JSONL: zbieramy tekst wszystkich wiadomości agenta + zdarzenie końcowe
           const texts: string[] = [];
-          let final: { is_error?: boolean; result?: string; total_cost_usd?: number } | undefined;
+          let sessionId: string | undefined;
+          let final: { is_error?: boolean; result?: string; total_cost_usd?: number; session_id?: string } | undefined;
           for (const line of stdout.split("\n")) {
             if (!line.trim()) continue;
             try {
@@ -60,8 +63,12 @@ export const claudeCode: EngineAdapter = {
                 is_error?: boolean;
                 result?: string;
                 total_cost_usd?: number;
+                subtype?: string;
+                session_id?: string;
               };
-              if (ev.type === "assistant") {
+              if (ev.type === "system" && ev.subtype === "init" && ev.session_id) {
+                sessionId = ev.session_id;
+              } else if (ev.type === "assistant") {
                 const text = (ev.message?.content ?? [])
                   .filter((c) => c.type === "text" && c.text)
                   .map((c) => c.text as string)
@@ -69,6 +76,7 @@ export const claudeCode: EngineAdapter = {
                 if (text.trim()) texts.push(text);
               } else if (ev.type === "result") {
                 final = ev;
+                if (ev.session_id) sessionId = ev.session_id;
               }
             } catch {
               /* linia nie-JSON — pomijamy */
@@ -88,6 +96,7 @@ export const claudeCode: EngineAdapter = {
             report,
             transcript: texts.join("\n\n"),
             costUsd: final?.total_cost_usd,
+            sessionId,
             raw: { events: texts.length, error: error ? String(error) : undefined },
           });
         }

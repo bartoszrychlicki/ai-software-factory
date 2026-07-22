@@ -19,6 +19,8 @@ export interface MetricRow {
   outcome: string; // znaczenie biznesowe: committed / pass / fail / lgtm / fix / check-fail / no-changes / engine-fail...
   costUsd?: number;
   durationMs?: number;
+  /** Czy wywołanie planera wznowiło sesję CLI (BAR-136). */
+  resumed?: boolean;
 }
 
 export async function recordMetric(row: Omit<MetricRow, "ts">): Promise<void> {

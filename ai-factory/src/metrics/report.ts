@@ -46,6 +46,33 @@ for (const [key, g] of [...groups.entries()].sort()) {
   );
 }
 
+// --- planner cold vs resumed (BAR-136) -----------------------------------
+const planModes = new Map<boolean, Agg>([
+  [false, { calls: 0, ok: 0, costUsd: 0, durationMs: 0, timed: 0 }],
+  [true, { calls: 0, ok: 0, costUsd: 0, durationMs: 0, timed: 0 }],
+]);
+for (const row of rows.filter((candidate) => candidate.stage === "plan" && candidate.resumed !== undefined)) {
+  const group = planModes.get(row.resumed as boolean)!;
+  group.calls++;
+  if (row.ok) group.ok++;
+  if (row.costUsd) group.costUsd += row.costUsd;
+  if (row.durationMs) { group.durationMs += row.durationMs; group.timed++; }
+}
+if ([...planModes.values()].some((group) => group.calls > 0)) {
+  console.log("\nPlan: cold vs resumed");
+  console.log("tryb             calls   ok%    koszt razem   śr. koszt   śr. czas");
+  console.log("─".repeat(70));
+  for (const resumed of [false, true]) {
+    const group = planModes.get(resumed)!;
+    console.log(
+      `resumed=${String(resumed)}`.padEnd(17) +
+      String(group.calls).padEnd(8) + pct(group.ok, group.calls).padEnd(7) +
+      fmtUsd(group.costUsd).padEnd(14) + fmtUsd(group.calls ? group.costUsd / group.calls : 0).padEnd(12) +
+      (group.timed ? fmtSec(group.durationMs / group.timed) : "—")
+    );
+  }
+}
+
 // --- wskaźniki pochodne ---------------------------------------------------
 const verifies = rows.filter((r) => r.stage === "verify" || r.stage === "verify-checks");
 const runsWithVerify = new Map<string, MetricRow[]>();
