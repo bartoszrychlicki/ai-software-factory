@@ -69,6 +69,8 @@ export interface TicketState {
    */
   files?: string[];
   prUrl?: string;
+  /** Ostatni pre-merge re-verify (BAR-124) — raz na przesunięcie maina, nie co tick. */
+  preMerge?: { mainSha: string; ok: boolean; at: string };
   mergeHandledAt?: string;
   prodSmokeAt?: string;
   finalized?: {

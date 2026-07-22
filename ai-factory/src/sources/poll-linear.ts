@@ -512,9 +512,100 @@ async function watchMerges() {
       // zamknięty PR też zwalnia pliki (BAR-141) — inaczej kolejka stoi na martwym tickecie
       registry.updateState(issue.id, { project, runId: registry.readState(issue.id)?.runId ?? "" }, (st) => { st.mergeHandledAt = new Date().toISOString(); });
       console.log(`[${issue.id}] PR CLOSED → Todo`);
+    } else if (pr.state === "OPEN") {
+      // BAR-124: PR czeka na człowieka, a main w tym czasie jedzie dalej. Weryfikacja
+      // sprzed publikacji przestaje cokolwiek znaczyć — sprawdzamy scalone drzewo ponownie.
+      preMergeGuard(project, src, issue.id, prUrl!, pr.headRefName).catch((err) =>
+        console.error(`[${issue.id}] pre-merge re-verify padł:`, err instanceof Error ? err.message : err));
     }
   }
   }
+  }
+}
+
+const preMergeRunning = new Set<string>(); // checki trwają minuty — pętla pollera nie może na nie czekać
+
+/**
+ * Pre-merge re-verify (BAR-124): otwarty PR fabryki × main, który ruszył po publikacji.
+ *
+ * Merge-queue (BAR-123) sprawdza scalone drzewo w momencie publikacji, ale PR potem
+ * czeka na człowieka — czasem godziny. W tym oknie wchodzi cudzy merge i zielony PR
+ * cicho staje się czerwony po scaleniu (BAR-106 + BAR-111: dwie gałęzie zielone osobno,
+ * po merge'u 2 testy padły). Tutaj scalamy w tymczasowym worktree i puszczamy pełne
+ * checks + e2e. Czerwono → PR wraca do draftu (nie da się zmergować przez pomyłkę)
+ * + komentarz z ogonem błędu. Raz na SHA maina, bez wywołań silników — kosztuje tylko CPU.
+ */
+async function preMergeGuard(project: string, src: LinearSource, ticketId: string, prUrl: string, headRef: string) {
+  if (preMergeRunning.has(ticketId)) return;
+  const cfg = await getProject(project).catch(() => undefined);
+  if (!cfg) return;
+  const repo = cfg.repo;
+  const def = cfg.default_branch ?? "main";
+
+  await exec("git", ["-C", repo, "fetch", "origin", def, headRef], { timeout: 120_000 }).catch(() => {});
+  const sha = async (ref: string) =>
+    (await exec("git", ["-C", repo, "rev-parse", ref]).catch(() => ({ stdout: "" }))).stdout.trim();
+  const mainSha = await sha(`origin/${def}`);
+  const headSha = await sha(`origin/${headRef}`);
+  if (!mainSha || !headSha) return;
+
+  const st = registry.readState(ticketId);
+  if (st?.preMerge?.mainSha === mainSha) return; // ten main już sprawdzony
+  const { stdout: behind } = await exec("git", ["-C", repo, "rev-list", "--count", `${headSha}..${mainSha}`]).catch(() => ({ stdout: "0" }));
+  if (Number(behind.trim()) === 0) return; // PR aktualny — nie ma czego scalać
+
+  preMergeRunning.add(ticketId);
+  const dir = join(WORKTREES_ROOT, basename(repo), `premerge-${ticketId}`);
+  const seed = { project, runId: st?.runId ?? "" };
+  const fail = async (body: string) => {
+    await exec("gh", ["pr", "ready", prUrl, "--undo"], { timeout: 30_000 }).catch(() => {});
+    await src.comment(ticketId, `${body} ${marker(ticketId)}`).catch(() => {});
+    notify(`⚠️ ${ticketId}: PR nie przechodzi po scaleniu z ${def}`, "PR wrócił do draftu — wymaga poprawki.").catch(() => {});
+    registry.updateState(ticketId, seed, (s) => { s.preMerge = { mainSha, ok: false, at: new Date().toISOString() }; });
+  };
+
+  try {
+    await exec("git", ["-C", repo, "worktree", "prune"]).catch(() => {});
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+    await exec("git", ["-C", repo, "worktree", "add", "--detach", dir, headSha], { timeout: 120_000 });
+
+    try {
+      await exec("git", ["-C", dir, "merge", mainSha, "--no-edit"], { timeout: 120_000 });
+    } catch {
+      const { stdout: conflicted } = await exec("git", ["-C", dir, "diff", "--diff-filter=U", "--name-only"]).catch(() => ({ stdout: "" }));
+      await fail(
+        `⚠️ **Pre-merge check: konflikt z \`${def}\`** — main ruszył (${behind.trim()} commit(ów)) po opublikowaniu PR-a.\n\n` +
+          `Pliki w konflikcie: ${conflicted.trim().split("\n").filter(Boolean).join(", ") || "?"}.\n` +
+          `PR wrócił do draftu. Przenieś ticket na *Todo*, żeby fabryka zbudowała go ponownie na świeżym mainie (plan jest zatwierdzony — replanowania nie będzie).`
+      );
+      return;
+    }
+
+    const cleanEnv = Object.fromEntries(
+      Object.entries(process.env).filter(([k]) => !k.startsWith("npm_") && k !== "NODE_ENV")
+    ) as NodeJS.ProcessEnv;
+    for (const cmd of [...(cfg.checks ?? []), ...(cfg.qa?.e2e ? [cfg.qa.e2e] : [])]) {
+      try {
+        await exec("bash", ["-c", cmd], { cwd: dir, env: cleanEnv, timeout: 20 * 60_000, maxBuffer: 50 * 1024 * 1024 });
+      } catch (err) {
+        const e = err as Error & { stdout?: string; stderr?: string };
+        const tail = [e.stdout, e.stderr].filter(Boolean).join("\n").slice(-2500);
+        console.error(`[${ticketId}] pre-merge FAIL na "${cmd}" po scaleniu z ${def}`);
+        await fail(
+          `⚠️ **Pre-merge check: konflikt semantyczny** — po scaleniu z \`${def}\` (${behind.trim()} nowych commitów) check \`${cmd}\` nie przechodzi.\n\n` +
+            `Osobno gałąź jest zielona; czerwone jest dopiero połączenie. PR wrócił do draftu — nie merguj.\n` +
+            `Przenieś ticket na *Todo*, żeby fabryka poprawiła go na świeżym mainie.\n\n\`\`\`\n${tail}\n\`\`\``
+        );
+        return;
+      }
+    }
+
+    registry.updateState(ticketId, seed, (s) => { s.preMerge = { mainSha, ok: true, at: new Date().toISOString() }; });
+    console.log(`[${ticketId}] pre-merge OK po scaleniu z ${def} (${behind.trim()} nowych commitów)`);
+  } finally {
+    preMergeRunning.delete(ticketId);
+    await exec("git", ["-C", repo, "worktree", "remove", "--force", dir]).catch(() => {});
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
   }
 }
 
