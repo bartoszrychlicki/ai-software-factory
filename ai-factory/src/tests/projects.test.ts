@@ -47,3 +47,19 @@ test("poprawna konfiguracja normalizuje checks i wymagane GitHub checks", async 
     assert.deepEqual(project.ci?.requiredChecks, ["quality"]);
   });
 });
+
+test("br-factory jest bezpiecznie zarejestrowany jako projekt self-hosted", async () => {
+  const project = await getProject("br-factory");
+  assert.equal(project.repo, "/Users/senioraiconsultant/Development/Edu/ai-sdlc");
+  assert.equal(project.github, "bartoszrychlicki/ai-software-factory");
+  assert.equal(project.default_branch, "main");
+  assert.equal(project.statuses, "extended");
+  assert.equal(project.max_concurrent_tickets, 1);
+  assert.deepEqual(project.ci?.requiredChecks, ["quality"]);
+  assert.deepEqual(project.checks, [
+    "npm --prefix ai-factory ci",
+    "npm --prefix ai-factory run check",
+    "npm --prefix ai-factory test",
+    "npm --prefix ai-factory run build",
+  ]);
+});

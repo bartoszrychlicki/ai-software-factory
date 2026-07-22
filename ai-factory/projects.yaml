@@ -46,3 +46,23 @@ br-budget:
       - name: strona resetu hasła istnieje
         url: https://budget.bartoszrychlicki.com/reset-password
         headerIncludes: x-vercel-id
+
+# Fabryka rozwija samą siebie. Repo wskazuje root Git, nie podkatalog ai-factory,
+# dzięki czemu worktree obejmuje także workflow CI i dokumentację projektu.
+br-factory:
+  statuses: extended
+  max_concurrent_tickets: 1
+  repo: /Users/senioraiconsultant/Development/Edu/ai-sdlc
+  github: bartoszrychlicki/ai-software-factory
+  default_branch: main
+  checks:
+    - npm --prefix ai-factory ci
+    - npm --prefix ai-factory run check
+    - npm --prefix ai-factory test
+    - npm --prefix ai-factory run build
+  ci:
+    requiredChecks:
+      - quality
+    timeoutMinutes: 20
+  # Brak screenshot/prodChecks: lokalne Studio jest współdzieloną usługą na 4111,
+  # więc uruchamianie drugiego egzemplarza z worktree kolidowałoby z produkcyjnym pollerem.
