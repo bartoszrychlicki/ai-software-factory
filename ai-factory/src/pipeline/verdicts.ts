@@ -71,7 +71,7 @@ export function verdictInstruction(kind: "plan" | "verify" | "review"): string {
     "```factory",
     shape,
     "```",
-    "Blok MUSI być w OSTATNIEJ wiadomości i jako jej ostatni element — fabryka czyta tylko ją.",
+    "Blok MUSI być ostatnim elementem odpowiedzi — po nim NIE dopisuj komentarzy, podsumowań ani uwag o agentach pomocniczych.",
   ].join("\n");
 }
 

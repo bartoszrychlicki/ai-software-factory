@@ -172,7 +172,7 @@ const planStep = createStep({
     await recordMetric({
       ticket: ticket.id, runId, stage: "plan", engine: route.spec,
       ok: result.ok,
-      outcome: result.ok ? (parsePlanVerdict(result.report).ok ? "ok" : "blocked") : "engine-fail",
+      outcome: result.ok ? (parsePlanVerdict(result.transcript ?? result.report).ok ? "ok" : "blocked") : "engine-fail",
       costUsd: result.costUsd, durationMs: Date.now() - t0,
     });
     await saveArtifact(
@@ -183,7 +183,8 @@ const planStep = createStep({
     );
     if (!result.ok) throw new Error(`Planner (${route.spec}) nie dostarczył planu: ${result.report}`);
 
-    return { ...inputData, plan: result.report, planCostUsd: (inputData.planCostUsd ?? 0) + (result.costUsd ?? 0) };
+    // do dalszych kroków idzie PEŁNY transkrypt: werdykt/pytania mogą siedzieć w wiadomości pośredniej
+    return { ...inputData, plan: result.transcript ?? result.report, planCostUsd: (inputData.planCostUsd ?? 0) + (result.costUsd ?? 0) };
   },
 });
 
@@ -565,7 +566,7 @@ const verifyStep = createStep({
         };
       }
 
-      const pass = parseVerifyVerdict(result.report).pass;
+      const pass = parseVerifyVerdict(result.transcript ?? result.report).pass;
       await recordMetric({
         ticket: ticket.id, runId, stage: "verify", engine: route.spec, attempt: inputData.attempt,
         ok: true, outcome: pass ? "pass" : "fail", costUsd: result.costUsd, durationMs: Date.now() - t0,
@@ -832,7 +833,7 @@ const prReviewStep = createStep({
 
       // FAIL-CLOSED: brak jednoznacznego LGTM = są uwagi (dotąd fail-open zdejmował draft
       // z PR-a, gdy agent zgubił marker w wiadomości pośredniej)
-      const fix = parseReviewVerdict(result.report).needsFix;
+      const fix = parseReviewVerdict(result.transcript ?? result.report).needsFix;
       const verdict = fix ? ("fix" as const) : ("lgtm" as const);
       await recordMetric({
         ticket: ticket.id, runId, stage: "review", engine: route.spec, round,

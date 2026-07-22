@@ -12,7 +12,13 @@ export interface EngineRunInput {
 
 export interface EngineRunResult {
   ok: boolean;
-  report: string;         // plan / raport buildu / werdykt verify
+  report: string;         // plan / raport buildu / werdykt verify (ostatnia wiadomość — dla człowieka)
+  /**
+   * PEŁNY tekst wszystkich wiadomości agenta. Werdykty parsujemy STĄD, bo agent
+   * potrafi oddać werdykt we wcześniejszej wiadomości i dokleić meta-komentarz
+   * na końcu (BAR-108, BAR-130, BAR-150) — wtedy `report` go nie zawiera.
+   */
+  transcript?: string;
   costUsd?: number;
   raw?: unknown;
 }

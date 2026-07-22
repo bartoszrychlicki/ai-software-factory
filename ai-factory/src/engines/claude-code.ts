@@ -10,7 +10,9 @@ export const claudeCode: EngineAdapter = {
     // handoff: rola dostaje instrukcje + kontekst poprzednika, nie cały transcript
     const prompt = `${input.instructions}\n\n${input.context}`;
 
-    const args = ["-p", prompt, "--output-format", "json"];
+    // stream-json: dostajemy KAŻDĄ wiadomość agenta, nie tylko ostatnią — inaczej
+    // werdykt oddany w wiadomości pośredniej przepada (BAR-108/130/150)
+    const args = ["-p", prompt, "--output-format", "stream-json", "--verbose"];
 
     // najmniejsze uprawnienia: plan i verify nie mogą pisać
     if (input.role === "build") {
@@ -44,21 +46,44 @@ export const claudeCode: EngineAdapter = {
             });
             return;
           }
-          try {
-            const out = JSON.parse(stdout);
-            resolve({
-              ok: !out.is_error,
-              report: out.result ?? "",
-              costUsd: out.total_cost_usd,
-              raw: out,
-            });
-          } catch {
-            resolve({
-              ok: false,
-              report: `Nieparsowalny output:\n${stdout.slice(0, 2000)}`,
-              raw: { stdout, stderr },
-            });
+          // JSONL: zbieramy tekst wszystkich wiadomości agenta + zdarzenie końcowe
+          const texts: string[] = [];
+          let final: { is_error?: boolean; result?: string; total_cost_usd?: number } | undefined;
+          for (const line of stdout.split("\n")) {
+            if (!line.trim()) continue;
+            try {
+              const ev = JSON.parse(line) as {
+                type?: string;
+                message?: { content?: { type?: string; text?: string }[] };
+                is_error?: boolean;
+                result?: string;
+                total_cost_usd?: number;
+              };
+              if (ev.type === "assistant") {
+                const text = (ev.message?.content ?? [])
+                  .filter((c) => c.type === "text" && c.text)
+                  .map((c) => c.text as string)
+                  .join("\n");
+                if (text.trim()) texts.push(text);
+              } else if (ev.type === "result") {
+                final = ev;
+              }
+            } catch {
+              /* linia nie-JSON — pomijamy */
+            }
           }
+          const report = final?.result ?? texts.at(-1) ?? "";
+          if (!report && !texts.length) {
+            resolve({ ok: false, report: `Brak treści od agenta:\n${stdout.slice(0, 2000)}`, raw: { stderr } });
+            return;
+          }
+          resolve({
+            ok: !final?.is_error,
+            report,
+            transcript: texts.join("\n\n"),
+            costUsd: final?.total_cost_usd,
+            raw: { events: texts.length },
+          });
         }
       );
     });
