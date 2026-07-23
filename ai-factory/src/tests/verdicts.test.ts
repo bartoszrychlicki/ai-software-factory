@@ -29,7 +29,18 @@ test("plan wymaga kompletnego, ścisłego kontraktu", () => {
   }));
   assert.equal(compatible.ok, true);
 
+  const opsWithoutFiles = parsePlanVerdict(factory({
+    verdict: "ok",
+    screenshots: [],
+    files: [],
+    domain: "ops",
+  }));
+  assert.equal(opsWithoutFiles.ok, true);
+  assert.equal(opsWithoutFiles.files.length, 0);
+
   assert.equal(parsePlanVerdict(factory({ verdict: "ok", files: [], domain: "frontend", screenshots: [] })).ok, false);
+  assert.equal(parsePlanVerdict(factory({ verdict: "ok", files: [], domain: "backend", screenshots: [] })).ok, false);
+  assert.equal(parsePlanVerdict(factory({ verdict: "ok", files: [], domain: "fullstack", screenshots: [] })).ok, false);
   assert.equal(parsePlanVerdict(factory({ verdict: "ok", files: ["../secret"], domain: "ops", screenshots: [] })).ok, false);
   assert.equal(parsePlanVerdict(factory({ verdict: "ok", questions: "pytanie", files: ["x"], domain: "ops", screenshots: [] })).ok, false);
   assert.equal(parsePlanVerdict(factory({ verdict: "ok", files: ["x"], domain: "ops", screenshots: [], extra: true })).ok, false);

@@ -31,7 +31,7 @@ const planContractSchema = z.discriminatedUnion("verdict", [
     // pustą wartość; każde realne pytanie przy `ok` nadal łamie kontrakt.
     questions: z.literal("").optional(),
     screenshots: z.array(z.string().trim().min(1)).max(4).default([]),
-    files: z.array(pathSchema).min(1).max(200),
+    files: z.array(pathSchema).max(200),
     domain: domainSchema,
   }).strict(),
   z.object({
@@ -41,7 +41,15 @@ const planContractSchema = z.discriminatedUnion("verdict", [
     files: z.array(pathSchema).max(200).default([]),
     domain: domainSchema.optional(),
   }).strict(),
-]);
+]).superRefine((value, ctx) => {
+  if (value.verdict === "ok" && value.domain !== "ops" && value.files.length < 1) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["files"],
+      message: "files wymaga co najmniej jednego wpisu poza domeną ops",
+    });
+  }
+});
 
 const verifyContractSchema = z.object({ verdict: z.enum(["pass", "fail"]) }).strict();
 const reviewContractSchema = z.object({ verdict: z.enum(["lgtm", "fix"]) }).strict();
