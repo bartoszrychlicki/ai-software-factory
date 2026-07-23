@@ -120,6 +120,7 @@ const PLAN_INSTRUCTIONS = [
   "Jeśli masz już odpowiedzi autora (sekcja poniżej ticketu) — potraktuj je jako wiążące decyzje i NIE zadawaj tych samych pytań ponownie.",
   "Jeśli stan opisany w tickecie JUŻ ISTNIEJE w kodzie (ticket spełniony): verdict \"blocked\" i wyjaśnienie w raporcie, BEZ pytań — nie planuj pustej pracy.",
   `W bloku factory wypełnij "files" KOMPLETNĄ listą plików, które ticket zmieni (ścieżki względem repo) — fabryka serializuje na ich podstawie równoległe tickety, więc pominięty plik grozi konfliktem merge'a.`,
+  `Ticket klasy ops/infra bez zmian w repo może zwrócić pustą listę "files" — checklista jest wynikiem, nie lista plików kodu.`,
   `Oraz "domain": frontend | backend | fullstack | ops — na podstawie zakresu zmian; od tego zależy dobór silnika buildu.`,
   "Jeśli ticket jest klasy ops/infra: checklista opisuje bezpieczne kroki, lokalizacje i oczekiwany stan końcowy — NIGDY nie wpisuj wartości sekretów (haseł, tokenów ani kluczy).",
   verdictInstruction("plan"),
@@ -354,12 +355,14 @@ const finalizePlanStep = createStep({
   outputSchema: planOutputSchema,
   execute: async ({ inputData }) => {
     const planVerdict = parsePlanVerdict(inputData.plan);
-    if (!planVerdict.ok || !planVerdict.files.length) {
+    const effectiveDomain = resolveDomain(inputData.ticket.labels, inputData.plan);
+    const filesRequired = effectiveDomain !== "ops";
+    if (!planVerdict.ok || (filesRequired && !planVerdict.files.length)) {
       const detail =
         planVerdict.source === "missing"
           ? `${MISSING_VERDICT}\n\n${inputData.plan.slice(0, 2000)}`
-          : !planVerdict.files.length
-            ? `Plan nie deklaruje żadnych plików w polu factory.files.\n\n${inputData.plan.slice(0, 2000)}`
+          : filesRequired && !planVerdict.files.length
+            ? `Plan nie deklaruje żadnych plików w polu factory.files (wymagane poza domeną ops).\n\n${inputData.plan.slice(0, 2000)}`
             : (planVerdict.questions ? formatClarifyQuestions(planVerdict.questions) : inputData.plan.slice(0, 2000));
       throw new Error(
         `BLOCKED: plan bez kompletnego kontraktu factory${inputData.clarifyRound > 0 ? ` po ${inputData.clarifyRound} rundach dopytywania` : ""}. ` +

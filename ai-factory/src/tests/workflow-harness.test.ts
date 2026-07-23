@@ -8,6 +8,112 @@ import { join } from "node:path";
 const git = (cwd: string, ...args: string[]) =>
   execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8" });
 
+async function runDomainOverrideHarness(input: {
+  ticketId: string;
+  declaredDomain: "frontend" | "ops";
+  files: string[];
+  labels: string[];
+  approvePlan?: boolean;
+}) {
+  const root = mkdtempSync(join(tmpdir(), "factory-workflow-domain-override-"));
+  const fakeBin = join(root, "bin");
+  const ghCalls = join(root, "gh-calls.log");
+  const previousFactoryRoot = process.env.FACTORY_ROOT;
+  const previousWorktrees = process.env.FACTORY_WORKTREES;
+  const previousPath = process.env.PATH;
+  mkdirSync(fakeBin, { recursive: true });
+
+  try {
+    const gh = join(fakeBin, "gh");
+    writeFileSync(gh, [
+      "#!/bin/sh",
+      `printf '%s\\n' "$*" >> ${JSON.stringify(ghCalls)}`,
+      "exit 99",
+    ].join("\n"));
+    chmodSync(gh, 0o755);
+
+    writeFileSync(join(root, "package.json"), JSON.stringify({ name: "factory-domain-override-harness" }));
+    writeFileSync(join(root, "projects.yaml"), [
+      "domain-override-harness:",
+      `  repo: ${JSON.stringify(root)}`,
+      "  checks:",
+      "    - \"true\"",
+    ].join("\n"));
+    writeFileSync(join(root, "routing.yaml"), [
+      "defaults:",
+      "  plan: fake",
+      "  build: fake",
+      "  verify: fake",
+      "  review: fake",
+    ].join("\n"));
+
+    process.env.FACTORY_ROOT = root;
+    process.env.FACTORY_WORKTREES = join(root, "worktrees");
+    process.env.PATH = `${fakeBin}:${previousPath ?? ""}`;
+
+    const [{ engines }, { ticketPipeline }, { Mastra }, { LibSQLStore }, { applyWorkflowPersistencePatch }] = await Promise.all([
+      import("../engines"),
+      import("../pipeline/ticket-pipeline"),
+      import("@mastra/core/mastra"),
+      import("@mastra/libsql"),
+      import("../mastra/workflow-persistence-patch"),
+    ]);
+    const calls = { plan: 0, build: 0, verify: 0, review: 0 };
+    engines.fake = {
+      name: "fake",
+      async run(engineInput) {
+        calls[engineInput.role] += 1;
+        if (engineInput.role !== "plan") {
+          throw new Error(`Nieoczekiwana rola ${engineInput.role} dla testu domain override`);
+        }
+        return {
+          ok: true,
+          report: "Plan testu domain override.\n\n```factory\n" + JSON.stringify({
+            verdict: "ok",
+            screenshots: [],
+            files: input.files,
+            domain: input.declaredDomain,
+          }) + "\n```",
+        };
+      },
+    };
+
+    applyWorkflowPersistencePatch();
+    const runtime = new Mastra({
+      workflows: { ticketPipeline },
+      storage: new LibSQLStore({ id: `${input.ticketId}-storage`, url: `file:${join(root, "harness.db")}` }),
+    });
+    const run = await runtime.getWorkflow("ticketPipeline").createRun({ runId: `${input.ticketId}-run` });
+    const planGate = await run.start({
+      inputData: {
+        id: input.ticketId,
+        title: "Domain override",
+        description: "Sprawdź efektywną domenę planu.",
+        project: "domain-override-harness",
+        labels: input.labels,
+      },
+    });
+    const checklistGate = input.approvePlan && planGate.status === "suspended"
+      ? await run.resume({ step: "approve-plan", resumeData: { approved: true } })
+      : undefined;
+
+    return {
+      planGate,
+      checklistGate,
+      calls,
+      ghCalled: existsSync(ghCalls),
+    };
+  } finally {
+    if (previousFactoryRoot === undefined) delete process.env.FACTORY_ROOT;
+    else process.env.FACTORY_ROOT = previousFactoryRoot;
+    if (previousWorktrees === undefined) delete process.env.FACTORY_WORKTREES;
+    else process.env.FACTORY_WORKTREES = previousWorktrees;
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
 test("deterministyczny harness prowadzi ticket przez plan, human gate, build, verify, publish i review", async () => {
   const root = mkdtempSync(join(tmpdir(), "factory-workflow-"));
   const bare = join(root, "origin.git");
@@ -196,7 +302,7 @@ test("domain=ops omija build, verify, publish, CI i review oraz kończy jawnym w
         return {
           ok: true,
           report: "Checklista: ustaw rekord DNS w panelu i sprawdź oczekiwany stan.\n\n```factory\n" + JSON.stringify({
-            verdict: "ok", screenshots: [], files: ["ops-checklist.md"], domain: "ops",
+            verdict: "ok", screenshots: [], files: [], domain: "ops",
           }) + "\n```",
         };
       },
@@ -241,4 +347,33 @@ test("domain=ops omija build, verify, publish, CI i review oraz kończy jawnym w
     else process.env.PATH = previousPath;
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("label domain:frontend wymaga plików mimo deklaracji domain=ops", async () => {
+  const result = await runDomainOverrideHarness({
+    ticketId: "OVERRIDE-FRONTEND",
+    declaredDomain: "ops",
+    files: [],
+    labels: ["domain:frontend"],
+  });
+
+  assert.equal(result.planGate.status, "failed");
+  assert.match(JSON.stringify(result.planGate), /factory\.files \(wymagane poza domeną ops\)/);
+  assert.deepEqual(result.calls, { plan: 1, build: 0, verify: 0, review: 0 });
+  assert.equal(result.ghCalled, false);
+});
+
+test("label domain:ops kieruje plan deklarowany jako frontend do bramki checklisty", async () => {
+  const result = await runDomainOverrideHarness({
+    ticketId: "OVERRIDE-OPS",
+    declaredDomain: "frontend",
+    files: ["src/x.ts"],
+    labels: ["domain:ops"],
+    approvePlan: true,
+  });
+
+  assert.equal(result.planGate.status, "suspended");
+  assert.equal(result.checklistGate?.status, "suspended");
+  assert.deepEqual(result.calls, { plan: 1, build: 0, verify: 0, review: 0 });
+  assert.equal(result.ghCalled, false);
 });
