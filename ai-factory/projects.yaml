@@ -12,6 +12,8 @@ pilot-app:
     requiredChecks:
       - quality
     timeoutMinutes: 20
+  verify:
+    budgetMinutes: 15   # BAR-170: pi/qwen lokalny model ubijany po 5 min na dużym diffie (BAR-165)
   screenshot:
     start: npx vite preview --port 4173 --strictPort
     url: http://localhost:4173/

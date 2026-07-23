@@ -7,7 +7,7 @@ import { writeFile, readFile, mkdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createWorkspace, createCheckout, removeCheckout } from "./workspace";
-import { getProject } from "./projects";
+import { getProject, verifyBudgetMinutes } from "./projects";
 import { resolveRoute } from "./routing";
 import { saveArtifact, artifactHeader } from "./artifacts";
 import { buildSignature, signatureLine, signatureMeta, signatureTrailer } from "./signature";
@@ -729,7 +729,7 @@ const verifyStep = createStep({
           checksSummary,
         ].join("\n"),
         workspace: co.dir,
-        budget: { minutes: 5 },
+        budget: { minutes: verifyBudgetMinutes(project) },
       });
 
       if (!result.ok) {
@@ -844,7 +844,7 @@ async function reverifyExactSha(
         checksSummary,
       ].join("\n"),
       workspace: co.dir,
-      budget: { minutes: 5 },
+      budget: { minutes: verifyBudgetMinutes(project) },
     });
     const verdict = result.ok ? parseVerifyVerdict(result.transcript ?? result.report) : undefined;
     const pass = !!result.ok && !!verdict?.pass;
