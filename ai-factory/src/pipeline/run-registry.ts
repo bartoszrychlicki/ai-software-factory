@@ -21,14 +21,15 @@ export type FactoryPhase =
   | "planning"
   | "questions"
   | "plan-approval"
+  | "ops-checklist"
   | "build"
   | "verify"
   | "review"
   | "pr-ready"
   | "blocked";
 
-export type Gate = "claim" | "plan-approval" | "clarify";
-export type DecisionKind = "start" | "approve" | "reject" | "answer";
+export type Gate = "claim" | "plan-approval" | "clarify" | "ops-checklist";
+export type DecisionKind = "start" | "approve" | "reject" | "answer" | "done";
 export type OutboxCommandKind = "start" | "resume";
 
 export interface OutboxCommand {
@@ -83,6 +84,8 @@ export interface TicketState {
   outbox: Record<string, OutboxCommand>;
   /** Parametry zlecenia z labeli — czytane RAZ przy claimie, potem niezmienne. */
   manifest?: { labels: string[]; engine?: string; domain?: string; planMode?: string; url?: string };
+  /** Efektywna domena (label override > plan), utrwalona RAZ przez poller. */
+  resolvedDomain?: string;
   autoRetry: { count: number; lastAt?: string };
   /**
    * Pliki zadeklarowane przez plannera (BAR-141). Ticket „trzyma" je od aprobaty
@@ -186,6 +189,7 @@ export function updateState(
       state.prUrl = undefined;
       state.mergeHandledAt = undefined;
       state.files = undefined;
+      state.resolvedDomain = undefined;
       state.preMerge = undefined;
       state.prodSmokeAt = undefined;
       state.createdAt = now;
@@ -390,6 +394,18 @@ export const normalizePath = (p: string): string => p.trim().replace(/^\.?\//, "
 export function recordFiles(ticketId: string, seed: { project: string; runId: string }, files: string[]): void {
   const clean = [...new Set(files.map(normalizePath).filter(Boolean))].slice(0, 200);
   if (clean.length) updateState(ticketId, seed, (s) => void (s.files = clean));
+}
+
+/** Utrwala efektywną domenę tylko przy pierwszym poprawnym rozstrzygnięciu w danym runie. */
+export function recordResolvedDomain(
+  ticketId: string,
+  seed: { project: string; runId: string },
+  domain: string | undefined
+): void {
+  if (!domain) return;
+  updateState(ticketId, seed, (s) => {
+    if (!s.resolvedDomain) s.resolvedDomain = domain;
+  });
 }
 
 /**

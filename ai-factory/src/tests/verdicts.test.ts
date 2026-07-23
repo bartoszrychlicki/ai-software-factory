@@ -5,6 +5,7 @@ import {
   parsePlanVerdict,
   parseReviewVerdict,
   parseVerifyVerdict,
+  resolveDomain,
 } from "../pipeline/verdicts";
 
 const factory = (value: unknown) => `raport\n\n\`\`\`factory\n${JSON.stringify(value)}\n\`\`\``;
@@ -38,6 +39,20 @@ test("brak lub nieznany werdykt zawsze zamyka bramkę fail-closed", () => {
   assert.equal(parseVerifyVerdict("wygląda dobrze").pass, false);
   assert.equal(parseReviewVerdict(factory({ verdict: "unknown" })).needsFix, true);
   assert.equal(parseReviewVerdict(factory({ verdict: "lgtm" })).needsFix, false);
+});
+
+test("resolveDomain stosuje label override, deklarację planu i ignoruje nieznane wartości", () => {
+  const backendPlan = factory({
+    verdict: "ok",
+    screenshots: [],
+    files: ["src/api.ts"],
+    domain: "backend",
+  });
+
+  assert.equal(resolveDomain(["domain:ops"], backendPlan), "ops");
+  assert.equal(resolveDomain([], backendPlan), "backend");
+  assert.equal(resolveDomain(["domain:unknown"], backendPlan), "backend");
+  assert.equal(resolveDomain(["domain:unknown"]), undefined);
 });
 
 test("formatClarifyQuestions formatuje pytania zlepione w jednej linii", () => {

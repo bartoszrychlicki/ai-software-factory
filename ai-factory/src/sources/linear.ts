@@ -168,6 +168,21 @@ export class LinearSource implements TicketSource {
     return issue.state.name;
   }
 
+  /** Nazwy stanów teamu obsługującego projekt — health-check mapy procesu przy starcie pollera. */
+  async listStateNames(): Promise<string[]> {
+    const data = await this.gql<{
+      issues: { nodes: { team: { states: { nodes: { name: string }[] } } }[] };
+    }>(
+      `query($filter: IssueFilter) { issues(filter: $filter, first: 1) {
+        nodes { team { states { nodes { name } } } }
+      } }`,
+      { filter: { project: { name: { eq: this.project } } } }
+    );
+    const states = data.issues.nodes[0]?.team.states.nodes;
+    if (!states) throw new Error(`Projekt "${this.project}" nie ma issue, z którego można odczytać stany teamu`);
+    return states.map((state) => state.name);
+  }
+
   /** Ile ticketów projektu jest w toku (stany typu started: In Progress/In Review + stany procesu). */
   async countActive(): Promise<number> {
     const data = await this.gql<{ issues: { nodes: { id: string }[] } }>(

@@ -18,6 +18,7 @@ import { z } from "zod";
 export type VerdictSource = "structured" | "missing";
 
 const domainSchema = z.enum(["frontend", "backend", "fullstack", "ops"]);
+const KNOWN_DOMAINS = new Set(domainSchema.options);
 const pathSchema = z.string().trim().min(1).refine((value) => !value.startsWith("/") && !value.includes(".."), {
   message: "ścieżka musi być względna wobec repo i nie może zawierać '..'",
 });
@@ -57,6 +58,23 @@ export interface PlanVerdict {
   /** Pliki, które ticket zmieni — serializacja kolizji (BAR-141). */
   files: string[];
   source: VerdictSource;
+}
+
+/**
+ * Jedno źródło prawdy dla efektywnej domeny ticketu.
+ * Ręczny label ma pierwszeństwo, ale nieznana wartość jest ignorowana i pozwala
+ * użyć poprawnej deklaracji plannera z kontraktu `factory`.
+ */
+export function resolveDomain(labels?: string[], plan?: string): string | undefined {
+  const fromLabel = labels
+    ?.find((label) => label.startsWith("domain:"))
+    ?.slice("domain:".length)
+    .trim()
+    .toLowerCase();
+  if (fromLabel && KNOWN_DOMAINS.has(fromLabel as z.infer<typeof domainSchema>)) return fromLabel;
+
+  const declared = plan ? parsePlanVerdict(plan).domain?.trim().toLowerCase() : undefined;
+  return declared && KNOWN_DOMAINS.has(declared as z.infer<typeof domainSchema>) ? declared : undefined;
 }
 
 export interface VerifyVerdict {

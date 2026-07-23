@@ -99,3 +99,28 @@ test("manifest zachowuje kanoniczny URL ticketu po ponownym odczycie stanu", () 
     delete process.env.FACTORY_RUNS_ROOT;
   }
 });
+
+test("efektywna domena jest utrwalana raz, a bramka ops zapisuje decyzję done", () => {
+  const root = mkdtempSync(join(tmpdir(), "factory-ops-state-"));
+  process.env.FACTORY_RUNS_ROOT = root;
+  try {
+    const seed = { project: "br-budget", runId: "ops-run" };
+    registry.recordResolvedDomain("BAR-134", seed, "ops");
+    registry.recordResolvedDomain("BAR-134", seed, "frontend");
+    registry.recordPhase("BAR-134", seed, "ops-checklist", "👤 🔧 Wykonaj checklistę");
+    registry.openGateRecord("BAR-134", seed, "ops-checklist", 0, "👤 🔧 Wykonaj checklistę");
+    registry.recordDecision("BAR-134", seed, "ops-checklist", 0, {
+      kind: "done",
+      via: "command",
+      observedAt: new Date().toISOString(),
+    });
+
+    const state = registry.readState("BAR-134");
+    assert.equal(state?.resolvedDomain, "ops");
+    assert.equal(state?.phase, "ops-checklist");
+    assert.equal(state?.gates[registry.gateId("ops-checklist", 0)]?.decision?.kind, "done");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    delete process.env.FACTORY_RUNS_ROOT;
+  }
+});

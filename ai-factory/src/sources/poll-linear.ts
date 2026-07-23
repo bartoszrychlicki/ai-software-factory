@@ -34,10 +34,16 @@ import { getProject } from "../pipeline/projects";
 import { breakerOpen, recordRunOutcome, checkHourlySpend } from "../pipeline/breaker";
 import { notify } from "../pipeline/notify";
 import { runProdChecks } from "../pipeline/prod-smoke";
+import {
+  classifyOpsVerification,
+  isOpsWorkflowResult,
+  opsTrackerStatus,
+  runProdChecksWithRetry,
+} from "../pipeline/ops-checklist";
 import * as registry from "../pipeline/run-registry";
-import { LINEAR_STATE_MAP as MAP, decisionOfState } from "./state-map";
+import { LINEAR_STATE_MAP as MAP, decisionOfState, validateStateMap } from "./state-map";
 import { parseCommand, hintFor } from "./commands";
-import { parsePlanVerdict } from "../pipeline/verdicts";
+import { parsePlanVerdict, resolveDomain } from "../pipeline/verdicts";
 import { allQualityCommands, QualityGateError, runQualityCommands } from "../pipeline/quality";
 import {
   acknowledgeOutboxFromRun,
@@ -83,6 +89,7 @@ const active = new Set<string>(); // tickety z opiekunem w tym procesie
 const mergeHandled = new Set<string>(); // merge obsłużony w tym procesie (stan trwały i tak jest w Linear)
 let breakerLogged = false; // log otwarcia bezpiecznika raz na zmianę stanu, nie co cykl
 const limitLogged = new Set<string>(); // log limitu równoległości raz na projekt, nie co cykl
+const invalidStateMapProjects = new Set<string>(); // fail-closed per projekt; inne projekty działają dalej
 
 const marker = (id: string) => `[linear:${id}:v1]`;
 
@@ -110,7 +117,26 @@ async function setPhase(project: string, src: LinearSource, id: string, phase: r
 
 const once = process.argv.includes("--once");
 
+async function validateLinearStateMaps(): Promise<void> {
+  for (const { project, src } of sources) {
+    try {
+      const missing = validateStateMap(MAP, await src.listStateNames());
+      if (!missing.length) continue;
+      invalidStateMapProjects.add(project);
+      const message = `Brak wymaganych stanów Lineara: ${missing.join(", ")}. Projekt nie będzie claimował ticketów.`;
+      console.error(`[${project}] ${message}`);
+      notify(`🛑 ${project}: niepełna mapa stanów Lineara`, message).catch(() => {});
+    } catch (err) {
+      invalidStateMapProjects.add(project);
+      const message = `Nie udało się zweryfikować stanów Lineara: ${err instanceof Error ? err.message : err}`;
+      console.error(`[${project}] ${message}`);
+      notify(`🛑 ${project}: walidacja stanów Lineara nieudana`, message).catch(() => {});
+    }
+  }
+}
+
 async function main() {
+  await validateLinearStateMaps();
   await adoptOrphans().catch((err) => console.error("Adopcja sierot nieudana:", err));
 
   do {
@@ -129,6 +155,7 @@ async function main() {
         } else {
           breakerLogged = false;
           for (const { project, src } of sources) {
+            if (invalidStateMapProjects.has(project)) continue;
             const tickets = await src.listReady().catch((err) => {
               console.error(`[${project}] listReady nieudane:`, err instanceof Error ? err.message : err);
               return [];
@@ -196,6 +223,7 @@ async function handleTicket(
   // Najpierw run Mastry. Jeśli to się nie uda, ticket nadal jest w Todo i nic nie ginie.
   const runId = await mastraClient.createRun();
   await src.claim(id);
+  const reuseDomain = reusePlan ? resolveDomain(labels, reusePlan) : undefined;
   // rejestr: manifest zlecenia czytany RAZ przy claimie (labele = parametry, nie sygnały)
   const initialized = registry.updateState(id, { project, runId }, (st) => {
     st.manifest = {
@@ -216,15 +244,25 @@ async function handleTicket(
     body: { id, title, description, project, labels, reusePlan },
   });
   if (reusePlan) {
-    const files = parsePlanVerdict(reusePlan).files;
-    registry.recordFiles(id, { project, runId }, files);
+    registry.recordResolvedDomain(id, { project, runId }, reuseDomain);
+    if (reuseDomain !== "ops") {
+      registry.recordFiles(id, { project, runId }, parsePlanVerdict(reusePlan).files);
+    }
   }
   await src.comment(id, reusePlan
-    ? `🤖 ai-factory przyjęła ticket ${marker(id)}. ♻️ Reużywam zatwierdzonego planu z poprzedniego runu (porażka infra/budżet) — build startuje od razu, bez bramki.`
+    ? reuseDomain === "ops"
+      ? `🤖 ai-factory przyjęła ticket ${marker(id)}. ♻️ Reużywam zatwierdzonej checklisty ops — przejdę bez buildera i PR do osobnej bramki ręcznego wykonania.`
+      : `🤖 ai-factory przyjęła ticket ${marker(id)}. ♻️ Reużywam zatwierdzonego planu z poprzedniego runu (porażka infra/budżet) — build startuje od razu, bez bramki.`
     : `🤖 ai-factory przyjęła ticket ${marker(id)}. Planner startuje.`
   ).catch((err) => console.error(`[${id}] komentarz claimu nieudany:`, err instanceof Error ? err.message : err));
-  notify(`🤖 ${id}: ticket przyjęty`, reusePlan ? "♻️ Reuse zatwierdzonego planu — build od razu." : `Planner startuje (${project}). Plan przyjdzie do akceptacji.`, url).catch(() => {});
-  await setPhase(project, src, id, reusePlan ? "build" : "planning", runId);
+  notify(
+    `🤖 ${id}: ticket przyjęty`,
+    reusePlan
+      ? reuseDomain === "ops" ? "♻️ Reuse checklisty ops — oczekiwanie na ręczne wykonanie." : "♻️ Reuse zatwierdzonego planu — build od razu."
+      : `Planner startuje (${project}). Plan przyjdzie do akceptacji.`,
+    url
+  ).catch(() => {});
+  await setPhase(project, src, id, reusePlan && reuseDomain !== "ops" ? "build" : "planning", runId);
   await src.comment(id, `🧾 run \`${runId}\` ${marker(id)}`).catch(() => {}); // kotwica adopcji (kluczowa dla reuse — nie ma komentarza z planem)
   await dispatchPendingOutbox(mastraClient, id, { project, runId });
   console.log(`[${id}] run ${runId} wystartowany`);
@@ -244,9 +282,15 @@ async function watchRun(
   planCommentedAtInit?: string,
   decisionSentInit = false
 ) {
-  let planCommentedAt = planCommentedAtInit;
-  let decisionSent = decisionSentInit;
+  const initialState = registry.readState(id);
+  const persistedPlanGate = initialState?.gates[registry.gateId("plan-approval", 0)];
+  const persistedChecklistGate = initialState?.gates[registry.gateId("ops-checklist", 0)];
+  let planCommentedAt = persistedPlanGate?.openedAt ?? planCommentedAtInit;
+  let decisionSent = !!persistedPlanGate?.decision || decisionSentInit;
+  let checklistCommentedAt = persistedChecklistGate?.openedAt;
+  let checklistDecisionSent = !!persistedChecklistGate?.decision;
   let hintSent = false;
+  let checklistHintSent = false;
   let collisionNotified = false; // BAR-141: „czekam na pliki" mówimy raz, nie co tick
   const ticketUrl = registry.readState(id)?.manifest?.url;
   const deadline = Date.now() + RUN_WATCH_MAX_MS;
@@ -289,21 +333,96 @@ async function watchRun(
         continue;
       }
 
+      const currentSuspendPath = suspendedPath(run);
+      const opsChecklistSuspended = status === "suspended" &&
+        registry.readState(id)?.resolvedDomain === "ops" &&
+        currentSuspendPath?.at(-1) === "await-checklist";
+
+      if (opsChecklistSuspended) {
+        if (!checklistCommentedAt) {
+          const checklist = artifactBody(join(runDir, "plan.md")) ?? findString(run, "plan") ?? "(nie udało się odczytać checklisty z runa)";
+          try {
+            await src.comment(
+              id,
+              `👤 Checklista ops gotowa ${marker(id)} — wykonaj ją ręcznie. Fabryka NIE wykona zmian DNS, sekretów ani innych mutacji w systemach zewnętrznych.\n\n` +
+                `Po wykonaniu przeciągnij kartę na **${MAP.phases.verify}** albo napisz \`/done\`. Dopiero wtedy uruchomię deklaratywne, read-only \`project.qa.prodChecks\`.\n\n---\n\n${clip(checklist, 16000)}`
+            );
+            checklistCommentedAt = new Date().toISOString();
+            registry.openGateRecord(id, { project, runId }, "ops-checklist", 0, MAP.phases["ops-checklist"]);
+            await setPhase(project, src, id, "ops-checklist", runId);
+            notify(`👤 ${id}: wykonaj checklistę ops`, "Po wykonaniu przesuń kartę na Weryfikacja albo napisz /done.", ticketUrl).catch(() => {});
+            console.log(`[${id}] checklista ops czeka na ręczne wykonanie`);
+          } catch (err) {
+            console.error(`[${id}] komentarz z checklistą ops nieudany (retry w następnym ticku):`, err instanceof Error ? err.message : err);
+          }
+        } else if (!checklistDecisionSent) {
+          const state = await src.getStateName(id).catch(() => undefined);
+          let kind = state ? decisionOfState(MAP, "ops-checklist", state) : undefined;
+          let via: "state" | "command" = "state";
+          const cmd = kind ? undefined : await readCommandDecision(src, id, checklistCommentedAt);
+          if (!kind && cmd?.decision?.kind === "done") {
+            kind = "done";
+            via = "command";
+          }
+          if (!kind && (cmd?.strayComment || cmd?.decision) && !checklistHintSent) {
+            checklistHintSent = true;
+            await src.comment(
+              id,
+              `${hintFor("ops-checklist", { done: MAP.decisions["ops-checklist"]?.done?.[0] })} ${marker(id)}`
+            ).catch(() => {});
+          }
+          if (kind === "done") {
+            checklistDecisionSent = true;
+            registry.recordDecision(id, { project, runId }, "ops-checklist", 0, {
+              kind: "done",
+              via,
+              observedAt: new Date().toISOString(),
+            });
+            registry.markDecisionStep(id, { project, runId }, "ops-checklist", 0, "consumedAt");
+            registry.enqueueOutbox(id, { project, runId }, {
+              id: outboxId("resume", "ops-checklist:0"),
+              kind: "resume",
+              step: currentSuspendPath ?? ["ops-path", "await-checklist"],
+              body: { checklistDone: true },
+              gate: "ops-checklist",
+              round: 0,
+            });
+            await dispatchPendingOutbox(mastraClient, id, { project, runId });
+            await src.comment(id, `🧪 Wykonanie checklisty potwierdzone ${marker(id)} — uruchamiam read-only prodChecks.`).catch(() => {});
+            await setPhase(project, src, id, "verify", runId);
+            console.log(`[${id}] checklista ops potwierdzona → prodChecks po zakończeniu workflow`);
+          }
+        }
+        continue;
+      }
+
       if (status === "suspended" && !planCommentedAt) {
         const plan = findString(run, "plan") ?? artifactBody(join(runDir, "plan.md")) ?? "(nie udało się odczytać planu z runa)";
+        const resolvedDomain = resolveDomain(registry.readState(id)?.manifest?.labels, plan);
+        const approvalInstruction = resolvedDomain === "ops"
+          ? `**Zaakceptuj plan checklisty:** przeciągnij kartę na *${MAP.phases.build}* albo napisz \`/approve\`. To NIE wykonuje ani nie autoryzuje operacji produkcyjnej — po akceptacji pojawi się osobna bramka ręcznego wykonania. Odrzucenie: Backlog / Canceled albo \`/reject <powód>\`.`
+          : `**Przeciągnij kartę:** na *${MAP.phases.build}* — buduję, albo na *Backlog / Canceled* — odrzucam (powód w komentarzu).\nZ telefonu: komenda \`/approve\` albo \`/reject <powód>\`.`;
         try {
           await src.comment(
             id,
-            `📋 Plan gotowy ${marker(id)} — czeka na Twoją decyzję.\n\n` +
-              `**Przeciągnij kartę:** na *${MAP.phases.build}* — buduję, albo na *Backlog / Canceled* — odrzucam (powód w komentarzu).\n` +
-              `Z telefonu: komenda \`/approve\` albo \`/reject <powód>\`.\n\n---\n\n${clip(plan, 16000)}`
+              `📋 Plan gotowy ${marker(id)} — czeka na Twoją decyzję.\n\n` +
+              `${approvalInstruction}\n\n---\n\n${clip(plan, 16000)}`
           );
           planCommentedAt = new Date().toISOString(); // dopiero PO udanym komentarzu — inaczej czkawka API gubi plan na zawsze (BAR-104)
-          registry.recordFiles(id, { project, runId }, parsePlanVerdict(plan).files); // BAR-141: rezerwacja plików na czas budowy
+          registry.recordResolvedDomain(id, { project, runId }, resolvedDomain);
+          if (resolvedDomain !== "ops") {
+            registry.recordFiles(id, { project, runId }, parsePlanVerdict(plan).files); // BAR-141: rezerwacja plików na czas budowy
+          }
           registry.openGateRecord(id, { project, runId }, "plan-approval", 0, "🚦 Plan do akceptacji");
           await setPhase(project, src, id, "plan-approval", runId);
           console.log(`[${id}] plan czeka na decyzję w Linear`);
-          notify(`⏳ ${id}: plan do akceptacji`, `Przeciągnij kartę na „${MAP.phases.build}" albo napisz /approve.`, ticketUrl).catch(() => {});
+          notify(
+            `⏳ ${id}: plan do akceptacji`,
+            resolvedDomain === "ops"
+              ? "Zaakceptuj checklistę; jej wykonanie będzie osobną bramką."
+              : `Przeciągnij kartę na „${MAP.phases.build}" albo napisz /approve.`,
+            ticketUrl
+          ).catch(() => {});
         } catch (err) {
           console.error(`[${id}] komentarz z planem nieudany (retry w następnym ticku):`, err instanceof Error ? err.message : err);
         }
@@ -331,7 +450,8 @@ async function watchRun(
         // BAR-141: aprobata nie startuje builda, dopóki inny run trzyma te same pliki.
         // Równoległe gałęzie na jednym pliku dały 6 konfliktów merge'a i jeden semantyczny
         // (nocna zmiana 2026-07-22) — tu zamieniamy je na czekanie w kolejce.
-        if (decision?.approved) {
+        const isOps = registry.readState(id)?.resolvedDomain === "ops";
+        if (decision?.approved && !isOps) {
           const collisions = registry.fileCollisions(id, registry.readState(id)?.files ?? []);
           if (collisions.length) {
             if (!collisionNotified) {
@@ -367,9 +487,16 @@ async function watchRun(
           console.log(`[${id}] decyzja z Linear: ${decision.approved ? "ZATWIERDZONO" : "ODRZUCONO"}`);
           // natychmiastowe domknięcie pętli zwrotnej — bez tego wygląda, jakby system nie chwycił decyzji
           if (decision.approved) {
-            await src.comment(id, `🔨 Aprobata przyjęta ${marker(id)} — build ruszył. Kolejne kroki: verify (checks+testy+e2e) → PR.`).catch(() => {});
-            await setPhase(project, src, id, "build", runId);
-            notify(`🔨 ${id}: build ruszył`, "Aprobata planu przyjęta.", ticketUrl).catch(() => {});
+            if (isOps) {
+              await src.comment(
+                id,
+                `✅ Plan checklisty zaakceptowany ${marker(id)}. To NIE autoryzuje żadnej operacji produkcyjnej — za chwilę otworzę osobną bramkę ręcznego wykonania.`
+              ).catch(() => {});
+            } else {
+              await src.comment(id, `🔨 Aprobata przyjęta ${marker(id)} — build ruszył. Kolejne kroki: verify (checks+testy+e2e) → PR.`).catch(() => {});
+              await setPhase(project, src, id, "build", runId);
+              notify(`🔨 ${id}: build ruszył`, "Aprobata planu przyjęta.", ticketUrl).catch(() => {});
+            }
           } else {
             await src.comment(id, `↩️ Odrzucenie przyjęte ${marker(id)} — run zostanie zakończony, powód trafi do raportu.`).catch(() => {});
           }
@@ -378,10 +505,55 @@ async function watchRun(
 
       if (status === "success") {
         try {
-        const prUrl = findString(run, "prUrl") ?? "(brak URL PR)";
-        const review = findString(run, "reviewSummary") ?? "";
-        // werdykt z result runa — findString by tu zawiódł (bierze najdłuższy string, a "pending" > "lgtm")
-        const verdict = (run as { result?: { reviewVerdict?: string } }).result?.reviewVerdict;
+        if (isOpsWorkflowResult(run.result)) {
+          const projectConfig = await getProject(project).catch(() => undefined);
+          const checks = projectConfig?.qa?.prodChecks;
+          const smoke = checks?.length
+            ? await runProdChecksWithRetry(checks, runProdChecks, sleep)
+            : undefined;
+          const verification = classifyOpsVerification(checks, smoke);
+          const trackerStatus = opsTrackerStatus(verification);
+
+          if (trackerStatus === "done") {
+            await src.comment(
+              id,
+              `✅ Checklista ops zweryfikowana ${marker(id)}. ${verification.message}\n${verification.report ?? ""}`.trim()
+            );
+            await src.setStatus(id, "done");
+            registry.finalize(id, { project, runId }, "success");
+            await recordRunOutcome(true).catch(() => {});
+            notify(`✅ ${id}: ops zweryfikowane`, "prodChecks PASS — ticket zakończony jako Done.", ticketUrl).catch(() => {});
+            console.log(`[${id}] OPS SUCCESS → Done`);
+          } else {
+            await src.comment(
+              id,
+              `🛑 Weryfikacja checklisty ops nie zakończyła ticketu ${marker(id)}.\n\n${verification.message}` +
+                (verification.report ? `\n\n${verification.report}` : "")
+            );
+            if (projectConfig?.statuses !== "extended") await src.setStatus(id, "blocked");
+            await setPhase(project, src, id, "blocked", runId);
+            registry.finalize(id, { project, runId }, "blocked", "verify");
+            notify(`🛑 ${id}: ops wymaga człowieka`, verification.message, ticketUrl).catch(() => {});
+            console.log(`[${id}] OPS ${verification.status.toUpperCase()} → BLOCKED`);
+          }
+          break;
+        }
+
+        if (typeof run.result !== "object" || run.result === null || (run.result as { kind?: unknown }).kind !== "code") {
+          throw new Error("Workflow code nie zwrócił jawnego wyniku kind=code.");
+        }
+        const codeResult = run.result as {
+          kind: "code";
+          prUrl: unknown;
+          reviewSummary: unknown;
+          reviewVerdict: unknown;
+        };
+        if (typeof codeResult.prUrl !== "string" || typeof codeResult.reviewSummary !== "string") {
+          throw new Error("Workflow code zwrócił niepełny typowany wynik.");
+        }
+        const prUrl = codeResult.prUrl;
+        const review = codeResult.reviewSummary;
+        const verdict = typeof codeResult.reviewVerdict === "string" ? codeResult.reviewVerdict : undefined;
         const reviewLine =
           verdict === "lgtm" ? "AI review: LGTM — PR oznaczony jako **ready for review**."
           : verdict === "fix" ? "⚠️ AI review: uwagi pozostały po wyczerpaniu rund review→fix — PR zostaje draftem, oceń przy merge."
@@ -920,11 +1092,7 @@ async function prodSmokeGuard(projectKey: string, src: LinearSource, ticketId: s
 
     await sleep(90_000); // deploy potrzebuje chwili (Vercel po merge'u na main)
 
-    let result = await runProdChecks(checks);
-    for (let retry = 0; !result.ok && retry < 4; retry++) {
-      await sleep(60_000); // może deploy jeszcze się propaguje
-      result = await runProdChecks(checks);
-    }
+    const result = await runProdChecksWithRetry(checks, runProdChecks, sleep);
 
     if (result.ok) {
       await src.comment(ticketId, `🟢 Prod smoke OK ${marker(ticketId)} — zmiana żyje na produkcji:\n${result.report}`);
@@ -1067,8 +1235,8 @@ function clip(s: string, max: number): string {
   return `${s.slice(0, head)}\n\n… ✂️ (wycięto ${s.length - max} znaków ze środka — pełny plan w runs/) …\n\n${s.slice(-tail)}`;
 }
 
-function sleep(ms: number) {
-  return new Promise((r) => setTimeout(r, ms));
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /** Minimalny loader .env — bez nowej zależności. Szuka obok src/sources/ → ai-factory/.env. */

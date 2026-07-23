@@ -19,6 +19,7 @@ import {
   parsePlanVerdict,
   parseVerifyVerdict,
   parseReviewVerdict,
+  resolveDomain,
   verdictInstruction,
   MISSING_VERDICT,
 } from "./verdicts";
@@ -62,6 +63,13 @@ const planOutputSchema = z.object({
   planCostUsd: z.number().optional(),
 });
 
+const opsResultSchema = z.object({
+  kind: z.literal("ops"),
+  ticketId: z.string(),
+  plan: z.string(),
+  planCostUsd: z.number().optional(),
+});
+
 /**
  * Stan pętli build→verify. Wejście == wyjście, bo dountil karmi
  * output cyklu z powrotem na jego wejście przy kolejnej iteracji.
@@ -84,8 +92,6 @@ const cycleSchema = z.object({
   verifyReport: z.string(),
 });
 
-const KNOWN_DOMAINS = ["frontend", "backend", "fullstack", "ops"];
-
 /**
  * Domena buildu → routing `build.<domena>` (BAR-133).
  *
@@ -94,16 +100,8 @@ const KNOWN_DOMAINS = ["frontend", "backend", "fullstack", "ops"];
  * dopóki ktoś nie pamiętał o labelu (BAR-92 run 1 poszedł w codex zamiast Opusa).
  * Nieznana wartość jest ignorowana — routing spada na default, nigdy nie wybucha.
  */
-const ticketDomain = (ticket: { labels?: string[] }, plan?: string): string | undefined => {
-  const fromLabel = ticket.labels?.find((l) => l.startsWith("domain:"))?.slice("domain:".length);
-  if (fromLabel) return fromLabel;
-  const declared = plan ? parsePlanVerdict(plan).domain?.trim().toLowerCase() : undefined;
-  if (declared && !KNOWN_DOMAINS.includes(declared)) {
-    console.warn(`[routing] planner zadeklarował nieznaną domenę "${declared}" — używam defaultu`);
-    return undefined;
-  }
-  return declared;
-};
+const ticketDomain = (ticket: { labels?: string[] }, plan?: string): string | undefined =>
+  resolveDomain(ticket.labels, plan);
 
 /** Metryka rozróżnia „planner zablokował" od „planner nie dotrzymał kontraktu" (BAR-147). */
 const planOutcome = (v: { ok: boolean; source: string }) =>
@@ -123,6 +121,7 @@ const PLAN_INSTRUCTIONS = [
   "Jeśli stan opisany w tickecie JUŻ ISTNIEJE w kodzie (ticket spełniony): verdict \"blocked\" i wyjaśnienie w raporcie, BEZ pytań — nie planuj pustej pracy.",
   `W bloku factory wypełnij "files" KOMPLETNĄ listą plików, które ticket zmieni (ścieżki względem repo) — fabryka serializuje na ich podstawie równoległe tickety, więc pominięty plik grozi konfliktem merge'a.`,
   `Oraz "domain": frontend | backend | fullstack | ops — na podstawie zakresu zmian; od tego zależy dobór silnika buildu.`,
+  "Jeśli ticket jest klasy ops/infra: checklista opisuje bezpieczne kroki, lokalizacje i oczekiwany stan końcowy — NIGDY nie wpisuj wartości sekretów (haseł, tokenów ani kluczy).",
   verdictInstruction("plan"),
 ].join("\n");
 
@@ -408,6 +407,38 @@ const approvePlanStep = createStep({
     }
     return inputData;
   },
+});
+
+const awaitChecklistStep = createStep({
+  id: "await-checklist",
+  description: "Human gate ops: ręczne wykonanie checklisty przed read-only prodChecks",
+  inputSchema: planOutputSchema,
+  outputSchema: planOutputSchema,
+  suspendSchema: z.object({ checklist: z.string() }),
+  resumeSchema: z.object({ checklistDone: z.boolean() }),
+  execute: async ({ inputData, resumeData, suspend }) => {
+    if (!resumeData) {
+      await suspend({ checklist: inputData.plan });
+      return inputData;
+    }
+    if (!resumeData.checklistDone) {
+      throw new Error("BLOCKED: checklista ops nie została potwierdzona jako wykonana.");
+    }
+    return inputData;
+  },
+});
+
+const finalizeOpsStep = createStep({
+  id: "finalize-ops",
+  description: "Jawny wynik ops dla pollera — bez builda, PR, CI i code review",
+  inputSchema: planOutputSchema,
+  outputSchema: opsResultSchema,
+  execute: async ({ inputData }) => ({
+    kind: "ops" as const,
+    ticketId: inputData.ticket.id,
+    plan: inputData.plan,
+    planCostUsd: inputData.planCostUsd,
+  }),
 });
 
 const initCycleStep = createStep({
@@ -1102,6 +1133,10 @@ const reviewCycleSchema = publishOutputSchema.extend({
   oscillation: z.boolean(),
 });
 
+const codeResultSchema = reviewCycleSchema.extend({ kind: z.literal("code") });
+const workflowResultSchema = z.discriminatedUnion("kind", [codeResultSchema, opsResultSchema]);
+export type TicketWorkflowResult = z.infer<typeof workflowResultSchema>;
+
 /**
  * Uwagi review jako porównywalny zbiór (BAR-125). Normalizacja zdejmuje numery
  * linii, wielkość liter i interpunkcję — ta sama uwaga sformułowana inaczej
@@ -1461,7 +1496,7 @@ const finalizeReviewStep = createStep({
   id: "finalize-review",
   description: "Zamknięcie pętli review: LGTM → PR ready for review; nierozwiązane uwagi → zostaje draft z ⚠️",
   inputSchema: reviewCycleSchema,
-  outputSchema: reviewCycleSchema,
+  outputSchema: codeResultSchema,
   execute: async ({ inputData, runId }) => {
     if (inputData.reviewVerdict === "lgtm") {
       if (!inputData.verifiedSha || inputData.sha !== inputData.verifiedSha) {
@@ -1481,27 +1516,15 @@ const finalizeReviewStep = createStep({
       ).catch(() => {});
     }
     // "skipped" (recenzja się nie odbyła) → też zostaje draft: brak czystej recenzji = brak awansu
-    return inputData;
+    return { ...inputData, kind: "code" as const };
   },
 });
 
-export const ticketPipeline = createWorkflow({
-  id: "ticket-pipeline",
-  inputSchema: intakeInputSchema,
-  outputSchema: reviewCycleSchema,
+const codePath = createWorkflow({
+  id: "code-path",
+  inputSchema: planOutputSchema,
+  outputSchema: codeResultSchema,
 })
-  .then(intakeStep)
-  .then(initPlanCycleStep)
-  .dountil(
-    planClarifyCycle,
-    async ({ inputData }) => {
-      if (!inputData.plan) return false;
-      const v = parsePlanVerdict(inputData.plan);
-      return v.ok || !v.questions || inputData.clarifyRound >= inputData.maxClarifyRounds;
-    }
-  )
-  .then(finalizePlanStep)
-  .then(approvePlanStep)
   .then(initCycleStep)
   .dountil(
     buildVerifyCycle,
@@ -1519,4 +1542,54 @@ export const ticketPipeline = createWorkflow({
       (inputData.reviewVerdict !== "fix" || inputData.reviewRound >= inputData.maxReviewRounds || inputData.oscillation)
   )
   .then(finalizeReviewStep);
+codePath.commit();
+
+const opsPath = createWorkflow({
+  id: "ops-path",
+  inputSchema: planOutputSchema,
+  outputSchema: opsResultSchema,
+})
+  .then(awaitChecklistStep)
+  .then(finalizeOpsStep);
+opsPath.commit();
+
+const branchResultSchema = z.object({
+  "code-path": codeResultSchema.optional(),
+  "ops-path": opsResultSchema.optional(),
+});
+
+const unwrapWorkflowResultStep = createStep({
+  id: "unwrap-workflow-result",
+  description: "Rozpakowanie wyniku wybranej gałęzi do jawnej unii code/ops",
+  inputSchema: branchResultSchema,
+  outputSchema: workflowResultSchema,
+  execute: async ({ inputData }) => {
+    const result = inputData["ops-path"] ?? inputData["code-path"];
+    if (!result) throw new Error("Workflow nie zwrócił jawnego wyniku gałęzi code/ops.");
+    return result;
+  },
+});
+
+export const ticketPipeline = createWorkflow({
+  id: "ticket-pipeline",
+  inputSchema: intakeInputSchema,
+  outputSchema: workflowResultSchema,
+})
+  .then(intakeStep)
+  .then(initPlanCycleStep)
+  .dountil(
+    planClarifyCycle,
+    async ({ inputData }) => {
+      if (!inputData.plan) return false;
+      const v = parsePlanVerdict(inputData.plan);
+      return v.ok || !v.questions || inputData.clarifyRound >= inputData.maxClarifyRounds;
+    }
+  )
+  .then(finalizePlanStep)
+  .then(approvePlanStep)
+  .branch([
+    [async ({ inputData }) => ticketDomain(inputData.ticket, inputData.plan) === "ops", opsPath],
+    [async ({ inputData }) => ticketDomain(inputData.ticket, inputData.plan) !== "ops", codePath],
+  ])
+  .then(unwrapWorkflowResultStep);
 ticketPipeline.commit();
