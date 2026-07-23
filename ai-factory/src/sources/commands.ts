@@ -12,6 +12,7 @@ export const COMMANDS: Record<string, DecisionKind> = {
   "/approve": "approve",
   "/reject": "reject",
   "/answer": "answer",
+  "/done": "done",
 };
 
 export interface ParsedCommand {
@@ -32,10 +33,18 @@ export function parseCommand(body: string): ParsedCommand | undefined {
 }
 
 /** Podpowiedź wysyłana, gdy przy otwartej bramce przyjdzie komentarz bez sygnału. */
-export function hintFor(gate: "plan-approval" | "clarify", states: { approve?: string; answer?: string }): string {
-  return gate === "plan-approval"
-    ? `ℹ️ To nie jest decyzja — przeciągnij kartę na **${states.approve ?? "Build"}** (zgoda) albo na Backlog/Canceled (odrzucenie), ` +
-        "ewentualnie napisz komendę `/approve` lub `/reject <powód>`."
-    : `ℹ️ Odpowiedzi zapisane. Żeby fabryka doplanowała, przeciągnij kartę na **${states.answer ?? "Planowanie"}** ` +
-        "albo napisz `/answer <odpowiedzi>`.";
+export function hintFor(
+  gate: "plan-approval" | "clarify" | "ops-checklist",
+  states: { approve?: string; answer?: string; done?: string }
+): string {
+  if (gate === "plan-approval") {
+    return `ℹ️ To nie jest decyzja — przeciągnij kartę na **${states.approve ?? "Build"}** (zgoda) albo na Backlog/Canceled (odrzucenie), ` +
+      "ewentualnie napisz komendę `/approve` lub `/reject <powód>`.";
+  }
+  if (gate === "ops-checklist") {
+    return `ℹ️ To nie jest potwierdzenie wykonania checklisty — przeciągnij kartę na **${states.done ?? "Weryfikacja"}** ` +
+      "albo napisz `/done`.";
+  }
+  return `ℹ️ Odpowiedzi zapisane. Żeby fabryka doplanowała, przeciągnij kartę na **${states.answer ?? "Planowanie"}** ` +
+    "albo napisz `/answer <odpowiedzi>`.";
 }

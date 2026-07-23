@@ -27,6 +27,7 @@ export const LINEAR_STATE_MAP: StateMap = {
     planning: "🧠 Planowanie",
     questions: "👤 ❓ Pytania do autora",
     "plan-approval": "👤 🚦 Plan do akceptacji",
+    "ops-checklist": "👤 🔧 Wykonaj checklistę",
     build: "🔨 Build",
     verify: "🧪 Weryfikacja",
     review: "👀 Code review",
@@ -41,6 +42,9 @@ export const LINEAR_STATE_MAP: StateMap = {
     },
     clarify: {
       answer: ["🧠 Planowanie"],
+    },
+    "ops-checklist": {
+      done: ["🧪 Weryfikacja"],
     },
   },
   labelParams: { engine: "engine:", domain: "domain:", planMode: "plan:" },
@@ -57,4 +61,17 @@ export function decisionOfState(map: StateMap, gate: Gate, stateName: string): D
   if (!forGate) return undefined;
   return (Object.entries(forGate) as [DecisionKind, string[]][])
     .find(([, states]) => states.includes(stateName))?.[0];
+}
+
+/** Wszystkie nazwy stanów, od których zależy sterowanie fabryką, muszą istnieć w trackerze. */
+export function validateStateMap(map: StateMap, existingStateNames: string[]): string[] {
+  const existing = new Set(existingStateNames);
+  const required = new Set([
+    map.ready,
+    ...Object.values(map.phases),
+    ...Object.values(map.decisions).flatMap((byDecision) =>
+      Object.values(byDecision ?? {}).flatMap((states) => states ?? [])
+    ),
+  ]);
+  return [...required].filter((stateName) => !existing.has(stateName));
 }
