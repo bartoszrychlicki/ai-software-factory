@@ -151,8 +151,16 @@ test("pi jawnie raportuje timeout i użyty budżet", async () => {
     assert.equal(result.ok, false);
     assert.match(result.report, /timeout/i);
     assert.match(result.report, /0\.02/);
-    assert.equal((result.raw as { errorKind?: string }).errorKind, "timeout");
-    assert.equal((result.raw as { budgetMinutes?: number }).budgetMinutes, 0.02);
+    const raw = result.raw as {
+      errorKind?: string;
+      budgetMinutes?: number;
+      errorCode?: string | number | null;
+      signal?: string | null;
+    };
+    assert.equal(raw.errorKind, "timeout");
+    assert.equal(raw.budgetMinutes, 0.02);
+    assert.equal(raw.errorCode, null);
+    assert.equal(raw.signal, "SIGTERM");
   } finally {
     process.env.PATH = originalPath;
     rmSync(root, { recursive: true, force: true });
