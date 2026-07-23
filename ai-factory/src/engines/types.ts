@@ -30,5 +30,10 @@ export interface EngineRunResult {
 /** Silnik = headless CLI (subskrypcja). Nowy silnik = nowy adapter, zero zmian w pipeline. */
 export interface EngineAdapter {
   name: string;           // claude-code | codex | kimi-code | lmstudio
+  /**
+   * Sposób przekazania zmian do roli verify. Brak capability zachowuje
+   * klasyczny pełny diff inline; workspace zakłada read-only dostęp do checkoutu.
+   */
+  verifyContextMode?: "full-diff" | "workspace";
   run(input: EngineRunInput): Promise<EngineRunResult>;
 }

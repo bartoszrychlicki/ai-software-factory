@@ -55,14 +55,57 @@ export function allQualityCommands(ticket: { checks?: string[]; e2e?: string }):
   return [...(ticket.checks ?? []), ...(ticket.e2e ? [ticket.e2e] : [])];
 }
 
+async function mergeBaseWith(workspaceDir: string, defaultBranch: string): Promise<string> {
+  await exec("git", ["-C", workspaceDir, "fetch", "origin", defaultBranch]);
+  const { stdout } = await exec("git", [
+    "-C",
+    workspaceDir,
+    "merge-base",
+    "HEAD",
+    `origin/${defaultBranch}`,
+  ]);
+  return stdout.trim();
+}
+
 /** Pełny diff PR-a względem aktualnej bazy, niezależnie od liczby fix commitów i merge commitów. */
 export async function fullBranchDiff(workspaceDir: string, defaultBranch: string): Promise<string> {
-  await exec("git", ["-C", workspaceDir, "fetch", "origin", defaultBranch]);
-  const { stdout: base } = await exec("git", ["-C", workspaceDir, "merge-base", "HEAD", `origin/${defaultBranch}`]);
+  const base = await mergeBaseWith(workspaceDir, defaultBranch);
   const { stdout: diff } = await exec(
     "git",
-    ["-C", workspaceDir, "diff", "--no-ext-diff", "--find-renames", `${base.trim()}...HEAD`],
+    ["-C", workspaceDir, "diff", "--no-ext-diff", "--find-renames", `${base}...HEAD`],
     { maxBuffer: 20 * 1024 * 1024 }
   );
   return diff;
+}
+
+export interface ChangeManifest {
+  base: string;
+  nameStatus: string;
+  diffStat: string;
+}
+
+/** Kompaktowy, kompletny manifest zmian dla verifiera czytającego pliki z checkoutu. */
+export async function changeManifest(
+  workspaceDir: string,
+  defaultBranch: string
+): Promise<ChangeManifest> {
+  const base = await mergeBaseWith(workspaceDir, defaultBranch);
+  const diffRange = `${base}...HEAD`;
+  const [{ stdout: nameStatus }, { stdout: diffStat }] = await Promise.all([
+    exec(
+      "git",
+      ["-C", workspaceDir, "diff", "--no-ext-diff", "--find-renames", "--name-status", diffRange],
+      { maxBuffer: 20 * 1024 * 1024 }
+    ),
+    exec(
+      "git",
+      ["-C", workspaceDir, "diff", "--no-ext-diff", "--find-renames", "--stat", diffRange],
+      { maxBuffer: 20 * 1024 * 1024 }
+    ),
+  ]);
+  return {
+    base,
+    nameStatus: nameStatus.trimEnd(),
+    diffStat: diffStat.trimEnd(),
+  };
 }
