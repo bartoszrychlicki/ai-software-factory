@@ -1,11 +1,15 @@
 # ai-factory
 
 Lokalna fabryka software: Linear jest kolejką i interfejsem bramek człowieka,
-Mastra prowadzi trwały workflow ticketu, a adaptery CLI realizują role planner,
-builder, verifier i reviewer w izolowanych worktree.
+a adaptery CLI realizują role planner, builder, verifier i reviewer w
+izolowanych worktree. Obecny pipeline używa Mastry jako legacy ownera workflow;
+zgodnie z decyzją BAR-157 docelowym i jedynym właścicielem lifecycle oraz
+efektów będzie transakcyjny SQLite coordinator, a Mastra pozostanie executorem.
 
 Pełny, aktualny diagram i opis stanów: [docs/ticket-flow.md](docs/ticket-flow.md).
 Wynik bramki trwałości BAR-157: [docs/mastra-lifecycle-spike.md](docs/mastra-lifecycle-spike.md).
+Zaakceptowany plan rozwoju na 90 dni:
+[docs/development-plan-2026.md](docs/development-plan-2026.md).
 
 ## Uruchomienie
 
