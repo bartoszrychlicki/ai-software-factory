@@ -11,6 +11,7 @@ const PI_PROVIDER = "lm-studio";
  */
 export const pi: EngineAdapter = {
   name: "pi",
+  verifyContextMode: "workspace",
 
   async run(input: EngineRunInput): Promise<EngineRunResult> {
     if (input.role !== "verify") {

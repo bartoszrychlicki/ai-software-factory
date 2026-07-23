@@ -6,16 +6,17 @@ Fabryka software: ticket → intake → plan (+gate niejasności) → human gate
 
 ## Mapa kodu
 
-- `src/engines/types.ts` — kontrakt `EngineAdapter.run({role, instructions, context, workspace, budget, model?, sessionId?}) → {ok, report, costUsd?, sessionId?, raw}`. **Adapter nigdy nie rzuca** — błąd = `ok:false`; decyzje podejmują kroki pipeline'u.
+- `src/engines/types.ts` — kontrakt `EngineAdapter.run({role, instructions, context, workspace, budget, model?, sessionId?}) → {ok, report, costUsd?, sessionId?, raw}` oraz capability `verifyContextMode` (`full-diff` domyślnie / `workspace`). **Adapter nigdy nie rzuca** — błąd = `ok:false`; decyzje podejmują kroki pipeline'u.
 - `src/engines/claude-code.ts` — `claude -p --output-format stream-json --verbose`; opcjonalne `sessionId` uruchamia `--resume` (MVP: tylko pętla plan↔clarify jednego ticketu), a id wraca ze stream-json `system/init` lub `result`; adapter zwraca `report` (ostatnia wiadomość, dla człowieka) i `transcript` (WSZYSTKIE wiadomości — z niego parsujemy werdykty); role ≠ build dostają tylko `Read,Glob,Grep`.
 - `src/engines/codex.ts` — `codex exec`, sandbox `read-only`/`workspace-write` wg roli; **musi mieć `child.stdin.end()`**.
 - `src/engines/kimi-code.ts` — `kimi -p` (headless). **TYLKO rola build**: tryb -p zawsze auto-zatwierdza zapisy i nie ma read-only (`--plan`/`--yolo`/`--auto` nie łączą się z `-p`) — inne role dostają odmowę fail-closed. Label `engine:*` działa przez to wyłącznie na build (routing.ts). Bez raportu kosztów.
-- `src/engines/pi.ts` — `pi -p --provider lm-studio --model <jawny model> --no-session`; **TYLKO rola verify**, prompt wyłącznie przez stdin, narzędzia ograniczone do read-only; brak modelu i inne role dostają odmowę fail-closed.
+- `src/engines/pi.ts` — `pi -p --provider lm-studio --model <jawny model> --no-session`; **TYLKO rola verify**, prompt wyłącznie przez stdin, narzędzia ograniczone do read-only, capability kontekstu `workspace`; brak modelu i inne role dostają odmowę fail-closed.
 - `src/engines/index.ts` — rejestr silników (nowy silnik = adapter + wpis + linijka w routing.yaml).
 - `src/sources/types.ts` — kontrakt `TicketSource`.
 - `src/sources/linear.ts` — `LinearSource` (GraphQL API; klucz w `.env` jako `LINEAR_API_KEY`, projekt `LINEAR_PROJECT`). Nazwa projektu w Linear == klucz w projects.yaml.
 - `src/sources/poll-linear.ts` — poller: co 60 s bierze issues w stanie `Todo`, claimuje (→ In Progress), startuje run przez API Mastry i raportuje komentarzami. **Aprobata planu**: przeciągnięcie karty na `🔨 Build` (albo komenda `/approve`); polling co 20 s → resume-async. Przy sukcesie uploaduje screenshot do CDN Lineara i osadza w komentarzu. Multi-projekt: `LINEAR_PROJECTS=pilot-app,br-budget` w .env (nazwa projektu w Linear == klucz projects.yaml). Produkcyjnie działa jako usługa launchd; ręcznie: `npx tsx src/sources/poll-linear.ts [--once]`.
 - `src/pipeline/ticket-pipeline.ts` — cały workflow, w tym pętla `dountil` na `build-verify-cycle`.
+- `src/pipeline/verify-context.ts` — wybiera pełny diff inline albo kompaktowy manifest workspace dla verify na podstawie capability adaptera.
 - `src/pipeline/ops-checklist.ts` — czysta klasyfikacja PASS/FAIL/no-checks, trwały guard wyniku ops i ograniczony retry prodChecks.
 - `src/pipeline/workspace.ts` — worktree per ticket w `~/.ai-factory/worktrees/<repo>/<ticket>`; `createCheckout` = świeży detached checkout SHA dla verify.
 - `src/pipeline/projects.ts` — rejestr projektów (`projects.yaml`); `findUpFile` szuka configów w górę drzewa (mastra dev ma cwd w `src/mastra/public`!).

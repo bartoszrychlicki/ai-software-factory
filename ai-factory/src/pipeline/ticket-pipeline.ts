@@ -24,6 +24,7 @@ import {
   MISSING_VERDICT,
 } from "./verdicts";
 import { allQualityCommands, cleanExecutionEnv, fullBranchDiff, QualityGateError, runQualityCommands } from "./quality";
+import { buildFinalVerifyContextBlock, buildVerifyContextSection } from "./verify-context";
 import { changedFilesInWorkspace, undeclaredChangedFiles } from "./scope";
 import { waitForGithubChecks } from "./github-ci";
 
@@ -694,9 +695,9 @@ const verifyStep = createStep({
 
       const checksSummary = checkResults.join("\n");
 
-      // 2) Diff dla agenta-werdyktu
+      // 2) Kontekst zmian wg capability adaptera verify
       const project = await getProject(ticket.project);
-      const diff = await fullBranchDiff(co.dir, project.default_branch ?? "main");
+      const verifyContext = await buildVerifyContextSection(route.engine, { co, project, sha });
 
       // 3) Niezależny werdykt: osobny run, read-only, czysty katalog
       const overBudget = await budgetExceeded(ticket, runId);
@@ -712,6 +713,7 @@ const verifyStep = createStep({
           "- każde kryterium akceptacji ma pokrycie w zmianach?",
           "- brak zmian poza zakresem planu?",
           "- jakość: oczywiste błędy, regresje, edge case'y?",
+          ...(verifyContext.extraInstruction ? [verifyContext.extraInstruction] : []),
           verdictInstruction("verify"),
           "Potem uzasadnienie punktowo. Bądź surowy — wątpliwość = FAIL.",
         ].join("\n"),
@@ -722,8 +724,7 @@ const verifyStep = createStep({
           "# Plan",
           inputData.plan,
           "",
-          "# Pełny diff brancha względem aktualnej bazy",
-          diff.slice(0, 60_000),
+          verifyContext.block,
           "",
           "# Checks projektu wykonane przez fabrykę na świeżym checkoutcie:",
           checksSummary,
@@ -811,7 +812,7 @@ async function reverifyExactSha(
     await runQualityCommands(co.dir, commands, { env: cleanEnv, timeoutMs: 20 * 60_000 });
     const checksSummary = commands.map((command) => `- \`${command}\` → OK`).join("\n");
     const project = await getProject(ticket.project);
-    const diff = await fullBranchDiff(co.dir, project.default_branch ?? "main");
+    const verifyContext = await buildVerifyContextSection(route.engine, { co, project, sha });
     const overBudget = await budgetExceeded(ticket, runId);
     if (overBudget) throw new Error(`budżet ticketu wyczerpany przed finalnym verify — ${overBudget}`);
 
@@ -827,6 +828,7 @@ async function reverifyExactSha(
         "- każde kryterium akceptacji ticketu nadal ma pokrycie?",
         "- poprawka lub merge nie zmieniły zachowania poza zakresem?",
         "- checks i e2e dotyczą dokładnie tego SHA?",
+        ...(verifyContext.extraInstruction ? [verifyContext.extraInstruction] : []),
         verdictInstruction("verify"),
         "Wątpliwość = FAIL.",
       ].join("\n"),
@@ -837,8 +839,7 @@ async function reverifyExactSha(
         "# Plan",
         inputData.plan,
         "",
-        `# Finalny SHA: ${sha}`,
-        diff.slice(0, 60_000),
+        buildFinalVerifyContextBlock(sha, verifyContext),
         "",
         "# Checks na czystym checkoutcie",
         checksSummary,

@@ -1,10 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fullBranchDiff, QualityGateError, runQualityCommands } from "../pipeline/quality";
+import { changeManifest, fullBranchDiff, QualityGateError, runQualityCommands } from "../pipeline/quality";
 
 const git = (cwd: string, ...args: string[]) =>
   execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8" });
@@ -30,6 +30,39 @@ test("review otrzymuje pełny diff brancha, nie tylko ostatni commit", async () 
     const diff = await fullBranchDiff(repo, "main");
     assert.match(diff, /first\.txt/);
     assert.match(diff, /second\.txt/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("manifest zmian zawiera modyfikacje, dodania, usunięcia i diffstat", async () => {
+  const root = mkdtempSync(join(tmpdir(), "factory-manifest-"));
+  const bare = join(root, "origin.git");
+  const repo = join(root, "repo");
+  try {
+    execFileSync("git", ["init", "--bare", bare]);
+    execFileSync("git", ["clone", bare, repo]);
+    git(repo, "config", "user.email", "factory@example.test");
+    git(repo, "config", "user.name", "Factory Test");
+    writeFileSync(join(repo, "modified.txt"), "before\n");
+    writeFileSync(join(repo, "deleted.txt"), "delete me\n");
+    git(repo, "add", ".");
+    git(repo, "commit", "-m", "base");
+    git(repo, "branch", "-M", "main");
+    git(repo, "push", "-u", "origin", "main");
+    git(repo, "checkout", "-b", "agent/test");
+    writeFileSync(join(repo, "modified.txt"), "after\n");
+    writeFileSync(join(repo, "added.txt"), "new\n");
+    unlinkSync(join(repo, "deleted.txt"));
+    git(repo, "add", "-A");
+    git(repo, "commit", "-m", "feature");
+
+    const manifest = await changeManifest(repo, "main");
+    assert.match(manifest.base, /^[0-9a-f]{40}$/);
+    assert.match(manifest.nameStatus, /^M\tmodified\.txt$/m);
+    assert.match(manifest.nameStatus, /^A\tadded\.txt$/m);
+    assert.match(manifest.nameStatus, /^D\tdeleted\.txt$/m);
+    assert.match(manifest.diffStat, /3 files changed/);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
