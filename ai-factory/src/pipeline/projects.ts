@@ -11,6 +11,8 @@ export interface ProjectConfig {
   checks?: string[]; // komendy weryfikacyjne projektu (uruchamiane na świeżym checkoutcie)
   /** GitHub checks wymagane dla dokładnego PR head SHA przed review i zdjęciem draftu. */
   ci?: { requiredChecks: string[]; timeoutMinutes?: number };
+  /** Budżet czasu dla wywołania silnika verify. */
+  verify?: { budgetMinutes?: number };
   /** Opcjonalny podgląd wyniku: fabryka stawia serwer, robi screenshot i dołącza do raportu. */
   screenshot?: { start: string; url: string };
   /** Limit równolegle prowadzonych ticketów projektu (BAR-122). Domyślnie bez limitu. */
@@ -24,6 +26,12 @@ export interface ProjectConfig {
     e2e?: string;
     prodChecks?: { name: string; url: string; status?: number; textIncludes?: string; headerIncludes?: string }[];
   };
+}
+
+export const DEFAULT_VERIFY_BUDGET_MINUTES = 5;
+
+export function verifyBudgetMinutes(project: ProjectConfig): number {
+  return project.verify?.budgetMinutes ?? DEFAULT_VERIFY_BUDGET_MINUTES;
 }
 
 /** mastra dev uruchamia kod z .mastra/output — szukamy pliku konfiguracyjnego w górę drzewa */

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { getProject } from "../pipeline/projects";
+import { getProject, verifyBudgetMinutes } from "../pipeline/projects";
 
 async function withProjectsYaml(yaml: string, run: () => Promise<void>) {
   const root = mkdtempSync(join(tmpdir(), "factory-projects-"));
@@ -46,6 +46,18 @@ test("poprawna konfiguracja normalizuje checks i wymagane GitHub checks", async 
     assert.deepEqual(project.checks, ["npm test"]);
     assert.deepEqual(project.ci?.requiredChecks, ["quality"]);
   });
+});
+
+test("verify ma domyślny budżet 5 minut bez override projektu", async () => {
+  await withProjectsYaml("demo:\n  repo: /tmp/demo\n  checks:\n    - npm test\n", async () => {
+    const project = await getProject("demo");
+    assert.equal(verifyBudgetMinutes(project), 5);
+  });
+});
+
+test("pilot-app nadpisuje budżet verify na 15 minut", async () => {
+  const project = await getProject("pilot-app");
+  assert.equal(verifyBudgetMinutes(project), 15);
 });
 
 test("br-factory jest bezpiecznie zarejestrowany jako projekt self-hosted", async () => {

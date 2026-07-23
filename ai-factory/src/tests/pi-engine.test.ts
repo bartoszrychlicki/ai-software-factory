@@ -125,6 +125,40 @@ test("pi wymaga jawnego modelu bez uruchamiania procesu", async () => {
   }
 });
 
+test("pi jawnie raportuje timeout i użyty budżet", async () => {
+  const root = mkdtempSync(join(tmpdir(), "factory-pi-timeout-"));
+  const fakePi = join(root, "pi");
+  const originalPath = process.env.PATH;
+
+  try {
+    writeFileSync(fakePi, [
+      "#!/bin/sh",
+      "sleep 3",
+      "printf 'TOO_LATE\\n'",
+    ].join("\n"));
+    chmodSync(fakePi, 0o755);
+    process.env.PATH = `${root}:${originalPath ?? ""}`;
+
+    const result = await pi.run({
+      role: "verify",
+      instructions: "Zweryfikuj zmianę.",
+      context: "",
+      workspace: process.cwd(),
+      budget: { minutes: 0.02 },
+      model: "qwen/qwen3.6-27b",
+    });
+
+    assert.equal(result.ok, false);
+    assert.match(result.report, /timeout/i);
+    assert.match(result.report, /0\.02/);
+    assert.equal((result.raw as { errorKind?: string }).errorKind, "timeout");
+    assert.equal((result.raw as { budgetMinutes?: number }).budgetMinutes, 0.02);
+  } finally {
+    process.env.PATH = originalPath;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("routing pilot-app verify wskazuje pi i jawny lokalny model", async () => {
   const route = await resolveRoute("verify", { project: "pilot-app" });
 
