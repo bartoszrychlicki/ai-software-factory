@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { readRetryEvidence } from "../sources/retry-context";
@@ -24,6 +24,11 @@ test("retry przenosi ostatni verifier, scope violation i najnowszy commit", () =
       join(dir, "build-attempt-2.md"),
       artifact({ outcome: "scope-violation" }, "potrzebny src/pipeline/ticket-pipeline.ts")
     );
+    // Kolejność nie może zależeć od mtime: na runnerach CI oba pliki często
+    // dostają identyczny timestamp.
+    const sameTime = new Date("2026-07-28T10:00:00.000Z");
+    utimesSync(join(dir, "build-attempt-1.md"), sameTime, sameTime);
+    utimesSync(join(dir, "build-attempt-2.md"), sameTime, sameTime);
 
     const evidence = readRetryEvidence(dir);
     assert.equal(evidence?.baseSha, "a".repeat(40));

@@ -37,8 +37,14 @@ function orderedArtifacts(runDir: string, pattern: RegExp): string[] {
   try {
     return readdirSync(runDir)
       .filter((file) => pattern.test(file))
-      .map((file) => ({ file, mtime: statSync(join(runDir, file)).mtimeMs }))
-      .sort((a, b) => b.mtime - a.mtime)
+      .map((file) => ({
+        file,
+        attempt: Number(file.match(/(\d+)/)?.[1] ?? 0),
+        mtime: statSync(join(runDir, file)).mtimeMs,
+      }))
+      // Numer próby jest źródłem prawdy. mtime bywa identyczny dla kilku
+      // artefaktów na szybkim filesystemie CI i nie daje stabilnej kolejności.
+      .sort((a, b) => b.attempt - a.attempt || b.mtime - a.mtime || b.file.localeCompare(a.file))
       .map(({ file }) => file);
   } catch {
     return [];
