@@ -63,6 +63,7 @@ export interface LifecycleRun {
 
 export type CommandKind =
   | "run-job"
+  | "run-tests"
   | "linear-status"
   | "linear-comment"
   | "publish-pr"
@@ -99,6 +100,8 @@ export interface StageAttempt {
   errorCode?: string;
   errorMessage?: string;
   costUsd?: number;
+  /** Pochodzenie kosztu: reported | estimated-tokens | estimated-time. */
+  costSource?: string;
   durationMs?: number;
   budgetMaxMinutes?: number;
   budgetMaxUsd?: number;
@@ -267,6 +270,7 @@ export class LifecycleStore {
       sha: "TEXT",
       error_code: "TEXT",
       error_message: "TEXT",
+      cost_source: "TEXT",
       budget_max_minutes: "REAL",
       budget_max_usd: "REAL",
       budget_used_minutes: "REAL",
@@ -417,7 +421,7 @@ export class LifecycleStore {
         this.db.prepare(`
           UPDATE lifecycle_commands
           SET state='done', last_error='canceled-by-replan', updated_at=?
-          WHERE ticket_id=? AND kind='run-job' AND state IN ('pending', 'dispatched')
+          WHERE ticket_id=? AND kind IN ('run-job', 'run-tests') AND state IN ('pending', 'dispatched')
         `).run(timestamp, ticketId);
         this.db.prepare(`
           UPDATE lifecycle_stage_attempts
@@ -451,6 +455,17 @@ export class LifecycleStore {
       ORDER BY created_at, rowid
       LIMIT ?
     `).all(now(), limit) as Record<string, unknown>[]).map((row) => this.hydrateCommand(row));
+  }
+
+  /**
+   * Odsuwa dostępność komendy bez zużywania budżetu prób (markCommand
+   * inkrementuje attempts) — używane przy serializacji kolizji plikowych.
+   */
+  deferCommand(key: string, availableAt: string): void {
+    this.db.prepare(`
+      UPDATE lifecycle_commands SET available_at=?, updated_at=?
+      WHERE idempotency_key=? AND state='pending'
+    `).run(availableAt, now(), key);
   }
 
   getCommand(key: string): LifecycleCommand | undefined {
@@ -557,13 +572,14 @@ export class LifecycleStore {
       | "errorCode"
       | "errorMessage"
       | "costUsd"
+      | "costSource"
       | "durationMs"
     >
   ): void {
     this.db.prepare(`
       UPDATE lifecycle_stage_attempts
       SET status=?, outcome=?, report=?, signature=?, sha=COALESCE(?, sha),
-          error_code=?, error_message=?, cost_usd=?, duration_ms=?, finished_at=?
+          error_code=?, error_message=?, cost_usd=?, cost_source=?, duration_ms=?, finished_at=?
       WHERE ticket_id=? AND stage=? AND attempt=?
     `).run(
       result.status,
@@ -574,6 +590,7 @@ export class LifecycleStore {
       result.errorCode ?? null,
       result.errorMessage ?? null,
       result.costUsd ?? null,
+      result.costSource ?? null,
       result.durationMs ?? null,
       now(),
       ticketId,
@@ -826,6 +843,7 @@ export class LifecycleStore {
       errorCode: row.error_code == null ? undefined : String(row.error_code),
       errorMessage: row.error_message == null ? undefined : String(row.error_message),
       costUsd: row.cost_usd == null ? undefined : Number(row.cost_usd),
+      costSource: row.cost_source == null ? undefined : String(row.cost_source),
       durationMs: row.duration_ms == null ? undefined : Number(row.duration_ms),
       budgetMaxMinutes: row.budget_max_minutes == null ? undefined : Number(row.budget_max_minutes),
       budgetMaxUsd: row.budget_max_usd == null ? undefined : Number(row.budget_max_usd),

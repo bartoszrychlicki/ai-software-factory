@@ -16,6 +16,8 @@ export interface Route {
   model?: string;
   effort?: string;
   spec: string; // np. "claude-code/claude-fable-5@high" — do logów/raportów
+  /** Wersja binarium CLI ("unknown" gdy nieodczytywalna) — trafia do podpisu akcji. */
+  cliVersion?: string;
 }
 
 /** "claude-code/claude-fable-5@high" -> { engineName, model: "claude-fable-5", effort: "high" } */
@@ -89,5 +91,6 @@ export async function resolveRoute(
       `Nieznany silnik "${engineName}" w routingu (dostępne: ${Object.keys(engines).join(", ")})`
     );
   }
-  return { engine, model, effort, spec };
+  const cliVersion = engine.version ? await engine.version() : undefined;
+  return { engine, model, effort, spec, cliVersion };
 }

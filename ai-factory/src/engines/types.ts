@@ -14,6 +14,9 @@ export interface EngineRunInput {
   signal?: AbortSignal;
 }
 
+/** Pochodzenie kosztu: raport CLI > estymata z tokenów > estymata z czasu. */
+export type CostSource = "reported" | "estimated-tokens" | "estimated-time";
+
 export interface EngineRunResult {
   ok: boolean;
   report: string;         // plan / raport buildu / werdykt verify (ostatnia wiadomość — dla człowieka)
@@ -24,6 +27,7 @@ export interface EngineRunResult {
    */
   transcript?: string;
   costUsd?: number;
+  costSource?: CostSource;
   /** Id sesji zwrócone przez CLI; inne adaptery mogą je pominąć. */
   sessionId?: string;
   raw?: unknown;
@@ -37,5 +41,7 @@ export interface EngineAdapter {
    * klasyczny pełny diff inline; workspace zakłada read-only dostęp do checkoutu.
    */
   verifyContextMode?: "full-diff" | "workspace";
+  /** Wersja binarium CLI (memoizowana); trafia do podpisów akcji fabryki. */
+  version?(): Promise<string>;
   run(input: EngineRunInput): Promise<EngineRunResult>;
 }

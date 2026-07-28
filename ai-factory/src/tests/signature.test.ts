@@ -56,6 +56,15 @@ test("buildSignature jawnie oznacza model domyślny CLI", () => {
   assert.equal(buildSignature("build", route()).model, "(domyślny CLI)");
 });
 
+test("harness niesie wersję CLI, a 'unknown' nie brudzi podpisu", () => {
+  const versioned = buildSignature("build", { ...route("gpt-5.6-sol"), cliVersion: "0.44.0" });
+  assert.equal(versioned.harness, "codex@0.44.0");
+  assert.equal(signatureLine(versioned), "ai-factory · codex@0.44.0 · gpt-5.6-sol · builder");
+
+  const unknown = buildSignature("build", { ...route("gpt-5.6-sol"), cliVersion: "unknown" });
+  assert.equal(unknown.harness, "codex");
+});
+
 test("formaty podpisu są stabilne i grepowalne", () => {
   const signature = buildSignature("build", route("gpt-5.6-sol"));
 

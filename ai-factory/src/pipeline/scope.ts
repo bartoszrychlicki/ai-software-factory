@@ -24,6 +24,27 @@ export async function changedFilesInWorkspace(cwd: string): Promise<string[]> {
   return [...new Set(paths.filter(Boolean))];
 }
 
+/** Pliki zmienione przez dokładny SHA względem merge-base z origin/<default>. */
+export async function changedFilesAtSha(
+  repo: string,
+  sha: string,
+  defaultBranch: string,
+  signal?: AbortSignal
+): Promise<string[]> {
+  await exec("git", ["-C", repo, "fetch", "origin", defaultBranch], { signal });
+  const { stdout: base } = await exec(
+    "git",
+    ["-C", repo, "merge-base", sha, `origin/${defaultBranch}`],
+    { signal }
+  );
+  const { stdout } = await exec(
+    "git",
+    ["-C", repo, "diff", "--name-only", "-z", `${base.trim()}...${sha}`],
+    { signal, maxBuffer: 10 * 1024 * 1024 }
+  );
+  return stdout.split("\0").filter(Boolean);
+}
+
 export function undeclaredChangedFiles(declaredFiles: string[], changedFiles: string[]): string[] {
   const declared = new Set(declaredFiles.map(normalize).filter(Boolean));
   return [...new Set(changedFiles.map(normalize).filter((path) => path && !declared.has(path)))];

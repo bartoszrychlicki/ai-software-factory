@@ -1,6 +1,7 @@
-import { access } from "node:fs/promises";
+import { access, mkdir, readFile, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import { execFileControlled } from "./process-control";
-import { getProject } from "./projects";
+import { findUpFile, getProject } from "./projects";
 import { resolveRoute } from "./routing";
 
 export interface PreflightDependency {
@@ -77,6 +78,7 @@ export async function runPreflight(
     return [];
   });
   const checkedEngines = new Set<string>();
+  const cliVersions: Record<string, string> = {};
   for (const route of routes) {
     if (checkedEngines.has(route.engine.name)) continue;
     checkedEngines.add(route.engine.name);
@@ -99,6 +101,35 @@ export async function runPreflight(
         `${route.engine.name} nie jest gotowy/autoryzowany: ${error instanceof Error ? error.message : error}`
       );
     }
+    cliVersions[route.engine.name] = await exec(binary, ["--version"])
+      .then(({ stdout }) => {
+        const line = stdout.trim().split("\n")[0] ?? "";
+        return line.match(/\d+\.\d+[^\s)]*/)?.[0] ?? (line || "unknown");
+      })
+      .catch(() => "unknown");
+  }
+  // Rejestr wersji harnessów: cichy auto-update CLI ma zostawić ślad ZANIM
+  // zmieni first-pass-rate. Zmiana wersji = warning (raportowany przez poller).
+  try {
+    const versionsPath = join(dirname(findUpFile("package.json")), "runs", "cli-versions.json");
+    const previous = await readFile(versionsPath, "utf8")
+      .then((raw) => JSON.parse(raw) as Record<string, string>)
+      .catch(() => ({} as Record<string, string>));
+    let changed = false;
+    for (const [engineName, version] of Object.entries(cliVersions)) {
+      if (version === "unknown") continue;
+      const before = previous[engineName];
+      if (before && before !== version) {
+        warnings.push(`Harness ${engineName} zmienił wersję: ${before} → ${version}.`);
+      }
+      if (before !== version) changed = true;
+    }
+    if (changed) {
+      await mkdir(dirname(versionsPath), { recursive: true });
+      await writeFile(versionsPath, JSON.stringify({ ...previous, ...cliVersions }, null, 2));
+    }
+  } catch {
+    // rejestr wersji jest best-effort — nie blokuje preflightu
   }
 
   if (project.github) {

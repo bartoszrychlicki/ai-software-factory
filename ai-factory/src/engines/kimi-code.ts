@@ -1,5 +1,6 @@
 import type { EngineAdapter, EngineRunInput, EngineRunResult } from "./types";
 import { engineEnv } from "./env";
+import { cliVersion } from "./version";
 import { execFileControlled } from "../pipeline/process-control";
 
 const KIMI_BIN = process.env.KIMI_BIN ?? "kimi";
@@ -13,6 +14,8 @@ const KIMI_BIN = process.env.KIMI_BIN ?? "kimi";
  */
 export const kimiCode: EngineAdapter = {
   name: "kimi-code",
+
+  version: () => cliVersion(KIMI_BIN),
 
   async run(input: EngineRunInput): Promise<EngineRunResult> {
     if (input.role !== "build") {

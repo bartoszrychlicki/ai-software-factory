@@ -4,8 +4,19 @@
  * Mastra wykonuje tylko pojedyncze factoryJob. Oczekiwanie na człowieka, testy,
  * GitHub, merge i smoke żyją tutaj i w SQLite, bez workflow resume.
  */
+import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, readdirSync, readFileSync, statSync, unlinkSync } from "node:fs";
+import {
+  closeSync,
+  existsSync,
+  mkdirSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { hostname } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -41,13 +52,8 @@ import {
 import { runPreflight } from "../pipeline/preflight";
 import { breakerOpen, checkHourlySpend, recordRunOutcome } from "../pipeline/breaker";
 import { findUpFile, getProject } from "../pipeline/projects";
-import {
-  allQualityCommands,
-  cleanExecutionEnv,
-  runQualityCommands,
-} from "../pipeline/quality";
-import { createCheckout, removeCheckout } from "../pipeline/workspace";
-import { auditScope } from "../pipeline/scope";
+import { planFileCollisions } from "../pipeline/serialization";
+import type { TestRunnerInput, TestRunnerResult } from "../pipeline/test-runner";
 import { execFileControlled } from "../pipeline/process-control";
 import { evaluateGithubChecks, inspectPullRequestChecks } from "../pipeline/github-ci";
 import { runProdChecks } from "../pipeline/prod-smoke";
@@ -56,6 +62,11 @@ import { notify } from "../pipeline/notify";
 const POLL_INTERVAL_MS = Number(process.env.FACTORY_POLL_INTERVAL_MS ?? 60_000);
 const marker = (ticketId: string) => `[linear:${ticketId}:v2]`;
 const reportedPreflight = new Map<string, string>();
+const reportedWarnings = new Map<string, string>();
+
+export interface TestRunnerSpawn extends TestRunnerInput {
+  resultPath: string;
+}
 
 export interface PollerDependencies {
   store: LifecycleStore;
@@ -63,6 +74,8 @@ export interface PollerDependencies {
   sources: Map<string, LinearSource>;
   /** Kanał powiadomień; testy wstrzykują rejestrator zamiast realnego notify. */
   notifier?: typeof notify;
+  /** Start detached runnera testów; testy wstrzykują stub zwracający PID. */
+  spawnTestRunner?: (input: TestRunnerSpawn) => number;
 }
 
 function stableRunId(key: string): string {
@@ -408,6 +421,7 @@ async function dispatchJob(
     errorCode: output.errorCode,
     errorMessage: output.outcome === "failed" ? output.report : undefined,
     costUsd: output.costUsd,
+    costSource: output.costSource,
     durationMs: output.durationMs,
   });
   applyDecision(deps, run.ticketId, reduceLifecycle(run, {
@@ -415,29 +429,6 @@ async function dispatchJob(
     attempt,
     output,
   }), command.key);
-}
-
-async function changedFilesAtSha(
-  repo: string,
-  sha: string,
-  defaultBranch: string,
-  signal?: AbortSignal
-): Promise<string[]> {
-  await execFileControlled("git", ["-C", repo, "fetch", "origin", defaultBranch], {
-    timeoutMs: 60_000,
-    signal,
-  });
-  const { stdout: base } = await execFileControlled(
-    "git",
-    ["-C", repo, "merge-base", sha, `origin/${defaultBranch}`],
-    { signal }
-  );
-  const { stdout } = await execFileControlled(
-    "git",
-    ["-C", repo, "diff", "--name-only", "-z", `${base.trim()}...${sha}`],
-    { signal }
-  );
-  return stdout.split("\0").filter(Boolean);
 }
 
 export async function publishDraftPullRequest(
@@ -592,8 +583,33 @@ export async function dispatchOutbox(deps: PollerDependencies): Promise<void> {
       deps.store.markCommand(command.key, "failed", { error: "Brak lifecycle run." });
       continue;
     }
+    // Joby zakończonego runu (cancel/done) nie mogą się już odpalić.
+    if ((command.kind === "run-job" || command.kind === "run-tests") && run.status === "done") {
+      deps.store.markCommand(command.key, "done", { error: "run-already-done" });
+      continue;
+    }
+    // Serializacja plikowa (BAR-141): build czeka, gdy inny zatwierdzony run
+    // projektu trzyma te same pliki. Odsuwamy dostępność zamiast palić próby.
+    if (command.kind === "run-job" && command.payload.kind === "build" && !command.externalId) {
+      const collisions = planFileCollisions(run, deps.store.listActive());
+      if (collisions.length) {
+        deps.store.deferCommand(command.key, new Date(Date.now() + 5 * 60_000).toISOString());
+        const holder = collisions[0];
+        deps.store.enqueue({
+          key: `${run.ticketId}:g${run.generation}:defer:${holder.ticketId}`,
+          ticketId: run.ticketId,
+          kind: "linear-comment",
+          stage: "build",
+          payload: {
+            body: `⏸️ Build czeka na ${holder.ticketId} — kolizja plików: ${holder.files.slice(0, 10).join(", ")}. Start automatyczny po domknięciu tamtego PR-a.`,
+          },
+        });
+        continue;
+      }
+    }
     try {
       if (command.kind === "run-job") await dispatchJob(deps, command, run);
+      else if (command.kind === "run-tests") await dispatchTestRun(deps, command, run);
       else if (command.state === "pending") await dispatchExternal(deps, command, run);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -633,146 +649,170 @@ export async function dispatchOutbox(deps: PollerDependencies): Promise<void> {
   }
 }
 
-async function runExactShaTests(
-  deps: PollerDependencies,
-  originalRun: LifecycleRun
-): Promise<void> {
-  if (!originalRun.headSha) throw new Error("Etap test nie ma head SHA.");
-  let run = originalRun;
-  const project = await getProject(run.project);
-  const attempt = deps.store.nextAttempt(run.ticketId, "test");
-  const usage = deps.store.totalUsage(run.ticketId);
-  deps.store.startAttempt(run.ticketId, "test", attempt, `local-test:${run.headSha}:${attempt}`, {
-    inputHash: run.manifest.inputHash,
-    sha: run.headSha,
-    budgetMaxMinutes: project.budget?.maxMinutes ??
-      Number(process.env.FACTORY_BUDGET_MAX_MIN ?? 45),
-    budgetMaxUsd: project.budget?.maxUsd ??
-      Number(process.env.FACTORY_BUDGET_MAX_USD ?? 3),
-    budgetUsedMinutes: usage.minutes,
-    budgetUsedUsd: usage.usd,
-  });
-  const checkout = await createCheckout(
-    project.repo,
-    run.headSha!,
-    `${run.ticketId}-test-${attempt}`
-  );
-  const controller = new AbortController();
-  const source = sourceFor(deps, run);
-  let cancellationCheckRunning = false;
-  const cancellationWatch = setInterval(async () => {
-    if (cancellationCheckRunning || controller.signal.aborted) return;
-    cancellationCheckRunning = true;
-    try {
-      if (await source.getStateName(run.ticketId) === "Canceled") controller.abort();
-    } catch {
-      // Błąd odczytu nie anuluje deterministycznych testów.
-    } finally {
-      cancellationCheckRunning = false;
-    }
-  }, 2_000);
-  cancellationWatch.unref();
+function runsRoot(): string {
+  return process.env.FACTORY_RUNS_ROOT ??
+    join(dirname(findUpFile("package.json")), "runs");
+}
+
+function testResultPath(ticketId: string, generation: number, attempt: number): string {
+  return join(runsRoot(), ticketId, `test-result-g${generation}-a${attempt}.json`);
+}
+
+function pidAlive(pid: number): boolean {
   try {
-    const defaultBranch = project.default_branch ?? "main";
-    await execFileControlled("git", ["-C", project.repo, "fetch", "origin", defaultBranch], {
-      timeoutMs: 60_000,
-      signal: controller.signal,
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function killPidGroup(pid: number): void {
+  try {
+    process.kill(-pid, "SIGTERM");
+  } catch {
+    try { process.kill(pid, "SIGTERM"); } catch { /* proces już nie istnieje */ }
+  }
+  setTimeout(() => {
+    try { process.kill(-pid, "SIGKILL"); } catch { /* grupa już nie istnieje */ }
+  }, 5_000).unref();
+}
+
+/** Produkcyjny spawn detached runnera testów (testy wstrzykują stub przez deps). */
+function spawnTestRunnerProcess(input: TestRunnerSpawn): number {
+  const rootDir = dirname(findUpFile("package.json"));
+  const runnerPath = join(rootDir, "src", "pipeline", "test-runner.ts");
+  const tsxBin = join(rootDir, "node_modules", ".bin", "tsx");
+  const inputPath = `${input.resultPath}.input.json`;
+  mkdirSync(dirname(inputPath), { recursive: true });
+  writeFileSync(inputPath, JSON.stringify(input));
+  const log = openSync(join(dirname(input.resultPath), `test-runner-a${input.attempt}.log`), "a");
+  try {
+    const child = spawn(tsxBin, [runnerPath, inputPath, input.resultPath], {
+      cwd: rootDir,
+      detached: true,
+      stdio: ["ignore", log, log],
+      env: process.env,
     });
-    const behind = await execFileControlled(
-      "git",
-      ["-C", checkout.dir, "merge-base", "--is-ancestor", `origin/${defaultBranch}`, "HEAD"],
-      { signal: controller.signal }
-    ).then(() => false).catch(() => true);
-    if (behind) {
-      await execFileControlled(
-        "git",
-        [
-          "-C", checkout.dir,
-          "-c", "user.name=ai-factory",
-          "-c", "user.email=ai-factory@local.invalid",
-          "merge", "--no-edit", `origin/${defaultBranch}`,
-        ],
-        { timeoutMs: 120_000, signal: controller.signal }
-      ).catch((error) => {
-        throw new Error(`BRANCH_CONFLICT: nie można zsynchronizować checkpointu z main.\n${error instanceof Error ? error.message : error}`);
-      });
-      const { stdout } = await execFileControlled(
-        "git",
-        ["-C", checkout.dir, "rev-parse", "HEAD"],
-        { signal: controller.signal }
-      );
-      const synchronizedSha = stdout.trim();
-      run = applyDecision(deps, run.ticketId, reduceLifecycle(run, {
+    child.unref();
+    if (!child.pid) throw new Error("Nie udało się uruchomić runnera testów (brak PID).");
+    return child.pid;
+  } finally {
+    closeSync(log);
+  }
+}
+
+/** Idempotentny enqueue testów exact-SHA dla runu w stanie test/pending. */
+function enqueueTestRun(deps: PollerDependencies, run: LifecycleRun): void {
+  if (!run.headSha) return;
+  deps.store.enqueue({
+    key: `${run.ticketId}:g${run.generation}:run-tests:${run.headSha}`,
+    ticketId: run.ticketId,
+    kind: "run-tests",
+    stage: "test",
+    payload: {
+      sha: run.headSha,
+      attempt: deps.store.nextAttempt(run.ticketId, "test"),
+    },
+  });
+}
+
+/**
+ * Testy exact-SHA w osobnym, detached procesie: pętla pollera nie stoi 20 min
+ * na `npm ci && test`, a restart pollera nie zabija biegnących testów.
+ * Wynik wraca plikiem JSON; stan przechodzi wyłącznie przez reduceLifecycle.
+ */
+async function dispatchTestRun(
+  deps: PollerDependencies,
+  command: LifecycleCommand,
+  run: LifecycleRun
+): Promise<void> {
+  const attempt = Number(command.payload.attempt ?? 1);
+  const sha = String(command.payload.sha);
+  const resultPath = testResultPath(run.ticketId, run.generation, attempt);
+
+  if (existsSync(resultPath)) {
+    const result = JSON.parse(readFileSync(resultPath, "utf8")) as TestRunnerResult;
+    let current = run;
+    if (result.finalSha !== result.requestedSha && current.headSha === result.requestedSha) {
+      current = applyDecision(deps, run.ticketId, reduceLifecycle(current, {
         type: "branch-synchronized",
-        previousSha: run.headSha!,
-        sha: synchronizedSha,
+        previousSha: result.requestedSha,
+        sha: result.finalSha,
       }));
     }
-    const changedFiles = await changedFilesAtSha(
-      project.repo,
-      run.headSha!,
-      project.default_branch ?? "main",
-      controller.signal
-    );
-    const scope = auditScope(run.planFiles, changedFiles, project.scope?.protected ?? []);
-    if (scope.blocked.length) throw new Error(`Scope audit:\n${scope.blocked.join("\n")}`);
-    const commands = allQualityCommands({
-      checks: project.checks,
-      e2e: project.qa?.e2e,
-      semgrep: project.security?.semgrep,
-    });
-    const results = await runQualityCommands(checkout.dir, commands, {
-      env: cleanExecutionEnv(),
-      timeoutMs: 20 * 60_000,
-      signal: controller.signal,
-    });
-    const report = [
-      `Exact SHA: ${run.headSha}`,
-      ...results.map((result) => `✅ ${result.command} (${result.durationMs} ms)`),
-      ...scope.warnings.map((warning) => `⚠️ ${warning}`),
-    ].join("\n");
     deps.store.finishAttempt(run.ticketId, "test", attempt, {
-      status: "success",
-      outcome: "pass",
-      report,
-      durationMs: results.reduce((sum, item) => sum + item.durationMs, 0),
+      status: result.ok ? "success" : "failed",
+      outcome: result.ok ? "pass" : "fail",
+      report: result.report,
+      durationMs: result.durationMs,
+      errorCode: result.ok ? undefined : "TEST_FAILED",
+      errorMessage: result.ok ? undefined : result.report,
     });
-    applyDecision(deps, run.ticketId, reduceLifecycle(run, {
+    applyDecision(deps, run.ticketId, reduceLifecycle(current, {
       type: "test-result",
-      ok: true,
-      sha: run.headSha!,
-      report,
-    }));
-  } catch (error) {
-    const report = error instanceof Error ? error.message : String(error);
-    if (controller.signal.aborted) {
-      deps.store.finishAttempt(run.ticketId, "test", attempt, {
-        status: "canceled",
-        outcome: "canceled",
-        report: "Testy przerwane po anulowaniu ticketu w Linear.",
-        errorCode: "CANCELED",
-        errorMessage: report,
-      });
-      applyDecision(deps, run.ticketId, reduceLifecycle(run, { type: "cancel" }));
-      return;
-    }
-    deps.store.finishAttempt(run.ticketId, "test", attempt, {
-      status: "failed",
-      outcome: "fail",
-      report,
-      errorCode: "TEST_FAILED",
-      errorMessage: report,
-    });
-    applyDecision(deps, run.ticketId, reduceLifecycle(run, {
-      type: "test-result",
-      ok: false,
-      sha: run.headSha!,
-      report,
-    }));
-  } finally {
-    clearInterval(cancellationWatch);
-    await removeCheckout(project.repo, checkout.dir);
+      ok: result.ok,
+      sha: result.finalSha,
+      report: result.report,
+    }), command.key);
+    return;
   }
+
+  if (!command.externalId) {
+    const project = await getProject(run.project);
+    const usage = deps.store.totalUsage(run.ticketId);
+    deps.store.startAttempt(run.ticketId, "test", attempt, `local-test:${sha}:${attempt}`, {
+      inputHash: run.manifest.inputHash,
+      sha,
+      budgetMaxMinutes: project.budget?.maxMinutes ??
+        Number(process.env.FACTORY_BUDGET_MAX_MIN ?? 45),
+      budgetMaxUsd: project.budget?.maxUsd ??
+        Number(process.env.FACTORY_BUDGET_MAX_USD ?? 3),
+      budgetUsedMinutes: usage.minutes,
+      budgetUsedUsd: usage.usd,
+    });
+    const pid = (deps.spawnTestRunner ?? spawnTestRunnerProcess)({
+      ticketId: run.ticketId,
+      project: run.project,
+      sha,
+      attempt,
+      planFiles: run.planFiles,
+      resultPath,
+    });
+    deps.store.markCommand(command.key, "dispatched", { externalId: String(pid) });
+    return;
+  }
+
+  // Runner wystartował, wyniku nie ma: liveness + lease (20 min testów + grace).
+  const pid = Number(command.externalId);
+  const alive = pidAlive(pid);
+  const latest = deps.store.latestAttempt(run.ticketId, "test");
+  const startedAt = latest?.startedAt ?? command.updatedAt;
+  const leaseMinutes = 20 + Number(process.env.FACTORY_JOB_GRACE_MIN ?? 10);
+  const elapsedMinutes = (Date.now() - Date.parse(startedAt)) / 60_000;
+  if (alive && elapsedMinutes <= leaseMinutes) return;
+  if (alive) killPidGroup(pid);
+  const errorCode = alive ? "TEST_STALLED" : "TEST_RUNNER_DIED";
+  const message = alive
+    ? `Runner testów przekroczył lease ${leaseMinutes} min bez wyniku.`
+    : "Runner testów zakończył się bez pliku wyniku (crash?). Wznowienie: /retry.";
+  deps.store.finishAttempt(run.ticketId, "test", attempt, {
+    status: "failed",
+    outcome: errorCode,
+    report: message,
+    errorCode,
+    errorMessage: message,
+  });
+  applyDecision(deps, run.ticketId, {
+    transition: {
+      stage: "test",
+      status: "blocked",
+      actor: "test-runner",
+      reason: errorCode,
+      patch: { blockedStage: "test", errorCode, errorMessage: message },
+    },
+    commands: [],
+  }, command.key);
 }
 
 export function localExactShaCiResult(
@@ -985,7 +1025,9 @@ export async function reconcileRun(deps: PollerDependencies, run: LifecycleRun):
   if (linearState === "Canceled") {
     const ticketId = current.ticketId;
     for (const command of deps.store.outstandingCommands().filter((item) => item.ticketId === ticketId)) {
-      if (command.externalId) await deps.mastra.cancelRun(command.externalId).catch(() => {});
+      if (!command.externalId) continue;
+      if (command.kind === "run-tests") killPidGroup(Number(command.externalId));
+      else if (command.kind === "run-job") await deps.mastra.cancelRun(command.externalId).catch(() => {});
     }
     applyDecision(deps, current.ticketId, reduceLifecycle(current, { type: "cancel" }));
     return;
@@ -1029,7 +1071,7 @@ export async function reconcileRun(deps: PollerDependencies, run: LifecycleRun):
     return;
   }
   if (current.stage === "smoke" && current.status === "pending") await runSmoke(deps, current);
-  else if (current.stage === "test" && current.status === "pending") await runExactShaTests(deps, current);
+  else if (current.stage === "test" && current.status === "pending") enqueueTestRun(deps, current);
   else if (current.stage === "ci" && current.status === "waiting_external") await reconcileCi(deps, current);
   else if (current.prUrl) await reconcilePullRequest(deps, current);
 }
@@ -1067,6 +1109,14 @@ async function claimReady(deps: PollerDependencies): Promise<void> {
       continue;
     }
     reportedPreflight.delete(projectKey);
+    // Warningi preflightu (np. zmiana wersji harnessu CLI) raportujemy raz.
+    const warningMessage = preflight.warnings.join("; ");
+    if (warningMessage && reportedWarnings.get(projectKey) !== warningMessage) {
+      console.warn(`[${projectKey}] preflight: ${warningMessage}`);
+      const notifier = deps.notifier ?? notify;
+      await notifier(`⚠️ ${projectKey}: preflight`, warningMessage).catch(() => {});
+      reportedWarnings.set(projectKey, warningMessage);
+    }
     const project = await getProject(projectKey);
     const active = deps.store.listActive().filter((run) => run.project === projectKey).length;
     const free = Math.max(0, (project.max_concurrent_tickets ?? Number.POSITIVE_INFINITY) - active);

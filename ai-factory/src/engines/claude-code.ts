@@ -1,11 +1,14 @@
 import type { EngineAdapter, EngineRunInput, EngineRunResult } from "./types";
 import { engineEnv } from "./env";
+import { cliVersion } from "./version";
 import { execFileControlled } from "../pipeline/process-control";
 
 const CLAUDE_BIN = process.env.CLAUDE_BIN ?? "claude";
 
 export const claudeCode: EngineAdapter = {
   name: "claude-code",
+
+  version: () => cliVersion(CLAUDE_BIN),
 
   async run(input: EngineRunInput): Promise<EngineRunResult> {
     // handoff: rola dostaje instrukcje + kontekst poprzednika, nie cały transcript
@@ -94,6 +97,7 @@ export const claudeCode: EngineAdapter = {
       report,
       transcript: texts.join("\n\n"),
       costUsd: final?.total_cost_usd,
+      costSource: final?.total_cost_usd !== undefined ? "reported" : undefined,
       sessionId,
       raw: { events: texts.length, error: processError ? String(processError) : undefined },
     };
