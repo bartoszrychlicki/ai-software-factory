@@ -29,8 +29,17 @@ import { join, dirname, basename } from "node:path";
 import { fileURLToPath } from "node:url";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { createHash } from "node:crypto";
 import { LinearSource } from "./linear";
+import {
+  buildCommentContextSnapshot,
+  type CommentContextSnapshot,
+} from "./comment-context";
+import { readRetryEvidence } from "./retry-context";
+import {
+  approvalMatchesInput,
+  decideMergeReopenOutcome,
+  type ApprovalInputIdentity,
+} from "./reuse-policy";
 import { getProject } from "../pipeline/projects";
 import { breakerOpen, recordRunOutcome, checkHourlySpend } from "../pipeline/breaker";
 import { notify } from "../pipeline/notify";
@@ -223,7 +232,44 @@ async function handleTicket(
   url?: string
 ) {
   console.log(`[${id}] claim (${project}): ${title}`);
-  const reusePlan = await findReusablePlan(src, id, description);
+  // Komentarze autora są częścią wejścia. Odczyt jest fail-closed: bez pełnego
+  // snapshotu nie claimujemy ticketu i nie ryzykujemy planu na starym kontekście.
+  const comments = await src.listComments(id);
+  const commentSnapshot = buildCommentContextSnapshot(id, title, description, comments);
+  const previous = registry.readState(id);
+
+  if (
+    decideMergeReopenOutcome(
+      previous,
+      commentSnapshot.effectiveInputHash,
+      previous?.manifest?.effectiveInputHash
+    ) === "no-scope"
+  ) {
+    if (!previous?.noScopeReportedAt) {
+      await src.comment(
+        id,
+        `ℹ️ Ticket został ponownie otwarty bez zmiany wymagań ani komentarza rozszerzającego zakres ${marker(id)}.\n\n` +
+          "Poprzedni run zakończył się zmergowanym PR-em. Dodaj nowy zakres/oczekiwanie w opisie lub komentarzu, a potem przenieś ticket na Todo."
+      );
+      registry.updateState(id, { project, runId: previous?.runId ?? "" }, (st) => {
+        st.noScopeReportedAt = new Date().toISOString();
+      });
+    }
+    await src.setStatus(id, "blocked").catch(() => {});
+    console.log(`[${id}] reopen bez nowego zakresu — pomijam planner/builder`);
+    active.delete(id);
+    return;
+  }
+
+  const retryEvidence = previous?.runId
+    ? readRetryEvidence(join(registry.runsRoot(), id, previous.runId))
+    : undefined;
+  const reusePlan = await findReusablePlan(
+    id,
+    description,
+    commentSnapshot,
+    comments
+  );
   // Najpierw run Mastry. Jeśli to się nie uda, ticket nadal jest w Todo i nic nie ginie.
   const runId = await mastraClient.createRun();
   await src.claim(id);
@@ -236,6 +282,7 @@ async function handleTicket(
       domain: labels.find((l) => l.startsWith("domain:"))?.slice(7),
       planMode: labels.find((l) => l.startsWith("plan:"))?.slice(5),
       url,
+      effectiveInputHash: commentSnapshot.effectiveInputHash,
     };
   });
   if (!initialized) {
@@ -245,7 +292,24 @@ async function handleTicket(
   registry.enqueueOutbox(id, { project, runId }, {
     id: outboxId("start", runId),
     kind: "start",
-    body: { id, title, description, project, labels, reusePlan },
+    body: {
+      id,
+      title,
+      description,
+      project,
+      labels,
+      reusePlan,
+      commentContext: commentSnapshot.context,
+      commentMeta: {
+        totalRelevant: commentSnapshot.totalRelevant,
+        includedCount: commentSnapshot.includedCount,
+        truncated: commentSnapshot.truncated,
+        effectiveInputHash: commentSnapshot.effectiveInputHash,
+      },
+      retryContext: retryEvidence?.context,
+      retryBaseSha: retryEvidence?.baseSha,
+      retryRequiresChanges: retryEvidence?.requiresChanges,
+    },
   });
   if (reusePlan) {
     registry.recordResolvedDomain(id, { project, runId }, reuseDomain);
@@ -1071,9 +1135,13 @@ async function handleClarifySuspend(
  * timeout bez finału = reuse (nie generujemy planu bez powodu).
  * Jawny `/restart` i utracony run zawsze wymuszają świeży plan.
  */
-async function findReusablePlan(src: LinearSource, id: string, description: string): Promise<string | undefined> {
+async function findReusablePlan(
+  id: string,
+  description: string,
+  snapshot: CommentContextSnapshot,
+  comments: Awaited<ReturnType<LinearSource["listComments"]>>
+): Promise<string | undefined> {
   try {
-    const comments = await src.listComments(id);
     // przyczyna z REJESTRU (deterministyczna); komentarze tylko dla runów sprzed migracji
     const prev = registry.readState(id)?.finalized;
     if (prev?.reason) {
@@ -1090,7 +1158,7 @@ async function findReusablePlan(src: LinearSource, id: string, description: stri
       if (lastFinal && registry.classifyFailure(lastFinal.body) !== "budget" && registry.classifyFailure(lastFinal.body) !== "infra") return undefined;
     }
 
-    const base = join(process.cwd(), "runs", id);
+    const base = join(registry.runsRoot(), id);
     const dirs = readdirSync(base)
       .map((d) => ({ d, m: statSync(join(base, d)).mtimeMs }))
       .sort((a, b) => b.m - a.m);
@@ -1099,11 +1167,19 @@ async function findReusablePlan(src: LinearSource, id: string, description: stri
         const dir = join(base, d);
         // UWAGA: samo istnienie result.json (był PR) NIE blokuje reuse — PR mógł zostać
         // zamknięty bez merge (konflikt); ticket ze zmergowanym PR-em i tak jest Done i nie wraca do claimu
-        const approval = JSON.parse(readFileSync(join(dir, "approval.json"), "utf8")) as { approved?: boolean; descriptionHash?: string };
+        const approval = JSON.parse(
+          readFileSync(join(dir, "approval.json"), "utf8")
+        ) as ApprovalInputIdentity;
         if (!approval.approved) continue;
-        // ticket zmieniony po aprobacie → plan nieaktualny → replan
-        if (approval.descriptionHash &&
-            approval.descriptionHash !== createHash("sha256").update(description).digest("hex")) return undefined;
+        // Opis LUB komentarze autora zmienione po aprobacie → plan nieaktualny.
+        if (
+          !approvalMatchesInput(
+            approval,
+            description,
+            snapshot.effectiveInputHash,
+            snapshot.comments
+          )
+        ) return undefined;
         const raw = readFileSync(join(dir, "plan.md"), "utf8");
         const body = raw.split(/^---\s*$/m).slice(2).join("---").trim() || raw;
         // Reuse zachowuje akceptację człowieka tylko wtedy, gdy istnieje również

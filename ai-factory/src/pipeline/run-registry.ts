@@ -85,7 +85,14 @@ export interface TicketState {
   /** Globalne komendy operatorskie z Lineara, idempotentne po UUID komentarza. */
   restartCommands?: Record<string, RestartCommandRecord>;
   /** Parametry zlecenia z labeli — czytane RAZ przy claimie, potem niezmienne. */
-  manifest?: { labels: string[]; engine?: string; domain?: string; planMode?: string; url?: string };
+  manifest?: {
+    labels: string[];
+    engine?: string;
+    domain?: string;
+    planMode?: string;
+    url?: string;
+    effectiveInputHash?: string;
+  };
   /** Efektywna domena (label override > plan), utrwalona RAZ przez poller. */
   resolvedDomain?: string;
   autoRetry: { count: number; lastAt?: string };
@@ -98,6 +105,8 @@ export interface TicketState {
   /** Ostatni pre-merge re-verify (BAR-124) — raz na przesunięcie maina, nie co tick. */
   preMerge?: { mainSha: string; headSha: string; ok: boolean; at: string };
   mergeHandledAt?: string;
+  /** Idempotencja komunikatu „reopen bez nowego zakresu" po merge'u. */
+  noScopeReportedAt?: string;
   prodSmokeAt?: string;
   finalized?: {
     outcome: "success" | "blocked" | "failed" | "rejected" | "orphan";
@@ -118,7 +127,7 @@ export interface RestartCommandRecord {
   lastError?: string;
 }
 
-function runsRoot(): string {
+export function runsRoot(): string {
   return process.env.FACTORY_RUNS_ROOT ?? join(dirname(findUpFile("package.json")), "runs");
 }
 
@@ -202,6 +211,7 @@ export function updateState(
       state.finalized = undefined;
       state.prUrl = undefined;
       state.mergeHandledAt = undefined;
+      state.noScopeReportedAt = undefined;
       state.files = undefined;
       state.resolvedDomain = undefined;
       state.preMerge = undefined;

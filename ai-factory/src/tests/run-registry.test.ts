@@ -100,6 +100,28 @@ test("manifest zachowuje kanoniczny URL ticketu po ponownym odczycie stanu", () 
   }
 });
 
+test("nowy run czyści marker reopen bez scope i zapisuje hash wejścia", () => {
+  const root = mkdtempSync(join(tmpdir(), "factory-new-run-input-"));
+  process.env.FACTORY_RUNS_ROOT = root;
+  try {
+    registry.updateState("BAR-173", { project: "ai-factory", runId: "old" }, (state) => {
+      state.manifest = { labels: [], effectiveInputHash: "old-input" };
+      state.noScopeReportedAt = "2026-07-28T10:00:00.000Z";
+    });
+    registry.updateState("BAR-173", { project: "ai-factory", runId: "new" }, (state) => {
+      state.manifest = { labels: [], effectiveInputHash: "new-input" };
+    });
+
+    const restored = registry.readState("BAR-173");
+    assert.equal(restored?.runId, "new");
+    assert.equal(restored?.manifest?.effectiveInputHash, "new-input");
+    assert.equal(restored?.noScopeReportedAt, undefined);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    delete process.env.FACTORY_RUNS_ROOT;
+  }
+});
+
 test("efektywna domena jest utrwalana raz, a bramka ops zapisuje decyzję done", () => {
   const root = mkdtempSync(join(tmpdir(), "factory-ops-state-"));
   process.env.FACTORY_RUNS_ROOT = root;

@@ -20,12 +20,21 @@ export async function createWorkspace(
   repoPath: string,
   ticketId: string,
   slug: string,
-  defaultBranch = "main"
+  defaultBranch = "main",
+  baseRef?: string
 ): Promise<Workspace> {
   const branch = `agent/${ticketId}-${slug}`;
   const dir = join(ROOT, basename(repoPath), ticketId);
+  // Rozwiąż checkpoint przed usunięciem starej gałęzi, która może być jego
+  // jedyną czytelną referencją. Sam obiekt commita pozostaje dostępny po SHA.
+  const checkpoint = baseRef
+    ? await exec("git", ["-C", repoPath, "rev-parse", "--verify", `${baseRef}^{commit}`])
+        .then(({ stdout }) => stdout.trim())
+        .catch(() => undefined)
+    : undefined;
 
-  // świeży start każdej próby: sprzątnij pozostałości poprzedniej
+  // świeży katalog każdej próby, ale retry może bazować na ostatnim commicie
+  // poprzedniej próby zamiast ponownie odtwarzać całą implementację od maina.
   await exec("git", ["-C", repoPath, "worktree", "remove", "--force", dir]).catch(() => {});
   await rm(dir, { recursive: true, force: true });
   // prune PRZED branch -D: martwa rejestracja worktree trzyma gałąź jako
@@ -37,11 +46,41 @@ export async function createWorkspace(
   // BAZA = świeży origin/<default>, nie lokalny main: praca równoległa przesuwa maina
   // w trakcie builda, a odgałęzienie od nieaktualnego stanu = gwarantowany konflikt przy publish
   await exec("git", ["-C", repoPath, "fetch", "origin", defaultBranch]).catch(() => {});
-  const base = await exec("git", ["-C", repoPath, "rev-parse", "--verify", `origin/${defaultBranch}`])
+  const base = checkpoint ?? await exec("git", ["-C", repoPath, "rev-parse", "--verify", `origin/${defaultBranch}`])
     .then(() => `origin/${defaultBranch}`)
     .catch(() => defaultBranch);
   await exec("git", ["-C", repoPath, "worktree", "add", "-b", branch, dir, base]);
   return { ticketId, branch, dir, repoPath };
+}
+
+/**
+ * Checkpoint z poprzedniego buildu wolno przenieść do nowego planu wyłącznie,
+ * gdy cały jego diff względem main mieści się w aktualnie zatwierdzonym scope.
+ */
+export async function checkpointWithinScope(
+  repoPath: string,
+  checkpointRef: string | undefined,
+  declaredFiles: string[],
+  defaultBranch = "main"
+): Promise<string | undefined> {
+  if (!checkpointRef) return undefined;
+  await exec("git", ["-C", repoPath, "fetch", "origin", defaultBranch]).catch(() => {});
+  const checkpoint = await exec(
+    "git",
+    ["-C", repoPath, "rev-parse", "--verify", `${checkpointRef}^{commit}`]
+  ).then(({ stdout }) => stdout.trim()).catch(() => undefined);
+  if (!checkpoint) return undefined;
+  const base = await exec("git", ["-C", repoPath, "rev-parse", "--verify", `origin/${defaultBranch}`])
+    .then(() => `origin/${defaultBranch}`)
+    .catch(() => defaultBranch);
+  const { stdout } = await exec(
+    "git",
+    ["-C", repoPath, "diff", "--name-only", "-z", `${base}...${checkpoint}`],
+    { encoding: "utf8", maxBuffer: 10 * 1024 * 1024 }
+  );
+  const allowed = new Set(declaredFiles.map((file) => file.trim().replace(/^\.\//, "")).filter(Boolean));
+  const changed = stdout.split("\0").map((file) => file.trim().replace(/^\.\//, "")).filter(Boolean);
+  return changed.every((file) => allowed.has(file)) ? checkpoint : undefined;
 }
 
 export async function removeWorkspace(ws: Workspace): Promise<void> {

@@ -113,6 +113,8 @@ test("prompt rundy resumed zawiera tylko ostatnią odpowiedź, a brak sesji zach
     id: "BAR-136",
     title: "Prompt caching",
     description: "UNIKALNY_PEŁNY_OPIS_TICKETU",
+    commentContext: "UNIKALNY_KOMENTARZ_AUTORA",
+    retryContext: "UNIKALNY_RAPORT_RETRY",
   };
   const answers = ["PIERWSZA_ODPOWIEDŹ", "OSTATNIA_ODPOWIEDŹ"];
   const cold = buildPlanEnginePrompt({ ticket, clarifyRound: 2, answers });
@@ -123,11 +125,15 @@ test("prompt rundy resumed zawiera tylko ostatnią odpowiedź, a brak sesji zach
   assert.match(cold.context, /UNIKALNY_PEŁNY_OPIS_TICKETU/);
   assert.match(cold.context, /PIERWSZA_ODPOWIEDŹ/);
   assert.match(cold.context, /OSTATNIA_ODPOWIEDŹ/);
+  assert.match(cold.context, /UNIKALNY_KOMENTARZ_AUTORA/);
+  assert.match(cold.context, /UNIKALNY_RAPORT_RETRY/);
 
   assert.equal(resumed.resumed, true);
   assert.equal(resumed.sessionId, "session-136");
   assert.doesNotMatch(resumed.context, /UNIKALNY_PEŁNY_OPIS_TICKETU/);
   assert.doesNotMatch(resumed.context, /PIERWSZA_ODPOWIEDŹ/);
+  assert.doesNotMatch(resumed.context, /UNIKALNY_KOMENTARZ_AUTORA/);
+  assert.doesNotMatch(resumed.context, /UNIKALNY_RAPORT_RETRY/);
   assert.match(resumed.context, /OSTATNIA_ODPOWIEDŹ/);
   assert.ok(
     Buffer.byteLength(`${resumed.instructions}\n\n${resumed.context}`) <
