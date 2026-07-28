@@ -54,10 +54,11 @@ export const pi: EngineAdapter = {
         (error, stdout, stderr) => {
           const report = stdout.trim();
           if (error) {
-            const errorKind = error.killed ? "timeout" : "process-error";
+            const timedOut = error.killed === true;
+            const errorKind = timedOut ? "timeout" : "process-error";
             resolve({
               ok: false,
-              report: error.killed
+              report: timedOut
                 ? `Pi: timeout po budżecie ${input.budget.minutes} min (proces zabity, signal=${error.signal ?? "?"})`
                 : report || `Proces pi zakończył się błędem: ${error.message}\n${stderr}`,
               raw: {
@@ -65,6 +66,8 @@ export const pi: EngineAdapter = {
                 stderr,
                 errorKind,
                 budgetMinutes: input.budget.minutes,
+                errorCode: error.code ?? null,
+                signal: error.signal ?? null,
               },
             });
             return;
