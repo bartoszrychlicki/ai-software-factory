@@ -11,6 +11,8 @@ export interface Workspace {
   branch: string;
   dir: string;
   repoPath: string;
+  /** SHA checkpointu po bezkonfliktowym nałożeniu na świeży origin/main. */
+  checkpointSha?: string;
 }
 
 // worktrees trzymamy POZA repo — zero śmieci w projekcie, łatwe sprzątanie
@@ -43,14 +45,27 @@ export async function createWorkspace(
   await exec("git", ["-C", repoPath, "worktree", "prune"]).catch(() => {});
   await exec("git", ["-C", repoPath, "branch", "-D", branch]).catch(() => {});
 
-  // BAZA = świeży origin/<default>, nie lokalny main: praca równoległa przesuwa maina
-  // w trakcie builda, a odgałęzienie od nieaktualnego stanu = gwarantowany konflikt przy publish
+  // BAZA zawsze = świeży origin/<default>. Checkpoint jest zmianą kandydata,
+  // nie bazą: nakładamy go na aktualny main i odrzucamy przy konflikcie.
   await exec("git", ["-C", repoPath, "fetch", "origin", defaultBranch]).catch(() => {});
-  const base = checkpoint ?? await exec("git", ["-C", repoPath, "rev-parse", "--verify", `origin/${defaultBranch}`])
+  const base = await exec("git", ["-C", repoPath, "rev-parse", "--verify", `origin/${defaultBranch}`])
     .then(() => `origin/${defaultBranch}`)
     .catch(() => defaultBranch);
   await exec("git", ["-C", repoPath, "worktree", "add", "-b", branch, dir, base]);
-  return { ticketId, branch, dir, repoPath };
+  let checkpointSha: string | undefined;
+  if (checkpoint) {
+    try {
+      await exec("git", ["-C", dir, "cherry-pick", checkpoint]);
+      checkpointSha = await exec("git", ["-C", dir, "rev-parse", "HEAD"])
+        .then(({ stdout }) => stdout.trim());
+    } catch {
+      // Konflikt lub pusty cherry-pick = checkpoint nie jest bezpiecznie
+      // przenośny na aktualny main. Disposable worktree wraca do czystej bazy.
+      await exec("git", ["-C", dir, "cherry-pick", "--abort"]).catch(() => {});
+      await exec("git", ["-C", dir, "reset", "--hard", base]);
+    }
+  }
+  return { ticketId, branch, dir, repoPath, checkpointSha };
 }
 
 /**

@@ -567,15 +567,16 @@ const buildStep = createStep({
       defaultBranch,
       checkpoint
     );
+    const appliedCheckpoint = ws.checkpointSha;
 
     // clip: raporty błędów bywają ogromne (echo komend) — nieprzycięte rozdęły prompt próby 2 do spawn E2BIG (BAR-91)
     const feedbackBlock = inputData.feedback
       ? `\n\n# FEEDBACK Z ODRZUCONEJ PRÓBY #${inputData.attempt}\nPoprzednia implementacja została odrzucona. Napraw wskazane problemy:\n${inputData.feedback.slice(0, 12_000)}`
       : "";
-    const checkpointBlock = checkpoint
-      ? `\n\n# CHECKPOINT POPRZEDNIEJ PRÓBY\nWorkspace zawiera już zatwierdzony commit ${checkpoint}. Zachowaj poprawne zmiany i wykonaj tylko brakujące poprawki.`
+    const checkpointBlock = appliedCheckpoint
+      ? `\n\n# CHECKPOINT POPRZEDNIEJ PRÓBY\nWorkspace zawiera już zatwierdzone zmiany nałożone na świeży main jako commit ${appliedCheckpoint}. Zachowaj poprawne zmiany i wykonaj tylko brakujące poprawki.`
       : checkpointCandidate
-        ? "\n\n# CHECKPOINT ODRZUCONY\nPoprzedni commit wykracza poza obecny factory.files albo nie istnieje. Implementujesz bezpiecznie od świeżego maina."
+        ? "\n\n# CHECKPOINT ODRZUCONY\nPoprzedni commit wykracza poza obecny factory.files, nie istnieje albo koliduje ze świeżym mainem. Implementujesz bezpiecznie od świeżego maina."
         : "";
     const retryBlock = ticket.retryContext
       ? `\n\n${ticket.retryContext}`
@@ -594,7 +595,7 @@ const buildStep = createStep({
     const buildMetric = (ok: boolean, outcome: string, costUsd?: number) =>
       recordMetric({ ticket: ticket.id, runId, stage: "build", engine: route.spec, attempt, ok, outcome, costUsd, durationMs: Date.now() - t0 });
     if (
-      checkpoint &&
+      appliedCheckpoint &&
       !ticket.retryRequiresChanges &&
       !inputData.feedback &&
       attempt === 1
@@ -611,7 +612,7 @@ const buildStep = createStep({
           engine: "deterministic/checkpoint",
           costUsd: 0,
           outcome: "checkpoint-reused",
-          sha: checkpoint,
+          sha: appliedCheckpoint,
           files: changedFiles.join(", "),
         },
         "Poprzedni commit buildera mieści się w aktualnym factory.files. Pominięto ponowny build; SHA przechodzi pełny verify."
@@ -623,8 +624,8 @@ const buildStep = createStep({
         feedback: "",
         branch: ws.branch,
         workspaceDir: ws.dir,
-        baseSha: checkpoint,
-        sha: checkpoint,
+        baseSha: appliedCheckpoint,
+        sha: appliedCheckpoint,
         verifiedSha: "",
         changedFiles,
         buildReport: "Bez zmian: bezpiecznie wznowiono zatwierdzony checkpoint poprzedniego runu.",
@@ -707,7 +708,7 @@ const buildStep = createStep({
       feedback: "",
       branch: ws.branch,
       workspaceDir: ws.dir,
-      baseSha: checkpoint ?? inputData.baseSha,
+      baseSha: appliedCheckpoint ?? inputData.baseSha,
       sha: sha.trim(),
       verifiedSha: "",
       changedFiles,
