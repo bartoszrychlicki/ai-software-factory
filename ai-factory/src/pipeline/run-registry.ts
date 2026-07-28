@@ -82,6 +82,8 @@ export interface TicketState {
   gates: Record<string, GateRecord>;
   /** Trwały outbox komend do Mastry. Brak odpowiedzi HTTP nigdy nie gubi start/resume. */
   outbox: Record<string, OutboxCommand>;
+  /** Globalne komendy operatorskie z Lineara, idempotentne po UUID komentarza. */
+  restartCommands?: Record<string, RestartCommandRecord>;
   /** Parametry zlecenia z labeli — czytane RAZ przy claimie, potem niezmienne. */
   manifest?: { labels: string[]; engine?: string; domain?: string; planMode?: string; url?: string };
   /** Efektywna domena (label override > plan), utrwalona RAZ przez poller. */
@@ -103,6 +105,17 @@ export interface TicketState {
     reason?: FailureReason;
     at: string;
   };
+}
+
+export interface RestartCommandRecord {
+  commentId: string;
+  payload?: string;
+  observedAt: string;
+  cancelConfirmedAt?: string;
+  auditCommentedAt?: string;
+  readyAt?: string;
+  handledAt?: string;
+  lastError?: string;
 }
 
 function runsRoot(): string {
@@ -175,6 +188,7 @@ export function updateState(
       autoRetry: { count: 0 },
     };
     state.outbox ??= {};
+    state.restartCommands ??= {};
     state.autoRetry ??= { count: 0 };
     // nowy run tego samego ticketu = czysty przebieg (bramki starych runów nie mogą zatruwać guardów)
     if (state.runId !== seed.runId) {
@@ -265,6 +279,46 @@ export function pendingOutbox(ticketId: string): OutboxCommand[] {
   return Object.values(readState(ticketId)?.outbox ?? {}).filter((command) => command.state === "pending");
 }
 
+export function observeRestartCommand(
+  ticketId: string,
+  seed: { project: string; runId: string },
+  command: { commentId: string; payload?: string; observedAt: string }
+): RestartCommandRecord | undefined {
+  let saved: RestartCommandRecord | undefined;
+  updateState(ticketId, seed, (s) => {
+    s.restartCommands ??= {};
+    saved = s.restartCommands[command.commentId] ?? { ...command };
+    s.restartCommands[command.commentId] = saved;
+  });
+  return saved;
+}
+
+export function markRestartStep(
+  ticketId: string,
+  seed: { project: string; runId: string },
+  commentId: string,
+  step: "cancelConfirmedAt" | "auditCommentedAt" | "readyAt" | "handledAt"
+): void {
+  updateState(ticketId, seed, (s) => {
+    const record = s.restartCommands?.[commentId];
+    if (!record) return;
+    if (!record[step]) record[step] = new Date().toISOString();
+    record.lastError = undefined;
+  });
+}
+
+export function markRestartError(
+  ticketId: string,
+  seed: { project: string; runId: string },
+  commentId: string,
+  error: string
+): void {
+  updateState(ticketId, seed, (s) => {
+    const record = s.restartCommands?.[commentId];
+    if (record) record.lastError = error;
+  });
+}
+
 export function recordPhase(
   ticketId: string,
   seed: { project: string; runId: string },
@@ -333,7 +387,14 @@ export function markDecisionStep(
  * - budget / infra: nic nie mówi o jakości planu — reuse jak najbardziej,
  * - rejected: decyzja człowieka.
  */
-export type FailureReason = "plan-gate" | "verify" | "budget" | "infra" | "rejected";
+export type FailureReason =
+  | "plan-gate"
+  | "verify"
+  | "budget"
+  | "infra"
+  | "rejected"
+  | "lost-run"
+  | "restart";
 
 export function classifyFailure(message: string): FailureReason {
   if (/odrzucony przez człowieka|Plan odrzucony/i.test(message)) return "rejected";

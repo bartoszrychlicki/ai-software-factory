@@ -34,6 +34,15 @@ test("bramka ops przyjmuje ruch do Weryfikacji i ścisłą komendę /done", () =
   assert.deepEqual(parseCommand("/done"), { kind: "done", payload: undefined });
 });
 
+test("operator może wydać wyłącznie ścisłą komendę /restart", () => {
+  assert.deepEqual(parseCommand("/restart utracony run"), {
+    kind: "restart",
+    payload: "utracony run",
+  });
+  assert.equal(parseCommand("proszę /restart"), undefined);
+  assert.equal(parseCommand("/restartuj"), undefined);
+});
+
 test("walidator mapy stanów fail-closed wykrywa brak stanu checklisty", () => {
   const complete = [
     LINEAR_STATE_MAP.ready,

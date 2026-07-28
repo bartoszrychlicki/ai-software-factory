@@ -13,7 +13,8 @@
  * STEROWANIE = PRZEJŚCIA STANÓW (BAR-142): claim `Backlog → Todo`, aprobata
  * `👤 🚦 Plan do akceptacji → 🔨 Build`, odrzucenie `→ Backlog/Canceled/⛔`,
  * odpowiedzi `👤 ❓ Pytania → 🧠 Planowanie`. Furtka z telefonu: ścisłe komendy
- * `/approve`, `/reject <powód>`, `/answer <treść>`. Żaden regex na swobodnym
+ * `/approve`, `/reject <powód>`, `/answer <treść>`. Globalna komenda operatorska
+ * `/restart [powód]` unieważnia aktywny run i wymusza świeży plan. Żaden regex na swobodnym
  * tekście nie decyduje o przepływie — komentarze są wyłącznie danymi.
  *
  * Uruchomienie:  npx tsx src/sources/poll-linear.ts [--once]
@@ -42,7 +43,7 @@ import {
 } from "../pipeline/ops-checklist";
 import * as registry from "../pipeline/run-registry";
 import { LINEAR_STATE_MAP as MAP, decisionOfState, validateStateMap } from "./state-map";
-import { parseCommand, hintFor } from "./commands";
+import { parseCommand, hintFor, isDecisionCommand } from "./commands";
 import { parsePlanVerdict, resolveDomain } from "../pipeline/verdicts";
 import { allQualityCommands, QualityGateError, runQualityCommands } from "../pipeline/quality";
 import {
@@ -54,6 +55,7 @@ import {
   suspendedPath,
   type MastraRunSnapshot,
 } from "./mastra-client";
+import { MissingRunDetector, processRestartCommands } from "./run-recovery";
 
 const exec = promisify(execFile);
 
@@ -137,10 +139,12 @@ async function validateLinearStateMaps(): Promise<void> {
 
 async function main() {
   await validateLinearStateMaps();
+  await watchOperatorRestarts().catch((err) => console.error("Obsługa /restart nieudana:", err));
   await adoptOrphans().catch((err) => console.error("Adopcja sierot nieudana:", err));
 
   do {
     try {
+      await watchOperatorRestarts().catch((err) => console.error("Obsługa /restart nieudana:", err));
       if (!(await mastraClient.serverUp())) {
         console.error("API Mastry nie odpowiada — pomijam cykl (tickety poczekają w Todo)");
       } else {
@@ -301,11 +305,15 @@ async function watchRun(
   const seenArtifacts = new Set<string>(safeReaddir(runDir));
   const answeredRounds = new Set<number>(); // rundy pytań, dla których resume już poszedł
   const hintedRounds = new Set<number>(); // podpowiedź „jak zatwierdzić odpowiedzi" raz na rundę
+  const missingRun = new MissingRunDetector(3);
 
   try {
     while (Date.now() < deadline) {
       await sleep(RUN_WATCH_INTERVAL_MS);
       await notifyPhaseMilestones(project, src, id, runDir, seenArtifacts, ticketUrl);
+
+      const durable = registry.readState(id);
+      if (!durable || durable.runId !== runId || durable.lifecycle === "finalized") break;
 
       // Stan końcowy ustawiony przez człowieka jest nadrzędny. Bez tego Canceled
       // zatrzymywał tylko kartę, a kosztowny builder/reviewer pracował dalej.
@@ -323,8 +331,30 @@ async function watchRun(
       }
 
       await dispatchPendingOutbox(mastraClient, id, { project, runId });
-      const run = await mastraClient.getRun(runId).catch(() => undefined);
-      if (!run) continue; // serwer chwilowo w dole — czekamy, run w Mastrze nie znika
+      let run: MastraRunSnapshot;
+      try {
+        run = await mastraClient.getRun(runId);
+        missingRun.reset();
+      } catch (error) {
+        if (missingRun.observe(error)) {
+          registry.finalize(id, { project, runId }, "orphan", "lost-run");
+          await src.comment(
+            id,
+            `🧯 Run \`${runId}\` nie istnieje już w Mastrze ${marker(id)}. ` +
+              "Fabryka zatrzymała adopcję i zwolniła rezerwacje. Napisz `/restart [powód]`, " +
+              "aby uruchomić świeży run ze świeżym planem."
+          ).catch(() => {});
+          await setPhase(project, src, id, "blocked", runId);
+          notify(
+            `🧯 ${id}: run Mastry utracony`,
+            "Ticket zatrzymany bezpiecznie. Operator może użyć /restart w Linear.",
+            ticketUrl
+          ).catch(() => {});
+          console.error(`[${id}] run ${runId} nie istnieje w Mastrze — oczekiwanie na /restart`);
+          break;
+        }
+        continue; // timeout/transport: run może nadal istnieć, więc tylko ponawiamy odczyt
+      }
       acknowledgeOutboxFromRun(id, { project, runId }, run);
       const status = runStatus(run);
 
@@ -624,6 +654,19 @@ async function watchRun(
 }
 
 // --- adopcja sierot po restarcie pollera ----------------------------------
+
+async function watchOperatorRestarts(): Promise<void> {
+  for (const { project, src } of sources) {
+    await processRestartCommands({
+      project,
+      source: src,
+      client: mastraClient,
+      readyState: MAP.ready,
+      factoryMarker: marker,
+      log: (message) => console.log(message),
+    });
+  }
+}
 
 async function adoptOrphans() {
   // ŹRÓDŁO PRAWDY: rejestr runów (state.json). Deterministyczne, niezależne od
@@ -1025,7 +1068,8 @@ async function handleClarifySuspend(
  * REGUŁA (Bartosz 2026-07-22): istnieje zatwierdzony plan → reuse jest DOMYŚLNY.
  * Replan tylko z jawnego powodu: finał merytoryczny (verify FAIL po próbach /
  * bramka z pytaniami) albo odrzucenie planu przez człowieka. Zombie/budżet/
- * timeout/restart bez finału = reuse (nie generujemy planu bez powodu).
+ * timeout bez finału = reuse (nie generujemy planu bez powodu).
+ * Jawny `/restart` i utracony run zawsze wymuszają świeży plan.
  */
 async function findReusablePlan(src: LinearSource, id: string, description: string): Promise<string | undefined> {
   try {
@@ -1033,7 +1077,13 @@ async function findReusablePlan(src: LinearSource, id: string, description: stri
     // przyczyna z REJESTRU (deterministyczna); komentarze tylko dla runów sprzed migracji
     const prev = registry.readState(id)?.finalized;
     if (prev?.reason) {
-      if (prev.reason === "plan-gate" || prev.reason === "verify" || prev.reason === "rejected") return undefined;
+      if (
+        prev.reason === "plan-gate" ||
+        prev.reason === "verify" ||
+        prev.reason === "rejected" ||
+        prev.reason === "restart" ||
+        prev.reason === "lost-run"
+      ) return undefined;
     } else {
       const lastFinal = [...comments].reverse().find((c) =>
         c.body.includes(marker(id)) && (c.body.includes("🛑 BLOCKED") || c.body.includes("Run nieudany") || c.body.includes("Plan odrzucony")));
@@ -1133,7 +1183,10 @@ async function readCommandDecision(
   for (const c of comments) {
     if (c.createdAt <= sinceIso || c.body.includes(marker(id))) continue;
     const cmd = parseCommand(c.body);
-    if (cmd) return { decision: { kind: cmd.kind, payload: cmd.payload }, strayComment: false };
+    if (cmd && isDecisionCommand(cmd.kind)) {
+      return { decision: { kind: cmd.kind, payload: cmd.payload }, strayComment: false };
+    }
+    if (cmd?.kind === "restart") continue; // globalny watcher obsługuje tę komendę
     stray = true; // komentarz człowieka bez sygnału — payload dla decyzji ze stanu albo powód podpowiedzi
   }
   return { strayComment: stray };

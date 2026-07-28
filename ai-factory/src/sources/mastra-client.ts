@@ -18,6 +18,23 @@ export interface WorkflowControlClient {
   cancelRun(runId: string): Promise<void>;
 }
 
+export class MastraHttpError extends Error {
+  constructor(
+    public readonly status: number,
+    public readonly path: string,
+    public readonly responseBody: string
+  ) {
+    super(`Mastra HTTP ${status} ${path}: ${responseBody.slice(0, 1000)}`);
+    this.name = "MastraHttpError";
+  }
+}
+
+export function isWorkflowRunMissing(error: unknown): error is MastraHttpError {
+  return error instanceof MastraHttpError &&
+    error.status === 404 &&
+    /\/runs\//.test(error.path);
+}
+
 /**
  * Wersjoodporny klient HTTP Mastry.
  *
@@ -39,9 +56,7 @@ export class MastraWorkflowClient implements WorkflowControlClient {
       signal: AbortSignal.timeout(this.timeoutMs),
     });
     const text = await res.text();
-    if (!res.ok) {
-      throw new Error(`Mastra HTTP ${res.status} ${path}: ${text.slice(0, 1000)}`);
-    }
+    if (!res.ok) throw new MastraHttpError(res.status, path, text);
     if (!text.trim()) return undefined;
     try {
       return JSON.parse(text) as unknown;
