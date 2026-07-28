@@ -6,7 +6,12 @@ import { promisify } from "node:util";
 import { writeFile, readFile, mkdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createWorkspace, createCheckout, removeCheckout } from "./workspace";
+import {
+  checkpointWithinScope,
+  createWorkspace,
+  createCheckout,
+  removeCheckout,
+} from "./workspace";
 import { getProject, verifyBudgetMinutes } from "./projects";
 import { resolveRoute } from "./routing";
 import { saveArtifact, artifactHeader } from "./artifacts";
@@ -30,6 +35,13 @@ import { waitForGithubChecks } from "./github-ci";
 
 const exec = promisify(execFile);
 
+const commentMetaSchema = z.object({
+  totalRelevant: z.number().int().nonnegative(),
+  includedCount: z.number().int().nonnegative(),
+  truncated: z.boolean(),
+  effectiveInputHash: z.string(),
+});
+
 const ticketSchema = z.object({
   id: z.string(),
   title: z.string(),
@@ -47,6 +59,14 @@ const ticketSchema = z.object({
   labels: z.array(z.string()).optional(), // m.in. override engine:*
   /** Plan-reuse: zatwierdzony plan z poprzedniego runu (porażka infra/budżet) — pomija planner i bramkę. */
   reusePlan: z.string().optional(),
+  /** Snapshot komentarzy autora z chwili claimu — dane wejściowe planera, nie kanał sterowania. */
+  commentContext: z.string().optional(),
+  commentMeta: commentMetaSchema.optional(),
+  /** Raport verifiera/scope gate z poprzedniego runu — wejście do planu naprawczego. */
+  retryContext: z.string().optional(),
+  /** Ostatni commit poprzedniego buildera; używany tylko po ponownej walidacji scope. */
+  retryBaseSha: z.string().optional(),
+  retryRequiresChanges: z.boolean().optional(),
 });
 
 const intakeInputSchema = z.object({
@@ -56,6 +76,11 @@ const intakeInputSchema = z.object({
   project: z.string(),
   labels: z.array(z.string()).optional(),
   reusePlan: z.string().optional(),
+  commentContext: z.string().optional(),
+  commentMeta: commentMetaSchema.optional(),
+  retryContext: z.string().optional(),
+  retryBaseSha: z.string().optional(),
+  retryRequiresChanges: z.boolean().optional(),
 });
 
 const planOutputSchema = z.object({
@@ -84,6 +109,8 @@ const cycleSchema = z.object({
   feedback: z.string(), // strukturalny feedback dla NASTĘPNEJ próby buildera
   branch: z.string(),
   workspaceDir: z.string(),
+  /** Zatwierdzony checkpoint poprzedniej próby/runu. */
+  baseSha: z.string(),
   sha: z.string(),
   /** Dokładny SHA, który przeszedł pełne checks/e2e i acceptance verification. */
   verifiedSha: z.string(),
@@ -121,6 +148,7 @@ const PLAN_INSTRUCTIONS = [
   "Jeśli masz już odpowiedzi autora (sekcja poniżej ticketu) — potraktuj je jako wiążące decyzje i NIE zadawaj tych samych pytań ponownie.",
   "Jeśli stan opisany w tickecie JUŻ ISTNIEJE w kodzie (ticket spełniony): verdict \"blocked\" i wyjaśnienie w raporcie, BEZ pytań — nie planuj pustej pracy.",
   `W bloku factory wypełnij "files" KOMPLETNĄ listą plików, które ticket zmieni (ścieżki względem repo) — fabryka serializuje na ich podstawie równoległe tickety, więc pominięty plik grozi konfliktem merge'a.`,
+  "Przed zamknięciem factory.files prześledź zależności zmienianego zachowania: bezpośrednie callsite'y, adaptery, test harness, testy regresji i dokumentację kontraktu. Jeśli poprzedni verifier wskazał brakujący plik, uwzględnij go jawnie albo opisz, dlaczego poprawka pozostaje w obecnym zakresie.",
   `Ticket klasy ops/infra bez zmian w repo może zwrócić pustą listę "files" — checklista jest wynikiem, nie lista plików kodu.`,
   `Oraz "domain": frontend | backend | fullstack | ops — na podstawie zakresu zmian; od tego zależy dobór silnika buildu.`,
   "Jeśli ticket jest klasy ops/infra: checklista opisuje bezpieczne kroki, lokalizacje i oczekiwany stan końcowy — NIGDY nie wpisuj wartości sekretów (haseł, tokenów ani kluczy).",
@@ -128,7 +156,13 @@ const PLAN_INSTRUCTIONS = [
 ].join("\n");
 
 interface PlanPromptState {
-  ticket: { id: string; title: string; description: string };
+  ticket: {
+    id: string;
+    title: string;
+    description: string;
+    commentContext?: string;
+    retryContext?: string;
+  };
   clarifyRound: number;
   answers: readonly string[];
   sessionId?: string;
@@ -159,9 +193,17 @@ export function buildPlanEnginePrompt(input: PlanPromptState): {
     ? "\n\n# Odpowiedzi autora ticketu na Twoje wcześniejsze pytania\n" +
       input.answers.map((answer, index) => `\n## Runda ${index + 1}\n${answer}`).join("\n")
     : "";
+  const commentBlock = input.ticket.commentContext
+    ? `\n\n${input.ticket.commentContext}`
+    : "";
+  const retryBlock = input.ticket.retryContext
+    ? `\n\n${input.ticket.retryContext}`
+    : "";
   return {
     instructions: PLAN_INSTRUCTIONS,
-    context: `# Ticket ${input.ticket.id}: ${input.ticket.title}\n\n${input.ticket.description}${answersBlock}`,
+    context:
+      `# Ticket ${input.ticket.id}: ${input.ticket.title}\n\n${input.ticket.description}` +
+      `${commentBlock}${retryBlock}${answersBlock}`,
     resumed: false,
   };
 }
@@ -171,8 +213,19 @@ const intakeStep = createStep({
   description: "Intake: rozwiązanie projektu z rejestru (deterministyczny kod)",
   inputSchema: intakeInputSchema,
   outputSchema: ticketSchema,
-  execute: async ({ inputData }) => {
+  execute: async ({ inputData, runId }) => {
     const project = await getProject(inputData.project);
+    await saveArtifact(
+      inputData.id,
+      runId,
+      "intake-context.json",
+      JSON.stringify({
+        commentMeta: inputData.commentMeta ?? null,
+        hasRetryContext: !!inputData.retryContext,
+        retryBaseSha: inputData.retryBaseSha ?? null,
+        capturedAt: new Date().toISOString(),
+      }, null, 2)
+    );
     return {
       id: inputData.id,
       title: inputData.title,
@@ -188,6 +241,11 @@ const intakeStep = createStep({
       e2e: project.qa?.e2e,
       labels: inputData.labels,
       reusePlan: inputData.reusePlan,
+      commentContext: inputData.commentContext,
+      commentMeta: inputData.commentMeta,
+      retryContext: inputData.retryContext,
+      retryBaseSha: inputData.retryBaseSha,
+      retryRequiresChanges: inputData.retryRequiresChanges,
     };
   },
 });
@@ -392,7 +450,8 @@ const approvePlanStep = createStep({
       if (inputData.ticket.reusePlan) {
         await saveArtifact(inputData.ticket.id, runId, "approval.json",
           JSON.stringify({ approved: true, reused: true, at: new Date().toISOString(),
-            descriptionHash: createHash("sha256").update(inputData.ticket.description).digest("hex") }, null, 2));
+            descriptionHash: createHash("sha256").update(inputData.ticket.description).digest("hex"),
+            effectiveInputHash: inputData.ticket.commentMeta?.effectiveInputHash }, null, 2));
         return inputData;
       }
       await suspend({ plan: inputData.plan });
@@ -404,7 +463,8 @@ const approvePlanStep = createStep({
       "approval.json",
       JSON.stringify({ approved: resumeData.approved, feedback: resumeData.feedback ?? null, at: new Date().toISOString(),
         // edycja ticketu po aprobacie unieważnia reuse (hash porównywany przy claimie)
-        descriptionHash: createHash("sha256").update(inputData.ticket.description).digest("hex") }, null, 2)
+        descriptionHash: createHash("sha256").update(inputData.ticket.description).digest("hex"),
+        effectiveInputHash: inputData.ticket.commentMeta?.effectiveInputHash }, null, 2)
     );
     if (!resumeData.approved) {
       throw new Error(`Plan odrzucony przez człowieka: ${resumeData.feedback ?? "bez uzasadnienia"}`);
@@ -459,6 +519,7 @@ const initCycleStep = createStep({
     feedback: "",
     branch: "",
     workspaceDir: "",
+    baseSha: inputData.ticket.retryBaseSha ?? "",
     sha: "",
     verifiedSha: "",
     changedFiles: [],
@@ -486,13 +547,38 @@ const buildStep = createStep({
       .replace(/[^a-z0-9]+/g, "-")
       .replace(/^-+|-+$/g, "")
       .slice(0, 30);
-    // świeży worktree per próba — retry to nowa próba, nie grzebanie w brudzie
+    const declaredFiles = parsePlanVerdict(plan).files;
+    // Worktree jest świeży, ale może startować z ostatniego commita kandydata.
+    // Checkpoint przechodzi dalej wyłącznie, jeśli CAŁY jego diff mieści się w
+    // obecnie zatwierdzonym factory.files.
     const project = await getProject(ticket.project).catch(() => undefined);
-    const ws = await createWorkspace(ticket.repoPath, ticket.id, slug, project?.default_branch ?? "main");
+    const defaultBranch = project?.default_branch ?? "main";
+    const checkpointCandidate = inputData.sha || inputData.baseSha || undefined;
+    const checkpoint = await checkpointWithinScope(
+      ticket.repoPath,
+      checkpointCandidate,
+      declaredFiles,
+      defaultBranch
+    );
+    const ws = await createWorkspace(
+      ticket.repoPath,
+      ticket.id,
+      slug,
+      defaultBranch,
+      checkpoint
+    );
 
     // clip: raporty błędów bywają ogromne (echo komend) — nieprzycięte rozdęły prompt próby 2 do spawn E2BIG (BAR-91)
     const feedbackBlock = inputData.feedback
       ? `\n\n# FEEDBACK Z ODRZUCONEJ PRÓBY #${inputData.attempt}\nPoprzednia implementacja została odrzucona. Napraw wskazane problemy:\n${inputData.feedback.slice(0, 12_000)}`
+      : "";
+    const checkpointBlock = checkpoint
+      ? `\n\n# CHECKPOINT POPRZEDNIEJ PRÓBY\nWorkspace zawiera już zatwierdzony commit ${checkpoint}. Zachowaj poprawne zmiany i wykonaj tylko brakujące poprawki.`
+      : checkpointCandidate
+        ? "\n\n# CHECKPOINT ODRZUCONY\nPoprzedni commit wykracza poza obecny factory.files albo nie istnieje. Implementujesz bezpiecznie od świeżego maina."
+        : "";
+    const retryBlock = ticket.retryContext
+      ? `\n\n${ticket.retryContext}`
       : "";
 
     const route = await resolveRoute("build", ticket, ticketDomain(ticket, inputData.plan));
@@ -507,6 +593,44 @@ const buildStep = createStep({
     const t0 = Date.now();
     const buildMetric = (ok: boolean, outcome: string, costUsd?: number) =>
       recordMetric({ ticket: ticket.id, runId, stage: "build", engine: route.spec, attempt, ok, outcome, costUsd, durationMs: Date.now() - t0 });
+    if (
+      checkpoint &&
+      !ticket.retryRequiresChanges &&
+      !inputData.feedback &&
+      attempt === 1
+    ) {
+      const { stdout } = await exec(
+        "git",
+        ["-C", ws.dir, "diff", "--name-only", "-z", `origin/${defaultBranch}...HEAD`],
+        { maxBuffer: 10 * 1024 * 1024 }
+      );
+      const changedFiles = stdout.split("\0").filter(Boolean);
+      await buildMetric(true, "checkpoint-reused", 0);
+      await saveBuild(
+        {
+          engine: "deterministic/checkpoint",
+          costUsd: 0,
+          outcome: "checkpoint-reused",
+          sha: checkpoint,
+          files: changedFiles.join(", "),
+        },
+        "Poprzedni commit buildera mieści się w aktualnym factory.files. Pominięto ponowny build; SHA przechodzi pełny verify."
+      );
+      return {
+        ...inputData,
+        attempt,
+        verdict: "pending" as const,
+        feedback: "",
+        branch: ws.branch,
+        workspaceDir: ws.dir,
+        baseSha: checkpoint,
+        sha: checkpoint,
+        verifiedSha: "",
+        changedFiles,
+        buildReport: "Bez zmian: bezpiecznie wznowiono zatwierdzony checkpoint poprzedniego runu.",
+        buildSignatureLine: signatureLine(signature),
+      };
+    }
     const result = await route.engine.run({
       role: "build",
       model: route.model,
@@ -517,7 +641,9 @@ const buildStep = createStep({
         "NIE commituj zmian — commit wykonuje fabryka.",
         "Na końcu wypisz raport: co zmieniłeś i jak to zweryfikować.",
       ].join("\n"),
-      context: `# Ticket ${ticket.id}: ${ticket.title}\n\n${ticket.description}\n\n# Plan\n\n${plan}${feedbackBlock}`,
+      context:
+        `# Ticket ${ticket.id}: ${ticket.title}\n\n${ticket.description}` +
+        `\n\n# Plan\n\n${plan}${retryBlock}${feedbackBlock}${checkpointBlock}`,
       workspace: ws.dir,
       // 15 min ubiło Sol@xhigh na BAR-91 (Krok 0 + duża implementacja) — premium modele na złożonych ticketach potrzebują więcej
       budget: { minutes: 25 },
@@ -547,7 +673,6 @@ const buildStep = createStep({
       };
     }
 
-    const declaredFiles = parsePlanVerdict(plan).files;
     const undeclared = undeclaredChangedFiles(declaredFiles, changedFiles);
     if (undeclared.length) {
       await buildMetric(false, "scope-violation", result.costUsd);
@@ -582,6 +707,7 @@ const buildStep = createStep({
       feedback: "",
       branch: ws.branch,
       workspaceDir: ws.dir,
+      baseSha: checkpoint ?? inputData.baseSha,
       sha: sha.trim(),
       verifiedSha: "",
       changedFiles,
