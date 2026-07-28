@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { chmod, mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -26,7 +26,10 @@ import { parseCommand } from "../sources/commands";
 import {
   applyDecision,
   dispatchOutbox,
+  ensureSingleWriter,
   localExactShaCiResult,
+  maybeBackupLifecycleDb,
+  pollOnce,
   reconcileRun,
   type PollerDependencies,
 } from "../sources/poll-linear-v2";
@@ -811,6 +814,175 @@ test("outbox: transient dostaje backoff, dead-letter zawsze powiadamia", async (
     assert.ok(notifications.some(({ title }) => title.includes("dead-letter")));
     // linear-comment nie jest lifecycle-critical: run nie może być zablokowany.
     assert.notEqual(store.getRun("BAR-D1")!.status, "blocked");
+  } finally {
+    store.close();
+    if (previousRoot === undefined) delete process.env.FACTORY_ROOT;
+    else process.env.FACTORY_ROOT = previousRoot;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+async function eventually(check: () => Promise<boolean> | boolean, timeoutMs = 3000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await check()) return;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.fail("warunek nie został spełniony w czasie");
+}
+
+test("backupTo tworzy spójną kopię na żywo, a usageSince liczy koszt godzinowy", async () => {
+  const root = await mkdtemp(join(tmpdir(), "factory-backup-"));
+  const store = new LifecycleStore(join(root, "registry.db"));
+  try {
+    store.createRun("BAR-K1", "harness", manifest);
+    store.startAttempt("BAR-K1", "plan", 1, "job-k1");
+    store.finishAttempt("BAR-K1", "plan", 1, {
+      status: "success", outcome: "ok", costUsd: 2.5, durationMs: 1000,
+    });
+    const hourAgo = new Date(Date.now() - 60 * 60_000).toISOString();
+    assert.equal(store.usageSince(hourAgo), 2.5);
+    assert.equal(store.usageSince(new Date(Date.now() + 60_000).toISOString()), 0);
+
+    const backupPath = join(root, "backups", "lifecycle-copy.db");
+    store.backupTo(backupPath);
+    const copy = new LifecycleStore(backupPath);
+    try {
+      assert.equal(copy.getRun("BAR-K1")?.ticketId, "BAR-K1");
+      assert.equal(copy.latestAttempt("BAR-K1", "plan")?.costUsd, 2.5);
+    } finally {
+      copy.close();
+    }
+
+    // maybeBackupLifecycleDb: pierwszy przebieg tworzy plik, drugi w tym samym dniu nie.
+    const dir = join(root, "auto-backups");
+    maybeBackupLifecycleDb(store, dir);
+    maybeBackupLifecycleDb(store, dir);
+    const { readdirSync } = await import("node:fs");
+    assert.equal(readdirSync(dir).filter((name) => name.endsWith(".db")).length, 1);
+  } finally {
+    store.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("single-writer lease: żywy cudzy poller blokuje start, martwy jest przejmowany", async () => {
+  const root = await mkdtemp(join(tmpdir(), "factory-lease-"));
+  const store = new LifecycleStore(join(root, "registry.db"));
+  try {
+    ensureSingleWriter(store, 11111, () => true);
+    assert.equal(store.readLease()?.pid, 11111);
+
+    assert.throws(
+      () => ensureSingleWriter(store, 22222, () => true),
+      /PID 11111/
+    );
+    // Ten sam PID może odnowić własny lease.
+    ensureSingleWriter(store, 11111, () => true);
+    // Martwy właściciel jest przejmowany mimo świeżego heartbeatu.
+    ensureSingleWriter(store, 22222, () => false);
+    assert.equal(store.readLease()?.pid, 22222);
+
+    store.renewLease(22222);
+    store.releaseLease(11111); // zły PID nie zwalnia
+    assert.equal(store.readLease()?.pid, 22222);
+    store.releaseLease(22222);
+    assert.equal(store.readLease(), undefined);
+  } finally {
+    store.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("otwarty circuit breaker zatrzymuje claim nowych ticketów i powiadamia raz", async () => {
+  const root = await mkdtemp(join(tmpdir(), "factory-breaker-"));
+  const previousRoot = process.env.FACTORY_ROOT;
+  const store = new LifecycleStore(join(root, "registry.db"));
+  const notifications: string[] = [];
+  let listReadyCalls = 0;
+  try {
+    await writeHarnessFixture(root);
+    await mkdir(join(root, "runs"), { recursive: true });
+    await writeFile(join(root, "runs", "circuit-breaker.json"), JSON.stringify({
+      openedAt: new Date().toISOString(),
+      reason: "3 nieudane runy z rzędu",
+      failStreak: 3,
+    }));
+    process.env.FACTORY_ROOT = root;
+    const source = {
+      async listReady() { listReadyCalls += 1; return []; },
+      async listStateNames() { return []; },
+    };
+    const deps: PollerDependencies = {
+      store,
+      mastra: {} as unknown as PollerDependencies["mastra"],
+      sources: new Map([["harness", source as never]]),
+      notifier: async (title) => { notifications.push(title); },
+    };
+    await pollOnce(deps);
+    await pollOnce(deps);
+    assert.equal(listReadyCalls, 0);
+    assert.equal(notifications.filter((title) => title.includes("Circuit breaker")).length, 1);
+  } finally {
+    store.close();
+    if (previousRoot === undefined) delete process.env.FACTORY_ROOT;
+    else process.env.FACTORY_ROOT = previousRoot;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("porażka fabryki nabija serię breakera, decyzja człowieka nie", async () => {
+  const root = await mkdtemp(join(tmpdir(), "factory-streak-"));
+  const previousRoot = process.env.FACTORY_ROOT;
+  const store = new LifecycleStore(join(root, "registry.db"));
+  const breakerFile = join(root, "runs", "circuit-breaker.json");
+  const failedPlan: FactoryJobOutput = {
+    kind: "plan",
+    outcome: "failed",
+    report: "engine down",
+    errorCode: "PLAN_ENGINE_FAILED",
+    signature: "sig",
+    durationMs: 1,
+    files: [],
+    changedFiles: [],
+    scopeWarnings: [],
+  };
+  try {
+    await writeHarnessFixture(root);
+    process.env.FACTORY_ROOT = root;
+    const deps: PollerDependencies = {
+      store,
+      mastra: {} as unknown as PollerDependencies["mastra"],
+      sources: new Map(),
+      notifier: async () => {},
+    };
+    const run = store.createRun("BAR-CB1", "harness", manifest);
+    applyDecision(deps, run.ticketId, reduceLifecycle(run, { type: "start" }));
+    applyDecision(deps, run.ticketId, reduceLifecycle(store.getRun("BAR-CB1")!, {
+      type: "job-finished", attempt: 1, output: failedPlan,
+    }));
+    await eventually(async () => {
+      try {
+        return (JSON.parse(await readFile(breakerFile, "utf8")) as { failStreak: number }).failStreak === 1;
+      } catch {
+        return false;
+      }
+    });
+
+    // PLAN_REJECTED (decyzja człowieka) nie zwiększa serii.
+    const run2 = store.createRun("BAR-CB2", "harness", manifest);
+    applyDecision(deps, run2.ticketId, reduceLifecycle(run2, { type: "start" }));
+    applyDecision(deps, run2.ticketId, reduceLifecycle(store.getRun("BAR-CB2")!, {
+      type: "job-finished", attempt: 1, output: planOutput,
+    }));
+    applyDecision(deps, run2.ticketId, reduceLifecycle(store.getRun("BAR-CB2")!, {
+      type: "reject", commentId: "c-rej", reason: "nie teraz",
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(
+      (JSON.parse(await readFile(breakerFile, "utf8")) as { failStreak: number }).failStreak,
+      1
+    );
   } finally {
     store.close();
     if (previousRoot === undefined) delete process.env.FACTORY_ROOT;

@@ -5,7 +5,8 @@
  * GitHub, merge i smoke żyją tutaj i w SQLite, bez workflow resume.
  */
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, statSync, unlinkSync } from "node:fs";
+import { hostname } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { buildCommentContextSnapshot } from "./comment-context";
@@ -38,7 +39,8 @@ import {
   maxDispatchAttempts,
 } from "../pipeline/retry-policy";
 import { runPreflight } from "../pipeline/preflight";
-import { getProject } from "../pipeline/projects";
+import { breakerOpen, checkHourlySpend, recordRunOutcome } from "../pipeline/breaker";
+import { findUpFile, getProject } from "../pipeline/projects";
 import {
   allQualityCommands,
   cleanExecutionEnv,
@@ -127,7 +129,29 @@ export function applyDecision(
     acknowledgeCommandKey,
   });
   emitTransitionNotification(deps, current, updated, decision.transition.reason);
+  recordBreakerOutcome(current, updated);
   return updated;
+}
+
+/** Decyzje człowieka nie nabijają serii breakera — tylko realne porażki fabryki. */
+const HUMAN_CAUSED_BLOCKS = new Set([
+  "PLAN_REJECTED",
+  "CANCELED",
+  "PREMATURE_DONE",
+  "INPUT_CHANGED_AFTER_BUILD",
+  "PLAN_MAX_QUESTIONS",
+]);
+
+function recordBreakerOutcome(before: LifecycleRun, after: LifecycleRun): void {
+  if (before.status !== "blocked" && after.status === "blocked") {
+    if (!HUMAN_CAUSED_BLOCKS.has(after.errorCode ?? "")) {
+      void recordRunOutcome(false).catch(() => {});
+    }
+    return;
+  }
+  if (before.status !== "done" && after.status === "done" && after.errorCode !== "CANCELED") {
+    void recordRunOutcome(true).catch(() => {});
+  }
 }
 
 /**
@@ -984,7 +1008,24 @@ export async function reconcileRun(deps: PollerDependencies, run: LifecycleRun):
   else if (current.prUrl) await reconcilePullRequest(deps, current);
 }
 
+let reportedBreaker: string | undefined;
+
 async function claimReady(deps: PollerDependencies): Promise<void> {
+  // Circuit breaker: seria porażek albo koszt/h zatrzymują CLAIM nowych
+  // ticketów; aktywne runy reconcilują się dalej (semantyka v1).
+  const hourAgo = new Date(Date.now() - 60 * 60_000).toISOString();
+  await checkHourlySpend(deps.store.usageSince(hourAgo)).catch(() => {});
+  const open = await breakerOpen().catch(() => null);
+  if (open) {
+    if (reportedBreaker !== open) {
+      console.error(`Circuit breaker otwarty: ${open}`);
+      const notifier = deps.notifier ?? notify;
+      await notifier("🔌 Circuit breaker otwarty", open).catch(() => {});
+      reportedBreaker = open;
+    }
+    return;
+  }
+  reportedBreaker = undefined;
   for (const [projectKey, source] of deps.sources) {
     const preflight = await runPreflight(projectKey, {
       linearStateNames: () => source.listStateNames(),
@@ -1041,6 +1082,63 @@ export async function pollOnce(deps: PollerDependencies): Promise<void> {
   await dispatchOutbox(deps);
 }
 
+/**
+ * Backup lifecycle.db: najwyżej raz na 24 h, retencja FACTORY_BACKUP_KEEP
+ * najnowszych kopii. Błąd backupu nigdy nie zatrzymuje pętli pollera.
+ */
+export function maybeBackupLifecycleDb(
+  store: LifecycleStore,
+  dir = join(dirname(findUpFile("package.json")), "runs", "backups")
+): void {
+  try {
+    mkdirSync(dir, { recursive: true });
+    const listBackups = () => readdirSync(dir)
+      .filter((name) => name.startsWith("lifecycle-") && name.endsWith(".db"))
+      .sort();
+    const newest = listBackups().at(-1);
+    const ageMs = newest
+      ? Date.now() - statSync(join(dir, newest)).mtimeMs
+      : Number.POSITIVE_INFINITY;
+    if (ageMs < 24 * 60 * 60_000) return;
+    const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\..+$/, "").replace("T", "-");
+    store.backupTo(join(dir, `lifecycle-${stamp}.db`));
+    const keep = Math.max(1, Number(process.env.FACTORY_BACKUP_KEEP ?? 7));
+    const backups = listBackups();
+    for (const stale of backups.slice(0, Math.max(0, backups.length - keep))) {
+      unlinkSync(join(dir, stale));
+    }
+  } catch (error) {
+    console.error("Backup lifecycle.db nieudany:", error instanceof Error ? error.message : error);
+  }
+}
+
+/**
+ * Single-writer lease: drugi poller (np. ręczny `--once` obok usługi launchd)
+ * nie może pisać do tej samej bazy — obie instancje zdispatchowałyby te same
+ * komendy outboxu. Martwy PID albo przeterminowany heartbeat można przejąć.
+ */
+export function ensureSingleWriter(
+  store: LifecycleStore,
+  pid = process.pid,
+  isAlive: (pid: number) => boolean = (candidate) => {
+    try {
+      process.kill(candidate, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+): void {
+  const lease = store.readLease();
+  const fresh = lease && Date.now() - Date.parse(lease.heartbeatAt) < 90_000;
+  if (lease && lease.pid !== pid && fresh && isAlive(lease.pid)) {
+    throw new Error(
+      `Inny poller (PID ${lease.pid}, ${lease.hostname ?? "?"}) trzyma lease na lifecycle.db — zatrzymaj go przed startem.`
+    );
+  }
+  store.claimLease(pid, hostname());
+}
+
 function loadDotEnv(): void {
   try {
     const path = join(dirname(fileURLToPath(import.meta.url)), "..", "..", ".env");
@@ -1064,14 +1162,27 @@ async function main(): Promise<void> {
     mastra: new MastraWorkflowClient(process.env.FACTORY_API ?? "http://localhost:4111/api", "factoryJob"),
     sources: new Map(projects.map((project) => [project, new LinearSource(apiKey, project)])),
   };
+  ensureSingleWriter(deps.store);
+  const release = () => {
+    try {
+      deps.store.releaseLease(process.pid);
+      deps.store.close();
+    } catch {
+      // zamknięcie w trakcie zamykania — nic do zrobienia
+    }
+  };
+  process.once("SIGINT", () => { release(); process.exit(130); });
+  process.once("SIGTERM", () => { release(); process.exit(143); });
   const once = process.argv.includes("--once");
   do {
+    deps.store.renewLease(process.pid);
+    maybeBackupLifecycleDb(deps.store);
     await pollOnce(deps).catch((error) =>
       console.error("Poll v2 nieudany:", error instanceof Error ? error.message : error)
     );
     if (!once) await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
   } while (!once);
-  deps.store.close();
+  release();
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

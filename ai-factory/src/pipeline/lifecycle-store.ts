@@ -250,6 +250,13 @@ export class LifecycleStore {
         processed_at TEXT NOT NULL,
         FOREIGN KEY(ticket_id) REFERENCES lifecycle_runs(ticket_id)
       );
+
+      CREATE TABLE IF NOT EXISTS lifecycle_lease (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        pid INTEGER NOT NULL,
+        hostname TEXT,
+        heartbeat_at TEXT NOT NULL
+      );
     `);
     const attemptColumns = this.db.prepare("PRAGMA table_info(lifecycle_stage_attempts)").all() as {
       name: string;
@@ -590,6 +597,52 @@ export class LifecycleStore {
       FROM lifecycle_stage_attempts WHERE ticket_id=? AND stage=?
     `).get(ticketId, stage) as { value: number };
     return Number(row.value) + 1;
+  }
+
+  /** Suma kosztów (ekwiwalent API) zakończonych prób od podanego ISO — druga przesłanka breakera. */
+  usageSince(iso: string): number {
+    const row = this.db.prepare(`
+      SELECT COALESCE(SUM(cost_usd), 0) AS usd
+      FROM lifecycle_stage_attempts WHERE finished_at >= ?
+    `).get(iso) as { usd: number };
+    return Number(row.usd);
+  }
+
+  /**
+   * Atomowa kopia bazy na żywo: checkpoint WAL + VACUUM INTO. Ścieżka docelowa
+   * nie może istnieć (SQLite odmówi nadpisania istniejącego pliku).
+   */
+  backupTo(path: string): void {
+    mkdirSync(dirname(path), { recursive: true });
+    this.db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    this.db.exec(`VACUUM INTO '${path.replace(/'/g, "''")}'`);
+  }
+
+  readLease(): { pid: number; hostname?: string; heartbeatAt: string } | undefined {
+    const row = this.db.prepare("SELECT * FROM lifecycle_lease WHERE id = 1").get() as
+      Record<string, unknown> | undefined;
+    if (!row) return undefined;
+    return {
+      pid: Number(row.pid),
+      hostname: row.hostname == null ? undefined : String(row.hostname),
+      heartbeatAt: String(row.heartbeat_at),
+    };
+  }
+
+  claimLease(pid: number, hostname?: string): void {
+    this.db.prepare(`
+      INSERT INTO lifecycle_lease (id, pid, hostname, heartbeat_at) VALUES (1, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        pid=excluded.pid, hostname=excluded.hostname, heartbeat_at=excluded.heartbeat_at
+    `).run(pid, hostname ?? null, now());
+  }
+
+  renewLease(pid: number): void {
+    this.db.prepare("UPDATE lifecycle_lease SET heartbeat_at=? WHERE id=1 AND pid=?").run(now(), pid);
+  }
+
+  releaseLease(pid: number): void {
+    this.db.prepare("DELETE FROM lifecycle_lease WHERE id=1 AND pid=?").run(pid);
   }
 
   totalUsage(ticketId: string): { usd: number; minutes: number } {
