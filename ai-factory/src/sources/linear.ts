@@ -1,5 +1,10 @@
 import type { FactoryStatus, Ticket, TicketSource } from "./types";
 import { LINEAR_STATE_MAP } from "./state-map";
+import {
+  POLLER_SIGNATURE,
+  signatureFooter,
+  type ActionSignature,
+} from "../pipeline/signature";
 
 const API = "https://api.linear.app/graphql";
 
@@ -196,11 +201,15 @@ export class LinearSource implements TicketSource {
     return data.issue.comments.nodes.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
   }
 
-  async comment(id: string, body: string): Promise<void> {
+  async comment(
+    id: string,
+    body: string,
+    signature: ActionSignature = POLLER_SIGNATURE
+  ): Promise<void> {
     const issue = await this.fetchIssue(id);
     await this.gql(
       `mutation($input: CommentCreateInput!) { commentCreate(input: $input) { success } }`,
-      { input: { issueId: issue.id, body } }
+      { input: { issueId: issue.id, body: body + signatureFooter(signature) } }
     );
   }
 

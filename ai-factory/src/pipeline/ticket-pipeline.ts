@@ -15,7 +15,13 @@ import {
 import { getProject, verifyBudgetMinutes } from "./projects";
 import { resolveRoute } from "./routing";
 import { saveArtifact, artifactHeader } from "./artifacts";
-import { buildSignature, signatureLine, signatureMeta, signatureTrailer } from "./signature";
+import {
+  buildSignature,
+  signatureLine,
+  signatureMeta,
+  signatureTrailer,
+  type ActionSignature,
+} from "./signature";
 import { takeScreenshot } from "./screenshot";
 import { recordMetric } from "./metrics";
 import { budgetExceeded } from "./budget";
@@ -262,6 +268,12 @@ const planCycleSchema = z.object({
   maxClarifyRounds: z.number(),
   answers: z.array(z.string()),
   sessionId: z.string().optional(),
+  planSignature: z.object({
+    agent: z.string(),
+    harness: z.string(),
+    model: z.string(),
+    profile: z.string(),
+  }).optional(),
 });
 
 const initPlanCycleStep = createStep({
@@ -276,6 +288,7 @@ const initPlanCycleStep = createStep({
     maxClarifyRounds: 2,
     answers: [],
     sessionId: undefined,
+    planSignature: undefined,
   }),
 });
 
@@ -298,7 +311,7 @@ const planStep = createStep({
       await recordMetric({ ticket: ticket.id, runId, stage: "plan", engine: "reuse", ok: true, outcome: "reused", costUsd: 0, durationMs: 0, resumed: false });
       await saveArtifact(ticket.id, runId, "plan.md",
         artifactHeader({ step: "plan", ...signatureMeta(signature), engine: "reuse", reused: "true", resumed: "false" }) + ticket.reusePlan);
-      return { ...inputData, plan: ticket.reusePlan };
+      return { ...inputData, plan: ticket.reusePlan, planSignature: signature };
     }
     // plan już OK (wejście kolejnej iteracji) — nie przeplanowujemy
     if (inputData.plan && parsePlanVerdict(inputData.plan).ok) return inputData;
@@ -366,9 +379,22 @@ const planStep = createStep({
       plan: result.transcript ?? result.report,
       planCostUsd: (inputData.planCostUsd ?? 0) + (totalCostUsd ?? 0),
       sessionId: result.sessionId ?? (resumeFallback ? undefined : inputData.sessionId),
+      planSignature: signature,
     };
   },
 });
+
+export function questionsArtifactMarkdown(
+  round: number,
+  questions: string,
+  signature?: ActionSignature
+): string {
+  return artifactHeader({
+    step: "clarify",
+    round,
+    ...(signature ? signatureMeta(signature) : {}),
+  }) + questions;
+}
 
 const clarifyGateStep = createStep({
   id: "clarify-ticket",
@@ -385,7 +411,11 @@ const clarifyGateStep = createStep({
     if (!questions || inputData.clarifyRound >= inputData.maxClarifyRounds) return inputData;
     if (!resumeData) {
       await saveArtifact(inputData.ticket.id, runId, `questions-round-${inputData.clarifyRound + 1}.md`,
-        artifactHeader({ step: "clarify", round: inputData.clarifyRound + 1 }) + questions);
+        questionsArtifactMarkdown(
+          inputData.clarifyRound + 1,
+          questions,
+          inputData.planSignature as ActionSignature | undefined
+        ));
       await suspend({ questions });
       return inputData;
     }
