@@ -10,31 +10,48 @@ import { execFileControlled } from "../pipeline/process-control";
 const CODEX_BIN = process.env.CODEX_BIN ?? "codex";
 
 /**
- * Ostatni event `token_count` ze strumienia `codex exec --json` — jedyne
- * źródło zużycia tokenów; codex nie raportuje kosztu wprost.
+ * Zużycie tokenów ze strumienia `codex exec --json` — jedyne źródło; codex
+ * nie raportuje kosztu wprost. Obsługiwane kształty eventów:
+ *  - `turn.completed` z per-turnowym `usage` (codex-cli ≥0.145, zweryfikowane
+ *    2026-07-29) — sumujemy po turach,
+ *  - `token_count` z kumulatywnym `info.total_token_usage` (starszy strumień
+ *    protokołowy) — bierzemy ostatni.
  */
 export function extractTokenUsage(stdout: string): TokenUsage | undefined {
-  let usage: TokenUsage | undefined;
+  let cumulative: TokenUsage | undefined;
+  let summed: TokenUsage | undefined;
+  const addTurn = (usage: TokenUsage) => {
+    summed = {
+      input_tokens: (summed?.input_tokens ?? 0) + (usage.input_tokens ?? 0),
+      cached_input_tokens: (summed?.cached_input_tokens ?? 0) + (usage.cached_input_tokens ?? 0),
+      output_tokens: (summed?.output_tokens ?? 0) + (usage.output_tokens ?? 0),
+    };
+  };
   for (const line of stdout.split("\n")) {
     const trimmed = line.trim();
     if (!trimmed.startsWith("{")) continue;
     try {
       const event = JSON.parse(trimmed) as {
         type?: string;
+        usage?: TokenUsage;
         info?: { total_token_usage?: TokenUsage };
         msg?: { type?: string; info?: { total_token_usage?: TokenUsage } };
       };
+      if (event.type === "turn.completed" && event.usage) {
+        addTurn(event.usage);
+        continue;
+      }
       const total = event.type === "token_count"
         ? event.info?.total_token_usage
         : event.msg?.type === "token_count"
           ? event.msg.info?.total_token_usage
           : undefined;
-      if (total) usage = total;
+      if (total) cumulative = total;
     } catch {
       // linia nie-JSON (np. banner CLI)
     }
   }
-  return usage;
+  return cumulative ?? summed;
 }
 
 export const codex: EngineAdapter = {
