@@ -24,7 +24,7 @@ function lastPosition(fragment: string): number {
 
 test("instalator nie regeneruje bundle'a pod działającym serwerem", () => {
   const freezePoller = position('bootout_agent "$POLLER_SERVICE"');
-  const snapshotRuns = position('UNFINISHED="$(find_unfinished_runs)"');
+  const snapshotRuns = position('BLOCKING="$(find_blocking_runs)"');
   const stopServer = position('bootout_agent "$SERVER_SERVICE"');
   const build = position('"$FACTORY_NPM_BIN" run build');
   const validateBundle = position('for artifact in index.mjs mastra.mjs tools.mjs studio/index.html');
@@ -39,6 +39,19 @@ test("instalator nie regeneruje bundle'a pod działającym serwerem", () => {
   assert.ok(validateBundle < startServer);
   assert.ok(startServer < healthStudio);
   assert.ok(healthStudio < startPoller);
+});
+
+test("instalator przepuszcza trwałe human gate, ale blokuje aktywne wykonanie", () => {
+  assert.match(
+    script,
+    /s\.lifecycle!=="finalized" && s\.lifecycle!=="awaiting_decision"/,
+  );
+  assert.match(
+    script,
+    /if\(s\.lifecycle==="awaiting_decision"\) ids\.push\(ticket\)/,
+  );
+  assert.ok(position('BLOCKING="$(find_blocking_runs)"') < position('bootout_agent "$SERVER_SERVICE"'));
+  assert.ok(position('SUSPENDED="$(find_suspended_runs)"') < position('bootout_agent "$SERVER_SERVICE"'));
 });
 
 test("nieudany bootstrap nie akceptuje starego joba jako sukcesu", () => {
