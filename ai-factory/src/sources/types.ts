@@ -1,3 +1,5 @@
+import type { ActionSignature } from "../pipeline/signature";
+
 export type FactoryStatus =
   | "in_progress"
   | "needs_clarification"
@@ -21,5 +23,5 @@ export interface TicketSource {
   listReady(): Promise<Ticket[]>;
   claim(id: string): Promise<void>;
   setStatus(id: string, status: FactoryStatus): Promise<void>;
-  comment(id: string, body: string): Promise<void>;
+  comment(id: string, body: string, signature?: ActionSignature): Promise<void>;
 }

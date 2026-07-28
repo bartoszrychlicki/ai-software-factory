@@ -57,6 +57,11 @@ import { parseCommand, hintFor, isDecisionCommand } from "./commands";
 import { parsePlanVerdict, resolveDomain } from "../pipeline/verdicts";
 import { allQualityCommands, QualityGateError, runQualityCommands } from "../pipeline/quality";
 import {
+  parseSignatureMeta,
+  POLLER_SIGNATURE,
+  type ActionSignature,
+} from "../pipeline/signature";
+import {
   acknowledgeOutboxFromRun,
   dispatchPendingOutbox,
   MastraWorkflowClient,
@@ -440,7 +445,8 @@ async function watchRun(
             await src.comment(
               id,
               `👤 Checklista ops gotowa ${marker(id)} — wykonaj ją ręcznie. Fabryka NIE wykona zmian DNS, sekretów ani innych mutacji w systemach zewnętrznych.\n\n` +
-                `Po wykonaniu przeciągnij kartę na **${MAP.phases.verify}** albo napisz \`/done\`. Dopiero wtedy uruchomię deklaratywne, read-only \`project.qa.prodChecks\`.\n\n---\n\n${clip(checklist, 16000)}`
+                `Po wykonaniu przeciągnij kartę na **${MAP.phases.verify}** albo napisz \`/done\`. Dopiero wtedy uruchomię deklaratywne, read-only \`project.qa.prodChecks\`.\n\n---\n\n${clip(checklist, 16000)}`,
+              artifactSignature(join(runDir, "plan.md"))
             );
             checklistCommentedAt = new Date().toISOString();
             registry.openGateRecord(id, { project, runId }, "ops-checklist", 0, MAP.phases["ops-checklist"]);
@@ -501,7 +507,8 @@ async function watchRun(
           await src.comment(
             id,
               `📋 Plan gotowy ${marker(id)} — czeka na Twoją decyzję.\n\n` +
-              `${approvalInstruction}\n\n---\n\n${clip(plan, 16000)}`
+              `${approvalInstruction}\n\n---\n\n${clip(plan, 16000)}`,
+            artifactSignature(join(runDir, "plan.md"))
           );
           planCommentedAt = new Date().toISOString(); // dopiero PO udanym komentarzu — inaczej czkawka API gubi plan na zawsze (BAR-104)
           registry.recordResolvedDomain(id, { project, runId }, resolvedDomain);
@@ -654,10 +661,17 @@ async function watchRun(
           : verdict === "fix" ? "⚠️ AI review: uwagi pozostały po wyczerpaniu rund review→fix — PR zostaje draftem, oceń przy merge."
           : "AI review (doradczo); PR zostaje draftem:";
         const screenshotMd = await uploadScreenshot(src, id, runId);
+        const latestReview = safeReaddir(runDir)
+          .map((file) => ({ file, round: Number(file.match(/^review-round-(\d+)\.md$/)?.[1] ?? -1) }))
+          .filter(({ round }) => round >= 0)
+          .sort((a, b) => b.round - a.round)[0]?.file;
         await src.comment(
           id,
           `✅ Zbudowane i zweryfikowane ${marker(id)}. PR: ${prUrl}\n\n` +
-            `${reviewLine}\n\n${clip(review, 4000)}${screenshotMd}\n\nMerge = decyzja człowieka.`
+            `${reviewLine}\n\n${clip(review, 4000)}${screenshotMd}\n\nMerge = decyzja człowieka.`,
+          latestReview
+            ? artifactSignature(join(runDir, latestReview))
+            : POLLER_SIGNATURE
         );
         await src.setStatus(id, "human_review");
         registry.updateState(id, { project, runId }, (st) => { st.prUrl = prUrl; });
@@ -1039,6 +1053,14 @@ function artifactBody(path: string): string | undefined {
   }
 }
 
+function artifactSignature(path: string): ActionSignature {
+  try {
+    return parseSignatureMeta(readFileSync(path, "utf8")) ?? POLLER_SIGNATURE;
+  } catch {
+    return POLLER_SIGNATURE;
+  }
+}
+
 /**
  * Suspend w trybie pytań: komentuje pytania ABCD, czeka na odpowiedź autora
  * (dowolny komentarz bez markera fabryki) i wznawia doplanowanie. true = tryb
@@ -1073,7 +1095,8 @@ async function handleClarifySuspend(
       id,
       `${qTag} ${marker(id)} — ticket wymaga doprecyzowania przed planem.\n\n` +
         `Odpowiedz w komentarzu (np. \`1A, 2C\`), a potem **przeciągnij kartę na *${MAP.phases.planning}*** — doplanuję z Twoimi odpowiedziami.\n` +
-          `Z telefonu: \`/answer 1A, 2C\`.\n\n---\n\n${qBody}`
+          `Z telefonu: \`/answer 1A, 2C\`.\n\n---\n\n${qBody}`,
+      artifactSignature(join(runDir, `questions-round-${qMax}.md`))
     ).catch(() => {});
     registry.openGateRecord(id, { project, runId }, "clarify", qMax, "❓ Pytania do autora");
     await setPhase(project, src, id, "questions", runId);
