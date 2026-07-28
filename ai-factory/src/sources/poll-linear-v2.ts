@@ -29,8 +29,14 @@ import {
 } from "../pipeline/coordinator";
 import {
   factoryJobOutputSchema,
+  JOB_BUDGET_MINUTES,
   type FactoryJobOutput,
 } from "../pipeline/factory-job";
+import {
+  backoffAt,
+  classifyDispatchError,
+  maxDispatchAttempts,
+} from "../pipeline/retry-policy";
 import { runPreflight } from "../pipeline/preflight";
 import { getProject } from "../pipeline/projects";
 import {
@@ -53,6 +59,8 @@ export interface PollerDependencies {
   store: LifecycleStore;
   mastra: MastraWorkflowClient;
   sources: Map<string, LinearSource>;
+  /** Kanał powiadomień; testy wstrzykują rejestrator zamiast realnego notify. */
+  notifier?: typeof notify;
 }
 
 function stableRunId(key: string): string {
@@ -110,7 +118,7 @@ export function applyDecision(
     status: decision.transition.status,
     updatedAt: current.updatedAt,
   };
-  return deps.store.transition(ticketId, {
+  const updated = deps.store.transition(ticketId, {
     ...decision.transition,
     commands: [
       ...decision.commands,
@@ -118,6 +126,49 @@ export function applyDecision(
     ],
     acknowledgeCommandKey,
   });
+  emitTransitionNotification(deps, current, updated, decision.transition.reason);
+  return updated;
+}
+
+/**
+ * Jedyny lejek powiadomień o przejściach lifecycle. Fire-and-forget — błąd
+ * kanału nigdy nie wywala pollera ani nie cofa transakcji.
+ */
+function emitTransitionNotification(
+  deps: PollerDependencies,
+  before: LifecycleRun,
+  after: LifecycleRun,
+  reason: string
+): void {
+  if (
+    before.stage === after.stage &&
+    before.status === after.status &&
+    before.errorCode === after.errorCode
+  ) return;
+  const notifier = deps.notifier ?? notify;
+  const url = after.manifest.url;
+  let title: string | undefined;
+  let message: string | undefined;
+  if (after.status === "blocked") {
+    title = `🛑 ${after.ticketId} zablokowany (${after.blockedStage ?? after.stage})`;
+    message = `${after.errorCode ?? reason}: ${(after.errorMessage ?? "").slice(0, 300)}`;
+  } else if (after.stage === "approval" && after.status === "waiting_human") {
+    title = `⏳ ${after.ticketId}: plan do akceptacji`;
+    message = "Zatwierdź `/approve` albo odrzuć `/reject <powód>`.";
+  } else if (after.stage === "plan" && after.status === "waiting_human") {
+    title = `❓ ${after.ticketId}: pytania planera`;
+    message = `Runda ${after.clarifyRound}/2 — odpowiedz \`/answer <treść>\`.`;
+  } else if (after.stage === "merge" && after.status === "waiting_human" && before.stage !== "merge") {
+    title = `✅ ${after.ticketId}: PR gotowy do merge`;
+    message = `Review: ${after.reviewStatus ?? "advisory"} — ${after.prUrl ?? ""}`;
+  } else if (after.status === "done" && after.errorCode !== "CANCELED" && before.status !== "done") {
+    title = `✅ ${after.ticketId} ukończony`;
+    message = after.prUrl
+      ? `PR zmergowany (${after.prUrl}); smoke: ${after.smokeStatus ?? "-"}.`
+      : "Ticket zakończony.";
+  }
+  if (!title || !message) return;
+  void notifier(title, message, url).catch(() => {});
 }
 
 function findFactoryOutput(value: unknown): FactoryJobOutput | undefined {
@@ -164,6 +215,49 @@ function failedJobOutput(command: LifecycleCommand, report: string): FactoryJobO
   };
 }
 
+/**
+ * Stall lease: job Mastry, który wisi w pending/running dłużej niż budżet roli
+ * + grace, jest anulowany i kończy się JOB_STALLED zamiast wisieć bez końca
+ * (np. po SIGKILL serwera Mastry snapshot zostaje "running" na zawsze).
+ */
+async function handleStalledJob(
+  deps: PollerDependencies,
+  command: LifecycleCommand,
+  run: LifecycleRun,
+  attempt: number,
+  jobRunId: string,
+  mastraStatus: string
+): Promise<boolean> {
+  const kind = String(command.payload.kind) as keyof typeof JOB_BUDGET_MINUTES;
+  const budgetMinutes = JOB_BUDGET_MINUTES[kind] ?? 25;
+  const graceMinutes = Number(process.env.FACTORY_JOB_GRACE_MIN ?? 10);
+  const leaseMinutes = budgetMinutes + graceMinutes;
+  const latest = deps.store.latestAttempt(run.ticketId, command.stage);
+  const startedAt = latest?.jobRunId === jobRunId ? latest.startedAt : command.updatedAt;
+  const elapsedMinutes = (Date.now() - Date.parse(startedAt)) / 60_000;
+  if (!Number.isFinite(elapsedMinutes) || elapsedMinutes <= leaseMinutes) return false;
+  await deps.mastra.cancelRun(jobRunId).catch(() => {});
+  const message =
+    `Job ${kind} przekroczył lease ${leaseMinutes} min bez wyniku ` +
+    `(Mastra status: ${mastraStatus}). Wznowienie: /retry.`;
+  const output = { ...failedJobOutput(command, message), errorCode: "JOB_STALLED" };
+  deps.store.finishAttempt(run.ticketId, command.stage, attempt, {
+    status: "failed",
+    outcome: "JOB_STALLED",
+    report: message,
+    signature: output.signature,
+    errorCode: "JOB_STALLED",
+    errorMessage: message,
+  });
+  applyDecision(
+    deps,
+    run.ticketId,
+    reduceLifecycle(run, { type: "job-finished", attempt, output }),
+    command.key
+  );
+  return true;
+}
+
 async function dispatchJob(
   deps: PollerDependencies,
   command: LifecycleCommand,
@@ -183,10 +277,13 @@ async function dispatchJob(
     budgetUsedUsd: usage.usd,
   };
   if (usage.minutes >= maxMinutes || usage.usd >= maxUsd) {
-    const output = failedJobOutput(
-      command,
-      `Budżet ticketu wyczerpany: ${usage.minutes.toFixed(1)}/${maxMinutes} min, $${usage.usd.toFixed(2)}/$${maxUsd}.`
-    );
+    const output = {
+      ...failedJobOutput(
+        command,
+        `Budżet ticketu wyczerpany: ${usage.minutes.toFixed(1)}/${maxMinutes} min, $${usage.usd.toFixed(2)}/$${maxUsd}.`
+      ),
+      errorCode: "BUDGET_EXHAUSTED",
+    };
     deps.store.startAttempt(
       run.ticketId,
       command.stage,
@@ -231,11 +328,11 @@ async function dispatchJob(
 
   const snapshot = await deps.mastra.getRun(jobRunId);
   const status = runStatus(snapshot);
-  if (status === "pending") {
-    await deps.mastra.startRun(jobRunId, command.payload);
+  if (status === "pending" || status === "running") {
+    if (await handleStalledJob(deps, command, run, attempt, jobRunId, status)) return;
+    if (status === "pending") await deps.mastra.startRun(jobRunId, command.payload);
     return;
   }
-  if (status === "running") return;
 
   const output = findFactoryOutput(snapshot.result ?? snapshot);
   if (!output || status === "failed" || status === "canceled") {
@@ -454,11 +551,22 @@ export async function dispatchOutbox(deps: PollerDependencies): Promise<void> {
       else if (command.state === "pending") await dispatchExternal(deps, command, run);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      deps.store.markCommand(command.key, command.attempts >= 2 ? "failed" : "pending", {
+      const errorClass = classifyDispatchError(error);
+      const deadLettered = command.attempts >= maxDispatchAttempts(errorClass);
+      deps.store.markCommand(command.key, deadLettered ? "failed" : "pending", {
         error: message,
+        retryAt: deadLettered ? undefined : backoffAt(command.attempts + 1),
       });
+      if (deadLettered) {
+        const notifier = deps.notifier ?? notify;
+        void notifier(
+          `💀 ${run.ticketId}: dead-letter ${command.kind}`,
+          `${errorClass}: ${message.slice(0, 400)}`,
+          run.manifest.url
+        ).catch(() => {});
+      }
       const lifecycleCritical = ["run-job", "publish-pr", "mark-pr-ready"].includes(command.kind);
-      if (command.attempts >= 2 && lifecycleCritical) {
+      if (deadLettered && lifecycleCritical) {
         applyDecision(deps, run.ticketId, {
           transition: {
             stage: command.stage,

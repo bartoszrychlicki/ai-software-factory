@@ -24,10 +24,13 @@ import {
 import { runPreflight } from "../pipeline/preflight";
 import { parseCommand } from "../sources/commands";
 import {
+  applyDecision,
+  dispatchOutbox,
   localExactShaCiResult,
   reconcileRun,
   type PollerDependencies,
 } from "../sources/poll-linear-v2";
+import { MastraHttpError } from "../sources/mastra-client";
 import { buildCommentContextSnapshot } from "../sources/comment-context";
 
 const manifest: TicketManifestV2 = {
@@ -652,5 +655,191 @@ test("preflight przed claimem sprawdza stany, CLI, Mastrę i strict quality", as
     if (previousRoot === undefined) delete process.env.FACTORY_ROOT;
     else process.env.FACTORY_ROOT = previousRoot;
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+async function writeHarnessFixture(root: string, extraProjectYaml: string[] = []): Promise<void> {
+  await writeFile(join(root, "package.json"), "{}");
+  await writeFile(join(root, "projects.yaml"), [
+    "harness:",
+    `  repo: ${JSON.stringify(root)}`,
+    "  checks:",
+    "    - \"true\"",
+    ...extraProjectYaml,
+  ].join("\n"));
+}
+
+test("stall lease: wiszący job Mastry kończy się JOB_STALLED i pozwala na /retry", async () => {
+  const root = await mkdtemp(join(tmpdir(), "factory-stall-"));
+  const previousRoot = process.env.FACTORY_ROOT;
+  const previousGrace = process.env.FACTORY_JOB_GRACE_MIN;
+  const store = new LifecycleStore(join(root, "registry.db"));
+  const notifications: { title: string; message: string }[] = [];
+  const canceled: string[] = [];
+  try {
+    await writeHarnessFixture(root);
+    process.env.FACTORY_ROOT = root;
+    // lease = budżet planu (20) + grace (-30) < 0 → natychmiastowy stall bez czekania w teście
+    process.env.FACTORY_JOB_GRACE_MIN = "-30";
+    let getRunCalls = 0;
+    const mastra = {
+      async getRun(runId: string) {
+        getRunCalls += 1;
+        if (getRunCalls === 1) {
+          throw new MastraHttpError(404, `/workflows/factoryJob/runs/${runId}`, "missing");
+        }
+        return { status: "running" };
+      },
+      async createRun() {},
+      async startRun() {},
+      async cancelRun(runId: string) { canceled.push(runId); },
+    };
+    const source = {
+      async setStateByName() {},
+      async listComments() { return []; },
+      async comment() {},
+    };
+    const deps: PollerDependencies = {
+      store,
+      mastra: mastra as unknown as PollerDependencies["mastra"],
+      sources: new Map([["harness", source as never]]),
+      notifier: async (title, message) => { notifications.push({ title, message }); },
+    };
+    const run = store.createRun("BAR-S1", "harness", manifest);
+    applyDecision(deps, run.ticketId, reduceLifecycle(run, { type: "start" }));
+    await dispatchOutbox(deps); // pierwszy tick: create-run + start, komenda dispatched
+    await dispatchOutbox(deps); // drugi tick: snapshot "running" po lease → JOB_STALLED
+    const blocked = store.getRun("BAR-S1")!;
+    assert.deepEqual(
+      [blocked.status, blocked.errorCode, blocked.blockedStage],
+      ["blocked", "JOB_STALLED", "plan"]
+    );
+    assert.equal(canceled.length, 1);
+    assert.ok(notifications.some(({ title }) => title.includes("zablokowany")));
+    assert.equal(store.latestAttempt("BAR-S1", "plan")?.errorCode, "JOB_STALLED");
+    const retried = reduceLifecycle(blocked, { type: "retry", commentId: "c1", nextAttempt: 2 });
+    assert.equal(retried.transition.stage, "plan");
+    assert.equal(retried.commands[0]?.payload.kind, "plan");
+  } finally {
+    store.close();
+    if (previousRoot === undefined) delete process.env.FACTORY_ROOT;
+    else process.env.FACTORY_ROOT = previousRoot;
+    if (previousGrace === undefined) delete process.env.FACTORY_JOB_GRACE_MIN;
+    else process.env.FACTORY_JOB_GRACE_MIN = previousGrace;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("wyczerpany budżet blokuje ticket z BUDGET_EXHAUSTED i powiadamia", async () => {
+  const root = await mkdtemp(join(tmpdir(), "factory-budget-"));
+  const previousRoot = process.env.FACTORY_ROOT;
+  const store = new LifecycleStore(join(root, "registry.db"));
+  const notifications: { title: string; message: string }[] = [];
+  try {
+    await writeHarnessFixture(root, ["  budget:", "    maxUsd: 1", "    maxMinutes: 45"]);
+    process.env.FACTORY_ROOT = root;
+    const source = {
+      async setStateByName() {},
+      async listComments() { return []; },
+      async comment() {},
+    };
+    const deps: PollerDependencies = {
+      store,
+      mastra: {
+        async getRun() { throw new Error("mastra nie powinna być wołana przy wyczerpanym budżecie"); },
+      } as unknown as PollerDependencies["mastra"],
+      sources: new Map([["harness", source as never]]),
+      notifier: async (title, message) => { notifications.push({ title, message }); },
+    };
+    const run = store.createRun("BAR-B1", "harness", manifest);
+    applyDecision(deps, run.ticketId, reduceLifecycle(run, { type: "start" }));
+    store.startAttempt("BAR-B1", "build", 1, "job-cost");
+    store.finishAttempt("BAR-B1", "build", 1, {
+      status: "success", outcome: "committed", costUsd: 5, durationMs: 1000,
+    });
+    await dispatchOutbox(deps);
+    const blocked = store.getRun("BAR-B1")!;
+    assert.deepEqual([blocked.status, blocked.errorCode], ["blocked", "BUDGET_EXHAUSTED"]);
+    assert.ok(notifications.some(({ message }) => message.includes("BUDGET_EXHAUSTED")));
+  } finally {
+    store.close();
+    if (previousRoot === undefined) delete process.env.FACTORY_ROOT;
+    else process.env.FACTORY_ROOT = previousRoot;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("outbox: transient dostaje backoff, dead-letter zawsze powiadamia", async () => {
+  const root = await mkdtemp(join(tmpdir(), "factory-outbox-retry-"));
+  const previousRoot = process.env.FACTORY_ROOT;
+  const store = new LifecycleStore(join(root, "registry.db"));
+  const notifications: { title: string; message: string }[] = [];
+  let failure: Error = new Error("connect ECONNREFUSED 127.0.0.1:443");
+  try {
+    await writeHarnessFixture(root);
+    process.env.FACTORY_ROOT = root;
+    const source = {
+      async setStateByName() {},
+      async listComments(): Promise<never> { throw failure; },
+      async comment() {},
+    };
+    const deps: PollerDependencies = {
+      store,
+      mastra: {} as unknown as PollerDependencies["mastra"],
+      sources: new Map([["harness", source as never]]),
+      notifier: async (title, message) => { notifications.push({ title, message }); },
+    };
+    store.createRun("BAR-D1", "harness", manifest);
+    const key = "BAR-D1:g1:linear-comment:x";
+    store.enqueue({ key, ticketId: "BAR-D1", kind: "linear-comment", stage: "plan", payload: { body: "hi" } });
+
+    await dispatchOutbox(deps);
+    const afterTransient = store.getCommand(key)!;
+    assert.equal(afterTransient.state, "pending");
+    assert.ok(
+      Date.parse(afterTransient.availableAt) > Date.now() + 20_000,
+      `backoff powinien odsunąć availableAt: ${afterTransient.availableAt}`
+    );
+    assert.equal(store.outstandingCommands().some((command) => command.key === key), false);
+    assert.equal(notifications.length, 0);
+
+    // Wymuś dostępność + drugi (ostatni) permanentny błąd → dead-letter z alertem.
+    failure = new Error("walidacja: brak treści komentarza");
+    store.markCommand(key, "pending", { retryAt: new Date(Date.now() - 1000).toISOString() });
+    await dispatchOutbox(deps);
+    assert.equal(store.getCommand(key)!.state, "failed");
+    assert.ok(notifications.some(({ title }) => title.includes("dead-letter")));
+    // linear-comment nie jest lifecycle-critical: run nie może być zablokowany.
+    assert.notEqual(store.getRun("BAR-D1")!.status, "blocked");
+  } finally {
+    store.close();
+    if (previousRoot === undefined) delete process.env.FACTORY_ROOT;
+    else process.env.FACTORY_ROOT = previousRoot;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("notyfikacje: plan-ready przechodzi przez lejek applyDecision dokładnie raz", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "factory-notify-"));
+  const store = new LifecycleStore(join(dir, "registry.db"));
+  const notifications: { title: string; message: string }[] = [];
+  try {
+    const deps: PollerDependencies = {
+      store,
+      mastra: {} as unknown as PollerDependencies["mastra"],
+      sources: new Map(),
+      notifier: async (title, message) => { notifications.push({ title, message }); },
+    };
+    const run = store.createRun("BAR-N1", "harness", manifest);
+    applyDecision(deps, run.ticketId, reduceLifecycle(run, { type: "start" }));
+    assert.equal(notifications.length, 0);
+    applyDecision(deps, run.ticketId, reduceLifecycle(store.getRun("BAR-N1")!, {
+      type: "job-finished", attempt: 1, output: planOutput,
+    }));
+    assert.equal(notifications.length, 1);
+    assert.ok(notifications[0].title.includes("plan do akceptacji"));
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
   }
 });

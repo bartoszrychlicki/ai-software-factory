@@ -68,6 +68,9 @@ export const factoryJobOutputSchema = z.object({
 export type FactoryJobInput = z.infer<typeof factoryJobInputSchema>;
 export type FactoryJobOutput = z.infer<typeof factoryJobOutputSchema>;
 
+/** Budżety wall-clock jobów; poller liczy z nich lease stall-detection. */
+export const JOB_BUDGET_MINUTES = { plan: 20, build: 25, review: 10 } as const;
+
 export interface FactoryJobRuntime {
   route(
     stage: Stage,
@@ -117,7 +120,7 @@ async function runPlan(
     instructions: planInstructions,
     context: planContext(input),
     workspace: (await runtime.project(input.ticket.project)).repo,
-    budget: { minutes: 20 },
+    budget: { minutes: JOB_BUDGET_MINUTES.plan },
     signal,
   });
   const durationMs = Date.now() - startedAt;
@@ -246,7 +249,7 @@ async function runBuild(
       feedback,
     ].filter(Boolean).join("\n\n"),
     workspace: workspace.dir,
-    budget: { minutes: 25 },
+    budget: { minutes: JOB_BUDGET_MINUTES.build },
     signal,
   });
   const durationMs = Date.now() - startedAt;
@@ -422,7 +425,7 @@ async function runReview(
         `# Zmiany\n${manifest.nameStatus}\n\n${manifest.diffStat}`,
       ].join("\n\n"),
       workspace: checkout.dir,
-      budget: { minutes: 10 },
+      budget: { minutes: JOB_BUDGET_MINUTES.review },
       signal,
     });
     const durationMs = Date.now() - startedAt;

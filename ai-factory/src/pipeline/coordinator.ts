@@ -387,10 +387,10 @@ export function reduceLifecycle(run: LifecycleRun, event: CoordinatorEvent): Coo
       };
     }
     if (run.blockedStage === "review") {
-      if (run.errorCode === "REVIEW_UNAVAILABLE") {
-        throw new Error("Review wykorzystało jedyne dozwolone automatyczne ponowienie.");
-      }
-      if (run.errorCode !== "OUTBOX_FAILED" || !run.prUrl || !run.headSha) {
+      // Ludzki /retry jest świadomy — dopuszczamy go także po wyczerpaniu
+      // pojedynczego automatycznego ponowienia (REVIEW_UNAVAILABLE) i po stallu.
+      const retryable = ["OUTBOX_FAILED", "REVIEW_UNAVAILABLE", "JOB_STALLED"];
+      if (!retryable.includes(run.errorCode ?? "") || !run.prUrl || !run.headSha) {
         throw new Error("Review nie ma bezpiecznej operacji do ponowienia.");
       }
       const attempt = event.nextAttempt ?? 1;
