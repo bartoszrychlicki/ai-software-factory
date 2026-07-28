@@ -5,6 +5,7 @@ import type { TicketState } from "../pipeline/run-registry";
 import {
   approvalMatchesInput,
   decideMergeReopenOutcome,
+  lostRunReapprovalAt,
 } from "../sources/reuse-policy";
 
 test("nowy effectiveInputHash unieważnia zatwierdzony plan", () => {
@@ -26,6 +27,17 @@ test("nowy effectiveInputHash unieważnia zatwierdzony plan", () => {
     ),
     true
   );
+});
+
+test("utracony run wymaga świeżej, ścisłej komendy /approve", () => {
+  const lostAt = "2026-07-28T10:00:00.000Z";
+  const comments = [
+    { body: "/approve", createdAt: "2026-07-28T09:00:00.000Z" },
+    { body: "approve", createdAt: "2026-07-28T11:00:00.000Z" },
+    { body: "/approve", createdAt: "2026-07-28T12:00:00.000Z" },
+  ];
+  assert.equal(lostRunReapprovalAt(comments, lostAt), "2026-07-28T12:00:00.000Z");
+  assert.equal(lostRunReapprovalAt(comments.slice(0, 2), lostAt), undefined);
 });
 
 test("legacy approval jest ważny tylko bez nowszych komentarzy autora", () => {

@@ -38,6 +38,7 @@ import { readRetryEvidence } from "./retry-context";
 import {
   approvalMatchesInput,
   decideMergeReopenOutcome,
+  lostRunReapprovalAt,
   type ApprovalInputIdentity,
 } from "./reuse-policy";
 import { getProject } from "../pipeline/projects";
@@ -1143,14 +1144,18 @@ async function findReusablePlan(
 ): Promise<string | undefined> {
   try {
     // przyczyna z REJESTRU (deterministyczna); komentarze tylko dla runów sprzed migracji
-    const prev = registry.readState(id)?.finalized;
+    const previousState = registry.readState(id);
+    const prev = previousState?.finalized;
+    const lostRunApprovedAt = prev?.reason === "lost-run"
+      ? lostRunReapprovalAt(comments, prev.at)
+      : undefined;
     if (prev?.reason) {
       if (
         prev.reason === "plan-gate" ||
         prev.reason === "verify" ||
         prev.reason === "rejected" ||
         prev.reason === "restart" ||
-        prev.reason === "lost-run"
+        (prev.reason === "lost-run" && !lostRunApprovedAt)
       ) return undefined;
     } else {
       const lastFinal = [...comments].reverse().find((c) =>
@@ -1167,9 +1172,29 @@ async function findReusablePlan(
         const dir = join(base, d);
         // UWAGA: samo istnienie result.json (był PR) NIE blokuje reuse — PR mógł zostać
         // zamknięty bez merge (konflikt); ticket ze zmergowanym PR-em i tak jest Done i nie wraca do claimu
-        const approval = JSON.parse(
-          readFileSync(join(dir, "approval.json"), "utf8")
-        ) as ApprovalInputIdentity;
+        let approval: ApprovalInputIdentity;
+        try {
+          approval = JSON.parse(
+            readFileSync(join(dir, "approval.json"), "utf8")
+          ) as ApprovalInputIdentity;
+        } catch {
+          // Run mógł zniknąć dokładnie między ruchem karty na Build a zapisem
+          // approval.json. Świeże /approve po utracie jest jawną ponowną decyzją
+          // człowieka dla planu z tego samego runu i nie zmienia input hash.
+          if (
+            lostRunApprovedAt &&
+            previousState?.runId === d &&
+            previousState.manifest?.effectiveInputHash
+          ) {
+            approval = {
+              approved: true,
+              at: lostRunApprovedAt,
+              effectiveInputHash: previousState.manifest.effectiveInputHash,
+            };
+          } else {
+            continue;
+          }
+        }
         if (!approval.approved) continue;
         // Opis LUB komentarze autora zmienione po aprobacie → plan nieaktualny.
         if (

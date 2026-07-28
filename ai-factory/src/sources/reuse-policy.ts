@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import type { TicketState } from "../pipeline/run-registry";
 import type { RelevantComment } from "./comment-context";
+import { parseCommand } from "./commands";
 
 export interface ApprovalInputIdentity {
   approved?: boolean;
@@ -44,4 +45,17 @@ export function decideMergeReopenOutcome(
     return "no-scope";
   }
   return "proceed";
+}
+
+/** Jawna ponowna aprobata po utracie runu; stare /approve nie może jej udawać. */
+export function lostRunReapprovalAt(
+  comments: readonly { body: string; createdAt: string }[],
+  lostAt: string | undefined
+): string | undefined {
+  if (!lostAt) return undefined;
+  return comments
+    .filter((comment) => comment.createdAt > lostAt && parseCommand(comment.body)?.kind === "approve")
+    .map((comment) => comment.createdAt)
+    .sort()
+    .at(-1);
 }
