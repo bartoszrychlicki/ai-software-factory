@@ -118,6 +118,8 @@ export interface LiveMigrationFacts {
   linearState: string;
   pr?: { url: string; state: "OPEN" | "CLOSED" | "MERGED"; headSha: string; branch: string };
   checkpointExists: boolean;
+  /** Komendy istniejące w chwili live read stają się watermarkiem importu. */
+  historicalCommands: { id: string; command: string }[];
 }
 
 export function importLegacyCandidate(
@@ -145,6 +147,9 @@ export function importLegacyCandidate(
       reviewStatus: candidate.prUrl ? "pending" : undefined,
     },
   });
+  for (const command of facts.historicalCommands) {
+    store.markCommentProcessed(candidate.ticketId, command.id, command.command);
+  }
 }
 
 /**
@@ -154,6 +159,9 @@ export function validateLiveMigration(
   candidate: LegacyMigrationCandidate,
   facts: LiveMigrationFacts
 ): void {
+  if (!Array.isArray(facts.historicalCommands)) {
+    throw new Error(`${candidate.ticketId}: live read nie dostarczył watermarku komend Lineara.`);
+  }
   if (facts.linearState === "Canceled") throw new Error(`${candidate.ticketId}: ticket jest Canceled.`);
   if (candidate.prUrl) {
     if (!facts.pr || facts.pr.url !== candidate.prUrl) {

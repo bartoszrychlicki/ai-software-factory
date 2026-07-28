@@ -568,15 +568,22 @@ test("migracja v1 importuje zatwierdzony plan/checkpoint i wymaga live read", as
     assert.throws(() => validateLiveMigration(candidate, {
       linearState: "In Progress",
       checkpointExists: false,
+      historicalCommands: [],
     }), /checkpoint/);
     importLegacyCandidate(store, candidate, {
       linearState: "In Progress",
       checkpointExists: true,
+      historicalCommands: [
+        { id: "old-approve", command: "approve" },
+        { id: "old-restart", command: "restart" },
+      ],
     });
     const imported = store.getRun("BAR-M1");
     assert.deepEqual([imported?.stage, imported?.status, imported?.headSha], [
       "test", "pending", "e".repeat(40),
     ]);
+    assert.equal(store.isCommentProcessed("old-approve"), true);
+    assert.equal(store.isCommentProcessed("old-restart"), true);
   } finally {
     store.close();
     await rm(root, { recursive: true, force: true });
