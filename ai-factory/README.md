@@ -73,16 +73,32 @@ do odczytu/testów migracji, ale nie są podpięte do runtime.
 
 - Build tworzy jeden checkpoint. Brak finału CLI, timeout lub błąd logowania
   zatrzymuje etap bez automatycznego drugiego buildera.
-- Testy i E2E biegną bez AI na świeżym checkoutcie dokładnego SHA.
+- Testy i E2E biegną bez AI na świeżym checkoutcie dokładnego SHA — w osobnym,
+  detached procesie (`test-runner.ts`), więc nie blokują pętli pollera i
+  przeżywają jego restart.
+- Job wiszący w Mastrze ponad budżet roli + grace kończy się `JOB_STALLED`
+  (cancel + `/retry`), nigdy nie wisi w nieskończoność.
 - Po FAIL poprawka buildera powstaje wyłącznie po `/retry`.
 - `factory.files` jest oczekiwaniem. Dodatkowy zwykły plik daje warning;
-  sekret lub niezatwierdzony workflow/ops/migracja blokują publikację.
+  sekret, niezatwierdzony workflow/ops/migracja ORAZ pliki wykonywane przez
+  etap test (package.json, lockfile'y, configi testów/buildu, `scripts/`)
+  blokują publikację. Per-projekt: `scope.protected` w `projects.yaml`.
+- Agent nie dostaje `SSH_AUTH_SOCK`; push/publish robi wyłącznie fabryka.
 - PR jest identyfikowany tylko przez trwałe `prUrl`; historyczne komentarze są
   ignorowane. Publish wykrywa istniejący branch/draft PR.
 - Każda zmiana PR head SHA unieważnia test/CI i uruchamia scope audit + testy
   nowego SHA, nigdy pełny rebuild.
 - Review AI jest advisory i może ponowić wyłącznie review raz. Nigdy nie odpala
-  buildera.
+  buildera. Reviewer nigdy nie jest tym samym silnikiem co builder
+  (`review.diverse` w routing.yaml), a `mark-pr-ready` wychodzi dopiero PO
+  werdykcie — komentarz recenzenta istnieje zanim PR opuści draft.
 - `Done` dla ticketu kodowego wymaga merge dokładnie śledzonego PR-a. Smoke FAIL
   blokuje już zmergowany ticket bez automatycznego rollbacku.
-- Budżet jest wspólny dla wszystkich krótkich jobów ticketu.
+- Budżet jest wspólny dla wszystkich krótkich jobów ticketu; koszt liczy się
+  także dla silników bez raportu (estymata tokenowa codexa albo czasowa —
+  `cost_source` w stage_attempts).
+- Circuit breaker (seria porażek / koszt na godzinę) wstrzymuje claim nowych
+  ticketów; dead-letter outboxu zawsze wysyła powiadomienie; `lifecycle.db`
+  ma dzienny backup, a drugi poller na tej samej bazie odmawia startu.
+- Dwa tickety z kolizją `planFiles` nie budują równolegle — późniejszy czeka
+  (⏸️ komentarz), start automatyczny po domknięciu PR-a trzymającego pliki.

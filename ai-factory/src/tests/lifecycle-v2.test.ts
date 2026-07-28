@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { chmod, mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { chmod, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -24,10 +25,16 @@ import {
 import { runPreflight } from "../pipeline/preflight";
 import { parseCommand } from "../sources/commands";
 import {
+  applyDecision,
+  dispatchOutbox,
+  ensureSingleWriter,
   localExactShaCiResult,
+  maybeBackupLifecycleDb,
+  pollOnce,
   reconcileRun,
   type PollerDependencies,
 } from "../sources/poll-linear-v2";
+import { MastraHttpError } from "../sources/mastra-client";
 import { buildCommentContextSnapshot } from "../sources/comment-context";
 
 const manifest: TicketManifestV2 = {
@@ -104,6 +111,7 @@ test("registry v2 atomowo zachowuje stan, próbę i idempotentny outbox po resta
       errorCode: "PLAN_FAILED",
       errorMessage: "planner failed",
       costUsd: 0.25,
+      costSource: undefined,
       durationMs: 2000,
       budgetMaxMinutes: 45,
       budgetMaxUsd: 3,
@@ -320,6 +328,86 @@ test("/retry odtwarza tylko zatrzymany deterministyczny etap", () => {
   }, { type: "retry", commentId: "c-ci" });
   assert.equal(ciRetry.transition.status, "waiting_external");
   assert.equal(ciRetry.commands.length, 0);
+});
+
+test("mark-pr-ready dopiero po werdykcie review; komentarz przed zdjęciem draftu", () => {
+  const base: LifecycleRun = {
+    ticketId: "BAR-R1",
+    project: "br-factory",
+    generation: 1,
+    stage: "ci",
+    status: "waiting_external",
+    manifest,
+    planFiles: ["src/a.ts"],
+    clarifyRound: 0,
+    branch: "agent/BAR-R1",
+    headSha: "a".repeat(40),
+    testedSha: "a".repeat(40),
+    prUrl: "https://github.test/o/r/pull/9",
+    createdAt: "x",
+    updatedAt: "x",
+  };
+  const ciPass = reduceLifecycle(base, {
+    type: "ci-result", outcome: "pass", sha: base.headSha!, report: "quality", nextReviewAttempt: 1,
+  });
+  assert.deepEqual(ciPass.commands.map((command) => command.kind), ["run-job"]);
+
+  const reviewRun: LifecycleRun = { ...base, stage: "review", status: "running", reviewStatus: "running" };
+  const verdict = reduceLifecycle(reviewRun, {
+    type: "job-finished",
+    attempt: 1,
+    output: {
+      kind: "review",
+      outcome: "success",
+      report: "uwagi doradcze",
+      signature: "reviewer",
+      durationMs: 1,
+      files: [],
+      changedFiles: [],
+      scopeWarnings: [],
+      headSha: base.headSha,
+      reviewVerdict: "advisory-fix",
+    },
+  });
+  // Komentarz recenzenta istnieje ZANIM PR wyjdzie z draftu; advisory nadal nie blokuje.
+  assert.deepEqual(verdict.commands.map((command) => command.kind), ["comment-pr", "mark-pr-ready"]);
+  assert.deepEqual([verdict.transition.stage, verdict.transition.status], ["merge", "waiting_human"]);
+});
+
+test("/retry review: bez werdyktu ponawia joba, z werdyktem tylko mark-pr-ready", () => {
+  const blockedReview: LifecycleRun = {
+    ticketId: "BAR-R2",
+    project: "br-factory",
+    generation: 1,
+    stage: "review",
+    status: "blocked",
+    manifest,
+    planFiles: [],
+    clarifyRound: 0,
+    headSha: "b".repeat(40),
+    prUrl: "https://github.test/o/r/pull/10",
+    blockedStage: "review",
+    errorCode: "REVIEW_UNAVAILABLE",
+    reviewStatus: "unavailable",
+    createdAt: "x",
+    updatedAt: "x",
+  };
+  const jobRetry = reduceLifecycle(blockedReview, { type: "retry", commentId: "c1", nextAttempt: 3 });
+  assert.deepEqual(jobRetry.commands.map((command) => command.kind), ["run-job"]);
+  assert.deepEqual([jobRetry.transition.stage, jobRetry.transition.status], ["review", "running"]);
+
+  const readyRetry = reduceLifecycle(
+    { ...blockedReview, errorCode: "OUTBOX_FAILED", reviewStatus: "lgtm" },
+    { type: "retry", commentId: "c2" }
+  );
+  assert.deepEqual(readyRetry.commands.map((command) => command.kind), ["mark-pr-ready"]);
+  assert.deepEqual([readyRetry.transition.stage, readyRetry.transition.status], ["merge", "waiting_human"]);
+
+  const stalled = reduceLifecycle(
+    { ...blockedReview, errorCode: "JOB_STALLED", reviewStatus: "running" },
+    { type: "retry", commentId: "c3", nextAttempt: 2 }
+  );
+  assert.deepEqual(stalled.commands.map((command) => command.kind), ["run-job"]);
 });
 
 test("br-budget używa lokalnego exact-SHA jako jedynego fallbacku CI", () => {
@@ -652,5 +740,584 @@ test("preflight przed claimem sprawdza stany, CLI, Mastrę i strict quality", as
     if (previousRoot === undefined) delete process.env.FACTORY_ROOT;
     else process.env.FACTORY_ROOT = previousRoot;
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+async function writeHarnessFixture(root: string, extraProjectYaml: string[] = []): Promise<void> {
+  await writeFile(join(root, "package.json"), "{}");
+  await writeFile(join(root, "projects.yaml"), [
+    "harness:",
+    `  repo: ${JSON.stringify(root)}`,
+    "  checks:",
+    "    - \"true\"",
+    ...extraProjectYaml,
+  ].join("\n"));
+}
+
+test("stall lease: wiszący job Mastry kończy się JOB_STALLED i pozwala na /retry", async () => {
+  const root = await mkdtemp(join(tmpdir(), "factory-stall-"));
+  const previousRoot = process.env.FACTORY_ROOT;
+  const previousGrace = process.env.FACTORY_JOB_GRACE_MIN;
+  const store = new LifecycleStore(join(root, "registry.db"));
+  const notifications: { title: string; message: string }[] = [];
+  const canceled: string[] = [];
+  try {
+    await writeHarnessFixture(root);
+    process.env.FACTORY_ROOT = root;
+    // lease = budżet planu (20) + grace (-30) < 0 → natychmiastowy stall bez czekania w teście
+    process.env.FACTORY_JOB_GRACE_MIN = "-30";
+    let getRunCalls = 0;
+    const mastra = {
+      async getRun(runId: string) {
+        getRunCalls += 1;
+        if (getRunCalls === 1) {
+          throw new MastraHttpError(404, `/workflows/factoryJob/runs/${runId}`, "missing");
+        }
+        return { status: "running" };
+      },
+      async createRun() {},
+      async startRun() {},
+      async cancelRun(runId: string) { canceled.push(runId); },
+    };
+    const source = {
+      async setStateByName() {},
+      async listComments() { return []; },
+      async comment() {},
+    };
+    const deps: PollerDependencies = {
+      store,
+      mastra: mastra as unknown as PollerDependencies["mastra"],
+      sources: new Map([["harness", source as never]]),
+      notifier: async (title, message) => { notifications.push({ title, message }); },
+    };
+    const run = store.createRun("BAR-S1", "harness", manifest);
+    applyDecision(deps, run.ticketId, reduceLifecycle(run, { type: "start" }));
+    await dispatchOutbox(deps); // pierwszy tick: create-run + start, komenda dispatched
+    await dispatchOutbox(deps); // drugi tick: snapshot "running" po lease → JOB_STALLED
+    const blocked = store.getRun("BAR-S1")!;
+    assert.deepEqual(
+      [blocked.status, blocked.errorCode, blocked.blockedStage],
+      ["blocked", "JOB_STALLED", "plan"]
+    );
+    assert.equal(canceled.length, 1);
+    assert.ok(notifications.some(({ title }) => title.includes("zablokowany")));
+    assert.equal(store.latestAttempt("BAR-S1", "plan")?.errorCode, "JOB_STALLED");
+    const retried = reduceLifecycle(blocked, { type: "retry", commentId: "c1", nextAttempt: 2 });
+    assert.equal(retried.transition.stage, "plan");
+    assert.equal(retried.commands[0]?.payload.kind, "plan");
+  } finally {
+    store.close();
+    if (previousRoot === undefined) delete process.env.FACTORY_ROOT;
+    else process.env.FACTORY_ROOT = previousRoot;
+    if (previousGrace === undefined) delete process.env.FACTORY_JOB_GRACE_MIN;
+    else process.env.FACTORY_JOB_GRACE_MIN = previousGrace;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("wyczerpany budżet blokuje ticket z BUDGET_EXHAUSTED i powiadamia", async () => {
+  const root = await mkdtemp(join(tmpdir(), "factory-budget-"));
+  const previousRoot = process.env.FACTORY_ROOT;
+  const store = new LifecycleStore(join(root, "registry.db"));
+  const notifications: { title: string; message: string }[] = [];
+  try {
+    await writeHarnessFixture(root, ["  budget:", "    maxUsd: 1", "    maxMinutes: 45"]);
+    process.env.FACTORY_ROOT = root;
+    const source = {
+      async setStateByName() {},
+      async listComments() { return []; },
+      async comment() {},
+    };
+    const deps: PollerDependencies = {
+      store,
+      mastra: {
+        async getRun() { throw new Error("mastra nie powinna być wołana przy wyczerpanym budżecie"); },
+      } as unknown as PollerDependencies["mastra"],
+      sources: new Map([["harness", source as never]]),
+      notifier: async (title, message) => { notifications.push({ title, message }); },
+    };
+    const run = store.createRun("BAR-B1", "harness", manifest);
+    applyDecision(deps, run.ticketId, reduceLifecycle(run, { type: "start" }));
+    store.startAttempt("BAR-B1", "build", 1, "job-cost");
+    store.finishAttempt("BAR-B1", "build", 1, {
+      status: "success", outcome: "committed", costUsd: 5, durationMs: 1000,
+    });
+    await dispatchOutbox(deps);
+    const blocked = store.getRun("BAR-B1")!;
+    assert.deepEqual([blocked.status, blocked.errorCode], ["blocked", "BUDGET_EXHAUSTED"]);
+    assert.ok(notifications.some(({ message }) => message.includes("BUDGET_EXHAUSTED")));
+  } finally {
+    store.close();
+    if (previousRoot === undefined) delete process.env.FACTORY_ROOT;
+    else process.env.FACTORY_ROOT = previousRoot;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("outbox: transient dostaje backoff, dead-letter zawsze powiadamia", async () => {
+  const root = await mkdtemp(join(tmpdir(), "factory-outbox-retry-"));
+  const previousRoot = process.env.FACTORY_ROOT;
+  const store = new LifecycleStore(join(root, "registry.db"));
+  const notifications: { title: string; message: string }[] = [];
+  let failure: Error = new Error("connect ECONNREFUSED 127.0.0.1:443");
+  try {
+    await writeHarnessFixture(root);
+    process.env.FACTORY_ROOT = root;
+    const source = {
+      async setStateByName() {},
+      async listComments(): Promise<never> { throw failure; },
+      async comment() {},
+    };
+    const deps: PollerDependencies = {
+      store,
+      mastra: {} as unknown as PollerDependencies["mastra"],
+      sources: new Map([["harness", source as never]]),
+      notifier: async (title, message) => { notifications.push({ title, message }); },
+    };
+    store.createRun("BAR-D1", "harness", manifest);
+    const key = "BAR-D1:g1:linear-comment:x";
+    store.enqueue({ key, ticketId: "BAR-D1", kind: "linear-comment", stage: "plan", payload: { body: "hi" } });
+
+    await dispatchOutbox(deps);
+    const afterTransient = store.getCommand(key)!;
+    assert.equal(afterTransient.state, "pending");
+    assert.ok(
+      Date.parse(afterTransient.availableAt) > Date.now() + 20_000,
+      `backoff powinien odsunąć availableAt: ${afterTransient.availableAt}`
+    );
+    assert.equal(store.outstandingCommands().some((command) => command.key === key), false);
+    assert.equal(notifications.length, 0);
+
+    // Wymuś dostępność + drugi (ostatni) permanentny błąd → dead-letter z alertem.
+    failure = new Error("walidacja: brak treści komentarza");
+    store.markCommand(key, "pending", { retryAt: new Date(Date.now() - 1000).toISOString() });
+    await dispatchOutbox(deps);
+    assert.equal(store.getCommand(key)!.state, "failed");
+    assert.ok(notifications.some(({ title }) => title.includes("dead-letter")));
+    // linear-comment nie jest lifecycle-critical: run nie może być zablokowany.
+    assert.notEqual(store.getRun("BAR-D1")!.status, "blocked");
+  } finally {
+    store.close();
+    if (previousRoot === undefined) delete process.env.FACTORY_ROOT;
+    else process.env.FACTORY_ROOT = previousRoot;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+async function eventually(check: () => Promise<boolean> | boolean, timeoutMs = 3000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await check()) return;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.fail("warunek nie został spełniony w czasie");
+}
+
+test("backupTo tworzy spójną kopię na żywo, a usageSince liczy koszt godzinowy", async () => {
+  const root = await mkdtemp(join(tmpdir(), "factory-backup-"));
+  const store = new LifecycleStore(join(root, "registry.db"));
+  try {
+    store.createRun("BAR-K1", "harness", manifest);
+    store.startAttempt("BAR-K1", "plan", 1, "job-k1");
+    store.finishAttempt("BAR-K1", "plan", 1, {
+      status: "success", outcome: "ok", costUsd: 2.5, durationMs: 1000,
+    });
+    const hourAgo = new Date(Date.now() - 60 * 60_000).toISOString();
+    assert.equal(store.usageSince(hourAgo), 2.5);
+    assert.equal(store.usageSince(new Date(Date.now() + 60_000).toISOString()), 0);
+
+    const backupPath = join(root, "backups", "lifecycle-copy.db");
+    store.backupTo(backupPath);
+    const copy = new LifecycleStore(backupPath);
+    try {
+      assert.equal(copy.getRun("BAR-K1")?.ticketId, "BAR-K1");
+      assert.equal(copy.latestAttempt("BAR-K1", "plan")?.costUsd, 2.5);
+    } finally {
+      copy.close();
+    }
+
+    // maybeBackupLifecycleDb: pierwszy przebieg tworzy plik, drugi w tym samym dniu nie.
+    const dir = join(root, "auto-backups");
+    maybeBackupLifecycleDb(store, dir);
+    maybeBackupLifecycleDb(store, dir);
+    const { readdirSync } = await import("node:fs");
+    assert.equal(readdirSync(dir).filter((name) => name.endsWith(".db")).length, 1);
+  } finally {
+    store.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("single-writer lease: żywy cudzy poller blokuje start, martwy jest przejmowany", async () => {
+  const root = await mkdtemp(join(tmpdir(), "factory-lease-"));
+  const store = new LifecycleStore(join(root, "registry.db"));
+  try {
+    ensureSingleWriter(store, 11111, () => true);
+    assert.equal(store.readLease()?.pid, 11111);
+
+    assert.throws(
+      () => ensureSingleWriter(store, 22222, () => true),
+      /PID 11111/
+    );
+    // Ten sam PID może odnowić własny lease.
+    ensureSingleWriter(store, 11111, () => true);
+    // Martwy właściciel jest przejmowany mimo świeżego heartbeatu.
+    ensureSingleWriter(store, 22222, () => false);
+    assert.equal(store.readLease()?.pid, 22222);
+
+    store.renewLease(22222);
+    store.releaseLease(11111); // zły PID nie zwalnia
+    assert.equal(store.readLease()?.pid, 22222);
+    store.releaseLease(22222);
+    assert.equal(store.readLease(), undefined);
+  } finally {
+    store.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("otwarty circuit breaker zatrzymuje claim nowych ticketów i powiadamia raz", async () => {
+  const root = await mkdtemp(join(tmpdir(), "factory-breaker-"));
+  const previousRoot = process.env.FACTORY_ROOT;
+  const store = new LifecycleStore(join(root, "registry.db"));
+  const notifications: string[] = [];
+  let listReadyCalls = 0;
+  try {
+    await writeHarnessFixture(root);
+    await mkdir(join(root, "runs"), { recursive: true });
+    await writeFile(join(root, "runs", "circuit-breaker.json"), JSON.stringify({
+      openedAt: new Date().toISOString(),
+      reason: "3 nieudane runy z rzędu",
+      failStreak: 3,
+    }));
+    process.env.FACTORY_ROOT = root;
+    const source = {
+      async listReady() { listReadyCalls += 1; return []; },
+      async listStateNames() { return []; },
+    };
+    const deps: PollerDependencies = {
+      store,
+      mastra: {} as unknown as PollerDependencies["mastra"],
+      sources: new Map([["harness", source as never]]),
+      notifier: async (title) => { notifications.push(title); },
+    };
+    await pollOnce(deps);
+    await pollOnce(deps);
+    assert.equal(listReadyCalls, 0);
+    assert.equal(notifications.filter((title) => title.includes("Circuit breaker")).length, 1);
+  } finally {
+    store.close();
+    if (previousRoot === undefined) delete process.env.FACTORY_ROOT;
+    else process.env.FACTORY_ROOT = previousRoot;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("porażka fabryki nabija serię breakera, decyzja człowieka nie", async () => {
+  const root = await mkdtemp(join(tmpdir(), "factory-streak-"));
+  const previousRoot = process.env.FACTORY_ROOT;
+  const store = new LifecycleStore(join(root, "registry.db"));
+  const breakerFile = join(root, "runs", "circuit-breaker.json");
+  const failedPlan: FactoryJobOutput = {
+    kind: "plan",
+    outcome: "failed",
+    report: "engine down",
+    errorCode: "PLAN_ENGINE_FAILED",
+    signature: "sig",
+    durationMs: 1,
+    files: [],
+    changedFiles: [],
+    scopeWarnings: [],
+  };
+  try {
+    await writeHarnessFixture(root);
+    process.env.FACTORY_ROOT = root;
+    const deps: PollerDependencies = {
+      store,
+      mastra: {} as unknown as PollerDependencies["mastra"],
+      sources: new Map(),
+      notifier: async () => {},
+    };
+    const run = store.createRun("BAR-CB1", "harness", manifest);
+    applyDecision(deps, run.ticketId, reduceLifecycle(run, { type: "start" }));
+    applyDecision(deps, run.ticketId, reduceLifecycle(store.getRun("BAR-CB1")!, {
+      type: "job-finished", attempt: 1, output: failedPlan,
+    }));
+    await eventually(async () => {
+      try {
+        return (JSON.parse(await readFile(breakerFile, "utf8")) as { failStreak: number }).failStreak === 1;
+      } catch {
+        return false;
+      }
+    });
+
+    // PLAN_REJECTED (decyzja człowieka) nie zwiększa serii.
+    const run2 = store.createRun("BAR-CB2", "harness", manifest);
+    applyDecision(deps, run2.ticketId, reduceLifecycle(run2, { type: "start" }));
+    applyDecision(deps, run2.ticketId, reduceLifecycle(store.getRun("BAR-CB2")!, {
+      type: "job-finished", attempt: 1, output: planOutput,
+    }));
+    applyDecision(deps, run2.ticketId, reduceLifecycle(store.getRun("BAR-CB2")!, {
+      type: "reject", commentId: "c-rej", reason: "nie teraz",
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(
+      (JSON.parse(await readFile(breakerFile, "utf8")) as { failStreak: number }).failStreak,
+      1
+    );
+  } finally {
+    store.close();
+    if (previousRoot === undefined) delete process.env.FACTORY_ROOT;
+    else process.env.FACTORY_ROOT = previousRoot;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("detached test runner: wynik z synchronizacją main przechodzi do publish", async () => {
+  const root = await mkdtemp(join(tmpdir(), "factory-runner-"));
+  const previousRoot = process.env.FACTORY_ROOT;
+  const store = new LifecycleStore(join(root, "registry.db"));
+  const shaA = "a".repeat(40);
+  const shaB = "b".repeat(40);
+  try {
+    await writeHarnessFixture(root);
+    process.env.FACTORY_ROOT = root;
+    const source = {
+      async setStateByName() {},
+      async listComments() { return []; },
+      async comment() {},
+    };
+    const deps: PollerDependencies = {
+      store,
+      mastra: {} as unknown as PollerDependencies["mastra"],
+      sources: new Map([["harness", source as never]]),
+      notifier: async () => {},
+      spawnTestRunner: (input) => {
+        mkdirSync(join(root, "runs", input.ticketId), { recursive: true });
+        writeFileSync(input.resultPath, JSON.stringify({
+          ok: true,
+          requestedSha: input.sha,
+          finalSha: shaB,
+          report: "checks ok po merge z main",
+          durationMs: 12,
+        }));
+        return process.pid;
+      },
+    };
+    store.createRun("BAR-TR1", "harness", manifest);
+    store.transition("BAR-TR1", {
+      stage: "test",
+      status: "pending",
+      actor: "test",
+      reason: "checkpoint",
+      patch: {
+        plan: "plan",
+        planFiles: ["src/a.ts"],
+        branch: "agent/BAR-TR1",
+        headSha: shaA,
+        approvedAt: "2026-07-29T10:00:00Z",
+      },
+    });
+    store.enqueue({
+      key: `BAR-TR1:g1:run-tests:${shaA}`,
+      ticketId: "BAR-TR1",
+      kind: "run-tests",
+      stage: "test",
+      payload: { sha: shaA, attempt: 1 },
+    });
+    await dispatchOutbox(deps); // spawn (stub zapisuje wynik natychmiast)
+    await dispatchOutbox(deps); // odczyt wyniku → branch-synchronized + test-result
+    const run = store.getRun("BAR-TR1")!;
+    assert.deepEqual(
+      [run.stage, run.status, run.headSha, run.testedSha],
+      ["publish", "pending", shaB, shaB]
+    );
+    assert.equal(store.getCommand(`BAR-TR1:g1:run-tests:${shaA}`)?.state, "done");
+    assert.equal(store.latestAttempt("BAR-TR1", "test")?.outcome, "pass");
+    assert.ok(store.getCommand(`BAR-TR1:g1:publish:${shaB}`), "publish-pr powinien być w outboxie");
+  } finally {
+    store.close();
+    if (previousRoot === undefined) delete process.env.FACTORY_ROOT;
+    else process.env.FACTORY_ROOT = previousRoot;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("martwy runner testów bez pliku wyniku blokuje z TEST_RUNNER_DIED", async () => {
+  const root = await mkdtemp(join(tmpdir(), "factory-runner-dead-"));
+  const previousRoot = process.env.FACTORY_ROOT;
+  const store = new LifecycleStore(join(root, "registry.db"));
+  const notifications: string[] = [];
+  try {
+    await writeHarnessFixture(root);
+    process.env.FACTORY_ROOT = root;
+    const source = {
+      async setStateByName() {},
+      async listComments() { return []; },
+      async comment() {},
+    };
+    const deps: PollerDependencies = {
+      store,
+      mastra: {} as unknown as PollerDependencies["mastra"],
+      sources: new Map([["harness", source as never]]),
+      notifier: async (title) => { notifications.push(title); },
+      spawnTestRunner: () => 999_999, // PID spoza zakresu = natychmiast martwy
+    };
+    store.createRun("BAR-TR2", "harness", manifest);
+    store.transition("BAR-TR2", {
+      stage: "test",
+      status: "pending",
+      actor: "test",
+      reason: "checkpoint",
+      patch: { plan: "plan", planFiles: [], headSha: "c".repeat(40), approvedAt: "2026-07-29T10:00:00Z" },
+    });
+    store.enqueue({
+      key: `BAR-TR2:g1:run-tests:${"c".repeat(40)}`,
+      ticketId: "BAR-TR2",
+      kind: "run-tests",
+      stage: "test",
+      payload: { sha: "c".repeat(40), attempt: 1 },
+    });
+    await dispatchOutbox(deps); // spawn martwego PID-a
+    await dispatchOutbox(deps); // brak wyniku + martwy PID → blocked
+    const run = store.getRun("BAR-TR2")!;
+    assert.deepEqual([run.status, run.errorCode], ["blocked", "TEST_RUNNER_DIED"]);
+    assert.ok(notifications.some((title) => title.includes("zablokowany")));
+  } finally {
+    store.close();
+    if (previousRoot === undefined) delete process.env.FACTORY_ROOT;
+    else process.env.FACTORY_ROOT = previousRoot;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("kolizja planFiles odsuwa build drugiego ticketu bez zużywania prób", async () => {
+  const root = await mkdtemp(join(tmpdir(), "factory-defer-"));
+  const previousRoot = process.env.FACTORY_ROOT;
+  const store = new LifecycleStore(join(root, "registry.db"));
+  try {
+    await writeHarnessFixture(root);
+    process.env.FACTORY_ROOT = root;
+    const deps: PollerDependencies = {
+      store,
+      mastra: {
+        async getRun() { return { status: "running" }; },
+      } as unknown as PollerDependencies["mastra"],
+      sources: new Map(),
+      notifier: async () => {},
+    };
+    // Ticket A: wcześniej zatwierdzony build w toku (dispatched job).
+    store.createRun("BAR-A", "harness", manifest);
+    store.transition("BAR-A", {
+      stage: "build", status: "running", actor: "test", reason: "building",
+      patch: { plan: "plan", planFiles: ["src/shared.ts"], approvedAt: "2026-07-29T10:00:00Z" },
+    });
+    store.enqueue({
+      key: "BAR-A:g1:job:build:build:a1",
+      ticketId: "BAR-A",
+      kind: "run-job",
+      stage: "build",
+      payload: { kind: "build", attempt: 1 },
+      externalId: "job-a",
+    });
+    store.startAttempt("BAR-A", "build", 1, "job-a");
+    // Ticket B: później zatwierdzony, build jeszcze nie wystartował.
+    store.createRun("BAR-B", "harness", manifest);
+    store.transition("BAR-B", {
+      stage: "build", status: "running", actor: "test", reason: "building",
+      patch: { plan: "plan", planFiles: ["src/shared.ts", "src/b.ts"], approvedAt: "2026-07-29T10:05:00Z" },
+    });
+    const keyB = "BAR-B:g1:job:build:build:a1";
+    store.enqueue({
+      key: keyB,
+      ticketId: "BAR-B",
+      kind: "run-job",
+      stage: "build",
+      payload: { kind: "build", attempt: 1 },
+    });
+    await dispatchOutbox(deps);
+    const deferred = store.getCommand(keyB)!;
+    assert.equal(deferred.state, "pending");
+    assert.equal(deferred.attempts, 0, "defer nie zużywa prób");
+    assert.ok(
+      Date.parse(deferred.availableAt) > Date.now() + 4 * 60_000,
+      `availableAt powinno być odsunięte: ${deferred.availableAt}`
+    );
+    assert.ok(store.getCommand("BAR-B:g1:defer:BAR-A"), "komentarz o kolizji powinien być w outboxie");
+  } finally {
+    store.close();
+    if (previousRoot === undefined) delete process.env.FACTORY_ROOT;
+    else process.env.FACTORY_ROOT = previousRoot;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("preflight rejestruje wersje CLI i ostrzega przy zmianie harnessu", async () => {
+  const root = await mkdtemp(join(tmpdir(), "factory-versions-"));
+  const previousRoot = process.env.FACTORY_ROOT;
+  process.env.FACTORY_ROOT = root;
+  try {
+    await writeFile(join(root, "package.json"), "{}");
+    await writeFile(join(root, "projects.yaml"), [
+      "demo:",
+      `  repo: ${JSON.stringify(root)}`,
+      "  checks:",
+      "    - \"true\"",
+    ].join("\n"));
+    await writeFile(join(root, "routing.yaml"), [
+      "defaults:",
+      "  plan: claude-code/sonnet",
+      "  build: codex",
+      "  review: claude-code/sonnet",
+    ].join("\n"));
+    const preflightDeps = (version: string) => ({
+      async linearStateNames() {
+        return ["Todo", "In Progress", "In Review", "Done", "Canceled", "👤 ⛔ Zablokowany"];
+      },
+      async mastraUp() { return true; },
+      async exec(file: string, args: readonly string[]) {
+        if (args[0] === "--version") return { stdout: `cli ${version} (build abc)\n`, stderr: "" };
+        if (file === "claude") return { stdout: '{"loggedIn":true}', stderr: "" };
+        return { stdout: "/fake/bin\n", stderr: "" };
+      },
+    });
+    const first = await runPreflight("demo", preflightDeps("0.44.0"));
+    assert.equal(first.warnings.some((warning) => warning.includes("zmienił wersję")), false);
+    assert.equal(existsSync(join(root, "runs", "cli-versions.json")), true);
+
+    const second = await runPreflight("demo", preflightDeps("0.45.0"));
+    assert.ok(
+      second.warnings.some((warning) => /zmienił wersję: 0\.44\.0 → 0\.45\.0/.test(warning)),
+      `oczekiwano warninga o zmianie wersji, dostałem: ${second.warnings.join(" | ")}`
+    );
+  } finally {
+    if (previousRoot === undefined) delete process.env.FACTORY_ROOT;
+    else process.env.FACTORY_ROOT = previousRoot;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("notyfikacje: plan-ready przechodzi przez lejek applyDecision dokładnie raz", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "factory-notify-"));
+  const store = new LifecycleStore(join(dir, "registry.db"));
+  const notifications: { title: string; message: string }[] = [];
+  try {
+    const deps: PollerDependencies = {
+      store,
+      mastra: {} as unknown as PollerDependencies["mastra"],
+      sources: new Map(),
+      notifier: async (title, message) => { notifications.push({ title, message }); },
+    };
+    const run = store.createRun("BAR-N1", "harness", manifest);
+    applyDecision(deps, run.ticketId, reduceLifecycle(run, { type: "start" }));
+    assert.equal(notifications.length, 0);
+    applyDecision(deps, run.ticketId, reduceLifecycle(store.getRun("BAR-N1")!, {
+      type: "job-finished", attempt: 1, output: planOutput,
+    }));
+    assert.equal(notifications.length, 1);
+    assert.ok(notifications[0].title.includes("plan do akceptacji"));
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
   }
 });

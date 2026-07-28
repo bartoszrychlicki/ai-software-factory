@@ -32,9 +32,14 @@ const PROFILE_BY_STAGE: Record<Stage, ActionProfile> = {
 };
 
 export function buildSignature(stage: Stage, route: Route): ActionSignature {
+  // harness niesie wersję CLI — regresja po cichym auto-update harnessu jest
+  // widoczna w metrykach i grepowalna w podpisach commitów/PR-ów.
+  const harness = route.cliVersion && route.cliVersion !== "unknown"
+    ? `${route.engine.name}@${route.cliVersion}`
+    : route.engine.name;
   return {
     agent: "ai-factory",
-    harness: route.engine.name,
+    harness,
     model: route.model ?? "(domyślny CLI)",
     profile: PROFILE_BY_STAGE[stage],
   };

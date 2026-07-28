@@ -2,6 +2,10 @@
  * Minimalne środowisko dla zewnętrznych CLI. Proces Mastry ma tokeny Lineara,
  * storage i powiadomień; agent nie potrzebuje ich do pracy w repo i nie może ich
  * dziedziczyć przypadkiem przez `execFile`.
+ *
+ * SSH_AUTH_SOCK celowo NIE przechodzi: agent (i wykonywany w teście kod
+ * z agent-modyfikowanego repo) nie może używać żywego agenta SSH właściciela.
+ * Push/publish robi fabryka własnym procesem z pełnym env.
  */
 const SAFE_KEYS = [
   "PATH",
@@ -15,7 +19,6 @@ const SAFE_KEYS = [
   "TMPDIR",
   "TMP",
   "TEMP",
-  "SSH_AUTH_SOCK",
   "CODEX_HOME",
   "CLAUDE_CONFIG_DIR",
   "NO_COLOR",

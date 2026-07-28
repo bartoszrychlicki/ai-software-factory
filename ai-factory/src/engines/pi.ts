@@ -1,5 +1,6 @@
 import type { EngineAdapter, EngineRunInput, EngineRunResult } from "./types";
 import { engineEnv } from "./env";
+import { cliVersion } from "./version";
 import { execFileControlled } from "../pipeline/process-control";
 
 const PI_BIN = process.env.PI_BIN ?? "pi";
@@ -12,6 +13,8 @@ const PI_PROVIDER = "lm-studio";
 export const pi: EngineAdapter = {
   name: "pi",
   verifyContextMode: "workspace",
+
+  version: () => cliVersion(PI_BIN),
 
   async run(input: EngineRunInput): Promise<EngineRunResult> {
     if (input.role !== "verify") {

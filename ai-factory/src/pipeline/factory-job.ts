@@ -43,6 +43,8 @@ export const factoryJobInputSchema = z.object({
   planDomain: z.string().optional(),
   feedback: z.string().optional(),
   headSha: z.string().optional(),
+  /** Harness buildera tego ticketu — review wyklucza go w routingu (dywersyfikacja). */
+  buildHarness: z.string().optional(),
 });
 
 export const factoryJobOutputSchema = z.object({
@@ -63,16 +65,37 @@ export const factoryJobOutputSchema = z.object({
   changedFiles: z.array(z.string()).default([]),
   scopeWarnings: z.array(z.string()).default([]),
   reviewVerdict: z.enum(["lgtm", "advisory-fix", "unavailable"]).optional(),
+  costSource: z.enum(["reported", "estimated-tokens", "estimated-time"]).optional(),
 });
 
 export type FactoryJobInput = z.infer<typeof factoryJobInputSchema>;
 export type FactoryJobOutput = z.infer<typeof factoryJobOutputSchema>;
 
+/** Budżety wall-clock jobów; poller liczy z nich lease stall-detection. */
+export const JOB_BUDGET_MINUTES = { plan: 20, build: 25, review: 10 } as const;
+
+/**
+ * Koszt efektywny próby: raport CLI > estymata tokenowa adaptera > estymata
+ * czasowa (FACTORY_SYNTH_USD_PER_MIN). Budżet USD ticketu przestaje być ślepy
+ * na silniki bez raportu kosztów (codex/kimi/pi).
+ */
+function effectiveCost(
+  result: { costUsd?: number; costSource?: FactoryJobOutput["costSource"] },
+  durationMs: number
+): { costUsd: number; costSource: NonNullable<FactoryJobOutput["costSource"]> } {
+  if (result.costUsd !== undefined) {
+    return { costUsd: result.costUsd, costSource: result.costSource ?? "reported" };
+  }
+  const perMinute = Number(process.env.FACTORY_SYNTH_USD_PER_MIN ?? 0.15);
+  return { costUsd: (durationMs / 60_000) * perMinute, costSource: "estimated-time" };
+}
+
 export interface FactoryJobRuntime {
   route(
     stage: Stage,
     ticket: { project: string; labels?: string[] },
-    domain?: string
+    domain?: string,
+    options?: { excludeEngine?: string }
   ): Promise<Route>;
   project(key: string): Promise<ProjectConfig>;
 }
@@ -117,10 +140,11 @@ async function runPlan(
     instructions: planInstructions,
     context: planContext(input),
     workspace: (await runtime.project(input.ticket.project)).repo,
-    budget: { minutes: 20 },
+    budget: { minutes: JOB_BUDGET_MINUTES.plan },
     signal,
   });
   const durationMs = Date.now() - startedAt;
+  const { costUsd, costSource } = effectiveCost(result, durationMs);
   const report = result.transcript ?? result.report;
   const verdict = parsePlanVerdict(report);
   const outcome = !result.ok || verdict.source === "missing"
@@ -139,7 +163,7 @@ async function runPlan(
     attempt: input.attempt,
     ok: outcome !== "failed",
     outcome,
-    costUsd: result.costUsd,
+    costUsd,
     durationMs,
     resumed: false,
   });
@@ -155,7 +179,7 @@ async function runPlan(
       outcome,
       ...signatureMeta(signature),
       engine: route.spec,
-      costUsd: result.costUsd,
+      costUsd,
     }) + report
   );
   return {
@@ -166,7 +190,8 @@ async function runPlan(
       ? result.ok ? "PLAN_CONTRACT_MISSING" : "PLAN_ENGINE_FAILED"
       : undefined,
     signature: signatureLine(signature),
-    costUsd: result.costUsd,
+    costUsd,
+    costSource,
     durationMs,
     plan: outcome === "success" ? report : undefined,
     questions,
@@ -206,7 +231,11 @@ async function runBuild(
         "git",
         ["-C", project.repo, "diff", "--name-only", "-z", `${base.trim()}...${verified}`]
       );
-      const checkpointAudit = auditScope(input.planFiles, names.split("\0").filter(Boolean));
+      const checkpointAudit = auditScope(
+        input.planFiles,
+        names.split("\0").filter(Boolean),
+        project.scope?.protected ?? []
+      );
       if (checkpointAudit.blocked.length) {
         throw new Error(`Checkpoint narusza aktualny plan:\n${checkpointAudit.blocked.join("\n")}`);
       }
@@ -246,10 +275,11 @@ async function runBuild(
       feedback,
     ].filter(Boolean).join("\n\n"),
     workspace: workspace.dir,
-    budget: { minutes: 25 },
+    budget: { minutes: JOB_BUDGET_MINUTES.build },
     signal,
   });
   const durationMs = Date.now() - startedAt;
+  const { costUsd, costSource } = effectiveCost(result, durationMs);
   if (!result.ok) {
     await recordMetric({
       ticket: input.ticket.id,
@@ -259,7 +289,7 @@ async function runBuild(
       attempt: input.attempt,
       ok: false,
       outcome: "engine-fail",
-      costUsd: result.costUsd,
+      costUsd,
       durationMs,
     });
     await saveArtifact(
@@ -281,7 +311,8 @@ async function runBuild(
       report: result.report,
       errorCode: "BUILD_ENGINE_FAILED",
       signature: signatureLine(signature),
-      costUsd: result.costUsd,
+      costUsd,
+      costSource,
       durationMs,
       files: input.planFiles,
       branch: workspace.branch,
@@ -300,7 +331,8 @@ async function runBuild(
       report: `${result.report}\n\nBuilder nie pozostawił zmian do checkpointu.`,
       errorCode: "BUILD_NO_CHANGES",
       signature: signatureLine(signature),
-      costUsd: result.costUsd,
+      costUsd,
+      costSource,
       durationMs,
       files: input.planFiles,
       branch: workspace.branch,
@@ -311,7 +343,7 @@ async function runBuild(
     };
   }
 
-  const audit = auditScope(input.planFiles, changedFiles);
+  const audit = auditScope(input.planFiles, changedFiles, project.scope?.protected ?? []);
   if (audit.blocked.length) {
     return {
       kind: "build",
@@ -319,7 +351,8 @@ async function runBuild(
       report: `${result.report}\n\nPublikacja zablokowana:\n${audit.blocked.map((line) => `- ${line}`).join("\n")}`,
       errorCode: "SCOPE_BLOCKED",
       signature: signatureLine(signature),
-      costUsd: result.costUsd,
+      costUsd,
+      costSource,
       durationMs,
       files: input.planFiles,
       branch: workspace.branch,
@@ -358,7 +391,7 @@ async function runBuild(
     attempt: input.attempt,
     ok: true,
     outcome: "committed",
-    costUsd: result.costUsd,
+    costUsd,
     durationMs,
   });
   await saveArtifact(
@@ -381,7 +414,8 @@ async function runBuild(
     outcome: "success",
     report: result.report,
     signature: signatureLine(signature),
-    costUsd: result.costUsd,
+    costUsd,
+    costSource,
     durationMs,
     files: input.planFiles,
     branch: workspace.branch,
@@ -400,7 +434,9 @@ async function runReview(
 ): Promise<FactoryJobOutput> {
   if (!input.headSha) throw new Error("Review wymaga dokładnego PR head SHA.");
   const project = await runtime.project(input.ticket.project);
-  const route = await runtime.route("review", input.ticket, input.planDomain);
+  const route = await runtime.route("review", input.ticket, input.planDomain, {
+    excludeEngine: input.buildHarness,
+  });
   const signature = buildSignature("review", route);
   const checkout = await createCheckout(project.repo, input.headSha, `${input.ticket.id}-review-${runId}`);
   const startedAt = Date.now();
@@ -422,10 +458,11 @@ async function runReview(
         `# Zmiany\n${manifest.nameStatus}\n\n${manifest.diffStat}`,
       ].join("\n\n"),
       workspace: checkout.dir,
-      budget: { minutes: 10 },
+      budget: { minutes: JOB_BUDGET_MINUTES.review },
       signal,
     });
     const durationMs = Date.now() - startedAt;
+    const { costUsd, costSource } = effectiveCost(result, durationMs);
     const report = result.transcript ?? result.report;
     const verdict = parseReviewVerdict(report);
     const reviewVerdict = !result.ok || verdict.source === "missing"
@@ -441,7 +478,7 @@ async function runReview(
       attempt: input.attempt,
       ok: reviewVerdict !== "unavailable",
       outcome: reviewVerdict,
-      costUsd: result.costUsd,
+      costUsd,
       durationMs,
     });
     await saveArtifact(
@@ -463,7 +500,8 @@ async function runReview(
       report,
       errorCode: reviewVerdict === "unavailable" ? "REVIEW_VERDICT_MISSING" : undefined,
       signature: signatureLine(signature),
-      costUsd: result.costUsd,
+      costUsd,
+      costSource,
       durationMs,
       files: input.planFiles,
       headSha: input.headSha,

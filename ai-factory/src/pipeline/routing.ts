@@ -16,6 +16,8 @@ export interface Route {
   model?: string;
   effort?: string;
   spec: string; // np. "claude-code/claude-fable-5@high" — do logów/raportów
+  /** Wersja binarium CLI ("unknown" gdy nieodczytywalna) — trafia do podpisu akcji. */
+  cliVersion?: string;
 }
 
 /** "claude-code/claude-fable-5@high" -> { engineName, model: "claude-fable-5", effort: "high" } */
@@ -25,6 +27,15 @@ function parseSpec(spec: string): { engineName: string; model?: string; effort?:
   if (!modelPart) return { engineName };
   const [model, effort] = modelPart.split("@");
   return { engineName, model: model || undefined, effort: effort || undefined };
+}
+
+export interface RouteOptions {
+  /**
+   * Dywersyfikacja cross-engine: jeżeli rozstrzygnięty silnik jest równy
+   * wykluczonemu (np. reviewer == builder), routing przechodzi na
+   * `<etap>.diverse`; brak fallbacku = fail-closed.
+   */
+  excludeEngine?: string;
 }
 
 /**
@@ -37,7 +48,8 @@ function parseSpec(spec: string): { engineName: string; model?: string; effort?:
 export async function resolveRoute(
   stage: Stage,
   ticket: { project: string; labels?: string[] },
-  domain?: string
+  domain?: string,
+  options: RouteOptions = {}
 ): Promise<Route> {
   const raw = await readFile(findUpFile("routing.yaml"), "utf8");
   const cfg = parse(raw) as RoutingFile;
@@ -47,7 +59,7 @@ export async function resolveRoute(
   const label = stage === "build" ? (ticket.labels ?? []).find((l) => l.startsWith("engine:")) : undefined;
   const projectCfg = cfg.projects?.[ticket.project];
 
-  const spec =
+  let spec =
     label?.slice("engine:".length) ??
     (domain ? projectCfg?.[`${stage}.${domain}`] : undefined) ??
     projectCfg?.[stage] ??
@@ -58,6 +70,20 @@ export async function resolveRoute(
     throw new Error(`Brak routingu dla etapu "${stage}" (projekt: ${ticket.project}) w routing.yaml`);
   }
 
+  if (options.excludeEngine && parseSpec(spec).engineName === options.excludeEngine) {
+    const diverse = projectCfg?.[`${stage}.diverse`] ?? cfg.defaults?.[`${stage}.diverse`];
+    if (!diverse) {
+      throw new Error(
+        `Routing ${stage}: silnik "${options.excludeEngine}" jest wykluczony (ten sam co builder), ` +
+        `a routing.yaml nie ma fallbacku "${stage}.diverse".`
+      );
+    }
+    if (parseSpec(diverse).engineName === options.excludeEngine) {
+      throw new Error(`Routing ${stage}.diverse wskazuje wykluczony silnik "${options.excludeEngine}".`);
+    }
+    spec = diverse;
+  }
+
   const { engineName, model, effort } = parseSpec(spec);
   const engine = engines[engineName];
   if (!engine) {
@@ -65,5 +91,6 @@ export async function resolveRoute(
       `Nieznany silnik "${engineName}" w routingu (dostępne: ${Object.keys(engines).join(", ")})`
     );
   }
-  return { engine, model, effort, spec };
+  const cliVersion = engine.version ? await engine.version() : undefined;
+  return { engine, model, effort, spec, cliVersion };
 }

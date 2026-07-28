@@ -11,14 +11,15 @@ flowchart TD
   D -- "plan" --> F["Linear /approve"]
   F --> G["Mastra factoryJob: build"]
   G --> H["Jeden checkpoint commit"]
-  H --> I["Fresh checkout exact SHA: checks + E2E"]
+  H --> I["Detached runner: fresh checkout exact SHA, checks (+Semgrep opt-in) + E2E"]
   I -- "FAIL" --> J["Blocked; /retry = builder fix z raportem"]
   J --> G
   I -- "PASS" --> K["Idempotent push + draft PR"]
   K --> L["GitHub CI exact PR head SHA"]
   L -- "head changed" --> I
-  L -- "PASS" --> M["PR ready + Mastra advisory review"]
-  M --> N["Linear In Review"]
+  L -- "PASS" --> M["Mastra advisory review (silnik ≠ builder)"]
+  M -- "werdykt: komentarz PRZED zdjęciem draftu" --> M2["PR ready"]
+  M2 --> N["Linear In Review"]
   N --> O{"Human merge"}
   O -- "closed unmerged" --> X["Blocked"]
   O -- "merged tracked PR" --> P["Prod smoke once"]
@@ -54,6 +55,15 @@ Każdy efekt ma stabilny idempotency key. Po restarcie poller:
 2. sprawdza niedokończone komendy i joby Mastry;
 3. weryfikuje dokładnie zapisany PR i head SHA;
 4. kontynuuje wyłącznie zatrzymany etap.
+
+Bezpieczniki runtime (2026-07-29): stall lease na joby Mastry (`JOB_STALLED`)
+i runner testów (`TEST_STALLED`/`TEST_RUNNER_DIED`); outbox z wykładniczym
+backoffem i alertem na każdy dead-letter; circuit breaker wstrzymuje claim
+nowych ticketów; dzienny backup `runs/lifecycle.db` (`runs/backups/`);
+single-writer lease blokuje drugi poller na tej samej bazie; kolizja
+`planFiles` między ticketami odsuwa build (⏸️ komentarz w Linear); testy
+exact-SHA biegną w detached procesie (`test-runner.ts`) — restart pollera ich
+nie zabija, wynik wraca plikiem `runs/<ticket>/test-result-*.json`.
 
 Registry v1 jest tylko do odczytu. Import wymaga zatwierdzonego planu,
 jednoznacznego checkpointu lub jawnie wskazanego bieżącego PR-a oraz świeżego
