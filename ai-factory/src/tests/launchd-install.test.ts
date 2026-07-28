@@ -48,10 +48,24 @@ test("instalator przepuszcza trwałe human gate, ale blokuje aktywne wykonanie",
   );
   assert.match(
     script,
-    /if\(s\.lifecycle==="awaiting_decision"\) ids\.push\(ticket\)/,
+    /if\(s\.lifecycle==="awaiting_decision"\) ids\.add\(ticket\)/,
   );
   assert.ok(position('BLOCKING="$(find_blocking_runs)"') < position('bootout_agent "$SERVER_SERVICE"'));
   assert.ok(position('SUSPENDED="$(find_suspended_runs)"') < position('bootout_agent "$SERVER_SERVICE"'));
+});
+
+test("zaimportowany run v2 zastępuje legacy v1 przy ocenie bezpieczeństwa restartu", () => {
+  assert.equal(
+    script.match(/const ids=new Set\(\), imported=new Set\(\);/g)?.length,
+    2,
+    "obie klasyfikacje muszą traktować registry v2 jako źródło nadrzędne",
+  );
+  assert.equal(
+    script.match(/if\(imported\.has\(ticket\)\) continue;/g)?.length,
+    2,
+    "zaimportowany ticket nie może być ponownie klasyfikowany z read-only state v1",
+  );
+  assert.match(script, /SELECT ticket_id, status FROM lifecycle_runs/);
 });
 
 test("nieudany bootstrap nie akceptuje starego joba jako sukcesu", () => {

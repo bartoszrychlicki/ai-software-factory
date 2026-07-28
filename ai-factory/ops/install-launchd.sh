@@ -69,41 +69,49 @@ bootstrap_agent() {
 find_blocking_runs() {
   '/Users/senioraiconsultant/.local/bin/node' -e '
 const fs=require("fs"), p=require("path"), root=p.join(process.argv[1],"runs");
-let ids=[];
+const ids=new Set(), imported=new Set();
 const dbFile=p.join(root,"lifecycle.db");
 if(fs.existsSync(dbFile)) {
   const {DatabaseSync}=require("node:sqlite");
   const db=new DatabaseSync(dbFile,{readOnly:true});
-  ids.push(...db.prepare("SELECT ticket_id FROM lifecycle_runs WHERE status = ?").all("running").map(r=>r.ticket_id));
+  for(const row of db.prepare("SELECT ticket_id, status FROM lifecycle_runs").all()) {
+    imported.add(row.ticket_id);
+    if(row.status==="running") ids.add(row.ticket_id);
+  }
   db.close();
 }
 if(fs.existsSync(root)) for(const ticket of fs.readdirSync(root)) {
+  if(imported.has(ticket)) continue;
   const file=p.join(root,ticket,"state.json");
   try {
     const s=JSON.parse(fs.readFileSync(file,"utf8"));
-    if(s.lifecycle!=="finalized" && s.lifecycle!=="awaiting_decision") ids.push(ticket);
+    if(s.lifecycle!=="finalized" && s.lifecycle!=="awaiting_decision") ids.add(ticket);
   } catch {}
 }
-process.stdout.write(ids.join(","));
+process.stdout.write([...ids].join(","));
 ' "$FACTORY_DIR"
 }
 
 find_suspended_runs() {
   '/Users/senioraiconsultant/.local/bin/node' -e '
 const fs=require("fs"), p=require("path"), root=p.join(process.argv[1],"runs");
-let ids=[];
+const ids=new Set(), imported=new Set();
 const dbFile=p.join(root,"lifecycle.db");
 if(fs.existsSync(dbFile)) {
   const {DatabaseSync}=require("node:sqlite");
   const db=new DatabaseSync(dbFile,{readOnly:true});
-  ids.push(...db.prepare("SELECT ticket_id FROM lifecycle_runs WHERE status IN (?, ?)").all("waiting_human","waiting_external").map(r=>r.ticket_id));
+  for(const row of db.prepare("SELECT ticket_id, status FROM lifecycle_runs").all()) {
+    imported.add(row.ticket_id);
+    if(row.status==="waiting_human" || row.status==="waiting_external") ids.add(row.ticket_id);
+  }
   db.close();
 }
 if(fs.existsSync(root)) for(const ticket of fs.readdirSync(root)) {
+  if(imported.has(ticket)) continue;
   const file=p.join(root,ticket,"state.json");
-  try { const s=JSON.parse(fs.readFileSync(file,"utf8")); if(s.lifecycle==="awaiting_decision") ids.push(ticket); } catch {}
+  try { const s=JSON.parse(fs.readFileSync(file,"utf8")); if(s.lifecycle==="awaiting_decision") ids.add(ticket); } catch {}
 }
-process.stdout.write(ids.join(","));
+process.stdout.write([...ids].join(","));
 ' "$FACTORY_DIR"
 }
 
