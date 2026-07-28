@@ -10,6 +10,7 @@ import { weatherWorkflow } from './workflows/weather-workflow';
 import { weatherAgent } from './agents/weather-agent';
 import { toolCallAppropriatenessScorer, completenessScorer, translationScorer } from './scorers/weather-scorer';
 import { ticketPipeline } from "../pipeline/ticket-pipeline";
+import { resolveMastraStorageUrl } from "./storage-url";
 
 applyWorkflowPersistencePatch();
 
@@ -21,9 +22,8 @@ export const mastra = new Mastra({
     id: 'composite-storage',
     default: new LibSQLStore({
       id: "mastra-storage",
-      // Uses a hosted database when deployed (mastra env db create --kind turso),
-      // and a local file during development.
-      url: process.env.TURSO_DATABASE_URL ?? "file:./mastra.db",
+      // Lokalny plik jest absolutny i poza regenerowanym `.mastra/output`.
+      url: resolveMastraStorageUrl(),
       authToken: process.env.TURSO_AUTH_TOKEN,
     }),
     domains: {
