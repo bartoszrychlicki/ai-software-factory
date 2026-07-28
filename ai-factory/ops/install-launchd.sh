@@ -70,6 +70,13 @@ find_blocking_runs() {
   '/Users/senioraiconsultant/.local/bin/node' -e '
 const fs=require("fs"), p=require("path"), root=p.join(process.argv[1],"runs");
 let ids=[];
+const dbFile=p.join(root,"lifecycle.db");
+if(fs.existsSync(dbFile)) {
+  const {DatabaseSync}=require("node:sqlite");
+  const db=new DatabaseSync(dbFile,{readOnly:true});
+  ids.push(...db.prepare("SELECT ticket_id FROM lifecycle_runs WHERE status = ?").all("running").map(r=>r.ticket_id));
+  db.close();
+}
 if(fs.existsSync(root)) for(const ticket of fs.readdirSync(root)) {
   const file=p.join(root,ticket,"state.json");
   try {
@@ -85,6 +92,13 @@ find_suspended_runs() {
   '/Users/senioraiconsultant/.local/bin/node' -e '
 const fs=require("fs"), p=require("path"), root=p.join(process.argv[1],"runs");
 let ids=[];
+const dbFile=p.join(root,"lifecycle.db");
+if(fs.existsSync(dbFile)) {
+  const {DatabaseSync}=require("node:sqlite");
+  const db=new DatabaseSync(dbFile,{readOnly:true});
+  ids.push(...db.prepare("SELECT ticket_id FROM lifecycle_runs WHERE status IN (?, ?)").all("waiting_human","waiting_external").map(r=>r.ticket_id));
+  db.close();
+}
 if(fs.existsSync(root)) for(const ticket of fs.readdirSync(root)) {
   const file=p.join(root,ticket,"state.json");
   try { const s=JSON.parse(fs.readFileSync(file,"utf8")); if(s.lifecycle==="awaiting_decision") ids.push(ticket); } catch {}

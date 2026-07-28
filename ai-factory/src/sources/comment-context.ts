@@ -19,7 +19,8 @@ export interface CommentContextSnapshot {
 export const DEFAULT_COMMENT_LIMIT = 20;
 export const DEFAULT_COMMENT_CHARS = 12_000;
 
-const factoryMarker = (ticketId: string) => `[linear:${ticketId}:v1]`;
+const hasFactoryMarker = (body: string, ticketId: string) =>
+  body.includes(`[linear:${ticketId}:v1]`) || body.includes(`[linear:${ticketId}:v2]`);
 
 /**
  * Komentarze autora są danymi planowania, ale komendy i komentarze fabryki
@@ -33,7 +34,7 @@ export function extractRelevantComments(
   return comments
     .flatMap((comment): RelevantComment[] => {
       const body = comment.body.trim();
-      if (!body || body.includes(factoryMarker(ticketId))) return [];
+      if (!body || hasFactoryMarker(body, ticketId)) return [];
       const command = parseCommand(body);
       if (!command) return [{ body, createdAt: comment.createdAt }];
       if ((command.kind === "answer" || command.kind === "reject") && command.payload) {

@@ -1,13 +1,12 @@
 # AI Software Factory
 
-Eksperymentalna, lokalna fabryka software oparta na agentach i trwałym workflow
-Mastra. Linear dostarcza kolejkę oraz bramki decyzyjne, role planner/builder/
-verifier/reviewer pracują przez adaptery CLI, a każdy ticket otrzymuje izolowany
-Git worktree i audytowalne artefakty przebiegu.
+Eksperymentalna, lokalna fabryka software oparta na agentach i trwałym
+koordynatorze SQLite. Linear dostarcza kolejkę i bramki człowieka, GitHub fakty
+o PR/CI/merge, a Mastra wykonuje wyłącznie krótkie joby plan/build/review.
 
 ```text
-Linear Todo → intake/outbox → plan → human gate → build → verify
-            → review → PR → human merge → cleanup → Done / prod smoke
+Preflight → Plan → /approve → Build → Test/E2E → Draft PR
+          → GitHub CI → In Review → Human merge → Prod smoke → Done
 ```
 
 ## Co znajduje się w repo
@@ -22,12 +21,12 @@ Linear Todo → intake/outbox → plan → human gate → build → verify
 
 ## Najważniejsze własności
 
-- ścisłe, fail-closed kontrakty plan/verify/review;
-- trwały outbox i odzyskiwanie workflow po restarcie;
-- izolowane branche/worktree i rezerwacja plików między ticketami;
-- niezależne verify i review na pełnym diffie brancha;
+- ścisłe, fail-closed kontrakty plan/review;
+- kanoniczne registry SQLite, trwały outbox i stage-only recovery;
+- izolowane branche/worktree bez globalnych rezerwacji plików;
+- deterministyczne testy exact-SHA i advisory review;
 - jawna akceptacja planu oraz merge pozostawiony człowiekowi;
-- pre-merge re-verify, sprzątanie po merge i opcjonalny prod smoke;
+- ponowne testy po zmianie PR head, sprzątanie po merge i prod smoke;
 - allowlista środowiska procesów agentów bez dziedziczenia sekretów fabryki.
 
 Instrukcje uruchomienia, testowania i instalacji usług launchd są w

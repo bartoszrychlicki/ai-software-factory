@@ -1,8 +1,5 @@
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import { engineEnv } from "../engines/env";
-
-const exec = promisify(execFile);
+import { execFileControlled } from "./process-control";
 
 export interface QualityCommandResult {
   command: string;
@@ -29,16 +26,17 @@ export function cleanExecutionEnv(source: NodeJS.ProcessEnv = process.env): Node
 export async function runQualityCommands(
   cwd: string,
   commands: string[],
-  options: { timeoutMs?: number; env?: NodeJS.ProcessEnv } = {}
+  options: { timeoutMs?: number; env?: NodeJS.ProcessEnv; signal?: AbortSignal } = {}
 ): Promise<QualityCommandResult[]> {
   const results: QualityCommandResult[] = [];
   for (const command of commands) {
     const startedAt = Date.now();
     try {
-      await exec("bash", ["-c", command], {
+      await execFileControlled("bash", ["-c", command], {
         cwd,
         env: options.env ?? cleanExecutionEnv(),
-        timeout: options.timeoutMs ?? 20 * 60_000,
+        signal: options.signal,
+        timeoutMs: options.timeoutMs ?? 20 * 60_000,
         maxBuffer: 50 * 1024 * 1024,
       });
       results.push({ command, durationMs: Date.now() - startedAt });
@@ -56,8 +54,8 @@ export function allQualityCommands(ticket: { checks?: string[]; e2e?: string }):
 }
 
 async function mergeBaseWith(workspaceDir: string, defaultBranch: string): Promise<string> {
-  await exec("git", ["-C", workspaceDir, "fetch", "origin", defaultBranch]);
-  const { stdout } = await exec("git", [
+  await execFileControlled("git", ["-C", workspaceDir, "fetch", "origin", defaultBranch]);
+  const { stdout } = await execFileControlled("git", [
     "-C",
     workspaceDir,
     "merge-base",
@@ -70,7 +68,7 @@ async function mergeBaseWith(workspaceDir: string, defaultBranch: string): Promi
 /** Pełny diff PR-a względem aktualnej bazy, niezależnie od liczby fix commitów i merge commitów. */
 export async function fullBranchDiff(workspaceDir: string, defaultBranch: string): Promise<string> {
   const base = await mergeBaseWith(workspaceDir, defaultBranch);
-  const { stdout: diff } = await exec(
+  const { stdout: diff } = await execFileControlled(
     "git",
     ["-C", workspaceDir, "diff", "--no-ext-diff", "--find-renames", `${base}...HEAD`],
     { maxBuffer: 20 * 1024 * 1024 }
@@ -92,12 +90,12 @@ export async function changeManifest(
   const base = await mergeBaseWith(workspaceDir, defaultBranch);
   const diffRange = `${base}...HEAD`;
   const [{ stdout: nameStatus }, { stdout: diffStat }] = await Promise.all([
-    exec(
+    execFileControlled(
       "git",
       ["-C", workspaceDir, "diff", "--no-ext-diff", "--find-renames", "--name-status", diffRange],
       { maxBuffer: 20 * 1024 * 1024 }
     ),
-    exec(
+    execFileControlled(
       "git",
       ["-C", workspaceDir, "diff", "--no-ext-diff", "--find-renames", "--stat", diffRange],
       { maxBuffer: 20 * 1024 * 1024 }

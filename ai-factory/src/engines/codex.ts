@@ -1,9 +1,9 @@
-import { execFile } from "node:child_process";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { EngineAdapter, EngineRunInput, EngineRunResult } from "./types";
 import { engineEnv } from "./env";
+import { execFileControlled } from "../pipeline/process-control";
 
 const CODEX_BIN = process.env.CODEX_BIN ?? "codex";
 
@@ -27,39 +27,36 @@ export const codex: EngineAdapter = {
     if (input.effort) args.push("-c", `model_reasoning_effort="${input.effort}"`);
     args.push("-"); // czytaj prompt ze stdin
 
-    return new Promise((resolve) => {
-      const child = execFile(
-        CODEX_BIN,
-        args,
-        {
-          cwd: input.workspace,
-          timeout: input.budget.minutes * 60_000,
-          maxBuffer: 50 * 1024 * 1024,
-          env: engineEnv(),
-        },
-        async (error, stdout, stderr) => {
-          let report = "";
-          try {
-            report = await readFile(lastMsg, "utf8");
-          } catch {}
-          await rm(outDir, { recursive: true, force: true });
-
-          if (error) {
-            // BEZ error.message — zawiera echo całej komendy z promptem (megabajty w raporcie)
-            const code = (error as NodeJS.ErrnoException).code ?? (error as { signal?: string }).signal ?? "?";
-            resolve({
-              ok: false,
-              report: report || `Proces codex zakończył się błędem (${code}). stderr:\n${stderr.slice(-2000)}`,
-              raw: { stderr: stderr.slice(-5000) },
-            });
-            return;
-          }
-          resolve({ ok: report.trim().length > 0, report, raw: { stdout: stdout.slice(-5000) } });
-        }
-      );
-
-      child.stdin?.write(prompt);
-      child.stdin?.end(); // EOF obowiązkowy — codex czeka na stdin
-    });
+    let stdout = "";
+    let stderr = "";
+    let processError: unknown;
+    try {
+      ({ stdout, stderr } = await execFileControlled(CODEX_BIN, args, {
+        cwd: input.workspace,
+        env: engineEnv(),
+        input: prompt,
+        signal: input.signal,
+        timeoutMs: input.budget.minutes * 60_000,
+      }));
+    } catch (error) {
+      processError = error;
+      const detail = error as { stdout?: string; stderr?: string };
+      stdout = detail.stdout ?? "";
+      stderr = detail.stderr ?? "";
+    }
+    let report = "";
+    try {
+      report = await readFile(lastMsg, "utf8");
+    } catch {}
+    await rm(outDir, { recursive: true, force: true });
+    if (processError) {
+      const reason = (processError as { terminationReason?: string }).terminationReason ?? "process-error";
+      return {
+        ok: false,
+        report: report || `Proces codex zakończył się błędem (${reason}). stderr:\n${stderr.slice(-2000)}`,
+        raw: { stderr: stderr.slice(-5000) },
+      };
+    }
+    return { ok: report.trim().length > 0, report, raw: { stdout: stdout.slice(-5000) } };
   },
 };
