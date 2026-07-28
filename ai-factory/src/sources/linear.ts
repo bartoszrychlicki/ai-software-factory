@@ -81,6 +81,20 @@ export class LinearSource implements TicketSource {
     return data.issue;
   }
 
+  async getTicket(identifier: string): Promise<Ticket & { stateName: string }> {
+    const issue = await this.fetchIssue(identifier);
+    return {
+      id: issue.identifier,
+      source: this.name,
+      title: issue.title,
+      description: issue.description ?? "",
+      labels: issue.labels.nodes.map((label) => label.name),
+      priority: issue.priorityLabel ?? undefined,
+      url: issue.url,
+      stateName: issue.state.name,
+    };
+  }
+
   /**
    * Tickety oddane fabryce przez człowieka = stan `ready` z mapy (Linear: "Todo").
    * STAN, nie label — sterowanie przepływem jest deterministyczne i widoczne na tablicy.
@@ -126,7 +140,7 @@ export class LinearSource implements TicketSource {
         : status === "needs_clarification"
           ? LINEAR_STATE_MAP.ready
           : status === "blocked"
-            ? "Backlog"
+            ? "👤 ⛔ Zablokowany"
             : undefined;
     const state = pickState(issue.team.states.nodes, STATUS_TO_STATE_TYPE[status], preferredName);
     await this.gql(

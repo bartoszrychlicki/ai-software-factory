@@ -10,6 +10,8 @@ export interface EngineRunInput {
   effort?: string;         // reasoning effort: low/medium/high/xhigh (mapowany per CLI)
   /** Wznowienie bieżącej sesji CLI; w MVP obsługiwane tylko przez claude-code w roli plan. */
   sessionId?: string;
+  /** Anulowanie joba Mastry musi zakończyć także zewnętrzny proces CLI. */
+  signal?: AbortSignal;
 }
 
 export interface EngineRunResult {

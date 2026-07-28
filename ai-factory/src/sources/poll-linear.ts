@@ -71,6 +71,7 @@ import {
   type MastraRunSnapshot,
 } from "./mastra-client";
 import { MissingRunDetector, processRestartCommands } from "./run-recovery";
+import { currentTrackedPrUrl } from "./merge-tracking";
 
 const exec = promisify(execFile);
 
@@ -802,11 +803,7 @@ async function watchMerges() {
       }
       continue;
     }
-    const mine = issue.comments.filter((c) => c.body.includes(marker(issue.id)));
-    const prUrl = mine
-      .map((c) => c.body.match(/https:\/\/github\.com\/\S+\/pull\/\d+/)?.[0])
-      .filter(Boolean)
-      .pop();
+    const prUrl = currentTrackedPrUrl(persisted, issue.comments, marker(issue.id));
     if (!prUrl) continue;
 
     let pr: { state: string; headRefName: string };

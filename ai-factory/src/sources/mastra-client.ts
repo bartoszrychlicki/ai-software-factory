@@ -11,7 +11,7 @@ export interface MastraRunSnapshot {
 
 export interface WorkflowControlClient {
   serverUp(): Promise<boolean>;
-  createRun(): Promise<string>;
+  createRun(requestedRunId?: string): Promise<string>;
   startRun(runId: string, inputData: Record<string, unknown>): Promise<void>;
   resumeRun(runId: string, step: string | string[], resumeData: Record<string, unknown>): Promise<void>;
   getRun(runId: string): Promise<MastraRunSnapshot>;
@@ -74,13 +74,17 @@ export class MastraWorkflowClient implements WorkflowControlClient {
     }
   }
 
-  async createRun(): Promise<string> {
-    const data = await this.request(`/workflows/${this.workflow}/create-run`, {
+  async createRun(requestedRunId?: string): Promise<string> {
+    const suffix = requestedRunId ? `?runId=${encodeURIComponent(requestedRunId)}` : "";
+    const data = await this.request(`/workflows/${this.workflow}/create-run${suffix}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: "{}",
     }) as { runId?: string };
     if (!data?.runId) throw new Error("Mastra create-run nie zwróciła runId");
+    if (requestedRunId && data.runId !== requestedRunId) {
+      throw new Error(`Mastra nie zachowała żądanego runId: ${requestedRunId} != ${data.runId}`);
+    }
     return data.runId;
   }
 
