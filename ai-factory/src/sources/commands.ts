@@ -1,6 +1,6 @@
 import type { DecisionKind } from "../pipeline/run-registry";
 
-export type OperatorCommandKind = "restart";
+export type OperatorCommandKind = "retry" | "replan" | "restart";
 export type CommandKind = DecisionKind | OperatorCommandKind;
 
 /**
@@ -16,6 +16,8 @@ export const COMMANDS: Record<string, CommandKind> = {
   "/reject": "reject",
   "/answer": "answer",
   "/done": "done",
+  "/retry": "retry",
+  "/replan": "replan",
   "/restart": "restart",
 };
 
@@ -39,6 +41,8 @@ export function parseCommand(body: string): ParsedCommand | undefined {
   const kind = COMMANDS[first.toLowerCase()];
   if (!kind) return undefined;
   const payload = rest.join(" ").trim() || trimmed.slice(first.length).trim();
+  if (["reject", "answer", "replan"].includes(kind) && !payload) return undefined;
+  if (["approve", "retry", "done"].includes(kind) && payload) return undefined;
   return { kind, payload: payload || undefined };
 }
 
@@ -48,13 +52,10 @@ export function hintFor(
   states: { approve?: string; answer?: string; done?: string }
 ): string {
   if (gate === "plan-approval") {
-    return `ℹ️ To nie jest decyzja — przeciągnij kartę na **${states.approve ?? "Build"}** (zgoda) albo na Backlog/Canceled (odrzucenie), ` +
-      "ewentualnie napisz komendę `/approve` lub `/reject <powód>`.";
+    return "ℹ️ To nie jest decyzja. Zatwierdź wyłącznie komendą `/approve` albo odrzuć: `/reject <powód>`.";
   }
   if (gate === "ops-checklist") {
-    return `ℹ️ To nie jest potwierdzenie wykonania checklisty — przeciągnij kartę na **${states.done ?? "Weryfikacja"}** ` +
-      "albo napisz `/done`.";
+    return "ℹ️ To nie jest potwierdzenie wykonania checklisty — użyj wyłącznie komendy `/done`.";
   }
-  return `ℹ️ Odpowiedzi zapisane. Żeby fabryka doplanowała, przeciągnij kartę na **${states.answer ?? "Planowanie"}** ` +
-    "albo napisz `/answer <odpowiedzi>`.";
+  return "ℹ️ Odpowiedzi są wejściem dopiero po ścisłej komendzie `/answer <odpowiedzi>`.";
 }

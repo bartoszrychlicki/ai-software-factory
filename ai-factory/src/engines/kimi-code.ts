@@ -1,6 +1,6 @@
-import { execFile } from "node:child_process";
 import type { EngineAdapter, EngineRunInput, EngineRunResult } from "./types";
 import { engineEnv } from "./env";
+import { execFileControlled } from "../pipeline/process-control";
 
 const KIMI_BIN = process.env.KIMI_BIN ?? "kimi";
 
@@ -34,32 +34,23 @@ export const kimiCode: EngineAdapter = {
     if (input.model) args.push("-m", input.model);
     args.push("--output-format", "text", "-p", prompt);
 
-    return new Promise((resolve) => {
-      const child = execFile(
-        KIMI_BIN,
-        args,
-        {
-          cwd: input.workspace,
-          timeout: input.budget.minutes * 60_000,
-          maxBuffer: 50 * 1024 * 1024,
-          env: engineEnv(),
-        },
-        (error, stdout, stderr) => {
-          const report = stdout.trim();
-          if (error) {
-            resolve({
-              ok: false,
-              report: report || `Proces zakończył się błędem: ${error.message}\n${stderr}`,
-              raw: { stdout, stderr },
-            });
-            return;
-          }
-          resolve({ ok: report.length > 0, report, raw: { stderr } });
-        }
-      );
-
-      // defensywnie jak codex: bez EOF na stdin niektóre CLI czekają w nieskończoność
-      child.stdin?.end();
-    });
+    try {
+      const { stdout, stderr } = await execFileControlled(KIMI_BIN, args, {
+        cwd: input.workspace,
+        env: engineEnv(),
+        signal: input.signal,
+        timeoutMs: input.budget.minutes * 60_000,
+      });
+      const report = stdout.trim();
+      return { ok: report.length > 0, report, raw: { stderr } };
+    } catch (error) {
+      const detail = error as Error & { stdout?: string; stderr?: string };
+      const report = detail.stdout?.trim() ?? "";
+      return {
+        ok: false,
+        report: report || `Proces zakończył się błędem: ${detail.message}\n${detail.stderr ?? ""}`,
+        raw: { stdout: detail.stdout, stderr: detail.stderr },
+      };
+    }
   },
 };

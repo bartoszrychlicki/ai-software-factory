@@ -9,7 +9,7 @@
     "dev": "mastra dev",
     "build": "mastra build --studio",
     "start": "mastra start",
-    "poller": "tsx src/sources/poll-linear.ts"
+    "poller": "tsx src/sources/poll-linear-v2.ts"
   },
   "keywords": [],
   "author": "",

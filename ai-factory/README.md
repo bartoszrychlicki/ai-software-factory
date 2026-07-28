@@ -1,77 +1,88 @@
 # ai-factory
 
-Lokalna fabryka software: Linear jest kolejką i interfejsem bramek człowieka,
-a adaptery CLI realizują role planner, builder, verifier i reviewer w
-izolowanych worktree. Obecny pipeline używa Mastry jako legacy ownera workflow;
-zgodnie z decyzją BAR-157 docelowym i jedynym właścicielem lifecycle oraz
-efektów będzie transakcyjny SQLite coordinator, a Mastra pozostanie executorem.
+Lokalna fabryka software z trwałym koordynatorem SQLite. Linear jest kolejką
+i interfejsem człowieka, GitHub źródłem prawdy o PR/CI/merge, a Mastra wykonuje
+wyłącznie krótkie joby AI: `plan`, `build`, `review`.
 
-Pełny, aktualny diagram i opis stanów: [docs/ticket-flow.md](docs/ticket-flow.md).
-Wynik bramki trwałości BAR-157: [docs/mastra-lifecycle-spike.md](docs/mastra-lifecycle-spike.md).
-Zaakceptowany plan rozwoju na 90 dni:
-[docs/development-plan-2026.md](docs/development-plan-2026.md).
+```text
+Preflight → Plan → /approve → Build → Test/E2E → Draft PR
+          → GitHub CI → In Review → Human merge → Prod smoke → Done
+```
 
-## Uruchomienie
+Żaden workflow Mastry nie czeka na człowieka, CI ani merge i nie jest wznawiany.
+Poller może zostać zrestartowany w dowolnym etapie; kanoniczny stan, próby i
+idempotentny outbox są w `runs/lifecycle.db`.
 
-Lokalna usługa działa z wcześniej zbudowanego bundle'a razem z Mastra Studio,
-bez hot reloadu:
+Pełny diagram: [docs/ticket-flow.md](docs/ticket-flow.md).
+Decyzja architektoniczna BAR-157:
+[docs/mastra-lifecycle-spike.md](docs/mastra-lifecycle-spike.md).
+
+## Uruchomienie i walidacja
 
 ```shell
 npm ci
 npm run check
 npm test
-bash ops/install-launchd.sh
+npm run build
 ```
 
-Instalator zatrzymuje poller, sprawdza niedokończone runy, zatrzymuje serwer i
-dopiero wtedy buduje `.mastra/output`. Waliduje pliki wejściowe bundle'a oraz health
-check API i Studio; poller startuje dopiero po gotowości obu endpointów. Nie
-uruchamiaj osobnego `npm run build` przy działających usługach — Mastra regeneruje
-katalog output destrukcyjnie.
+Poller developerski:
 
-Tryb developerski (`npm run dev`) jest wyłącznie do pracy lokalnej. Hot reload
-nie może być używany podczas aktywnego runu ticketu.
+```shell
+FACTORY_ROOT="$(pwd)" npm run poller -- --once
+```
 
-## Komendy operatora w Linear
+Produkcja nadal korzysta z instalatora `ops/install-launchd.sh`. Nie buduj bundle'a
+pod działającym serwerem i nie uruchamiaj drugiej Mastry na tym samym storage.
 
-Komenda musi być pierwszym tokenem komentarza. `/restart [powód]` działa dla
-aktywnego ticketu bez opublikowanego PR-a: najpierw potwierdza anulowanie starego
-runu (brakujący run jest traktowany jako już anulowany), zwalnia jego rezerwacje,
-zapisuje audyt i oddaje ticket do `Todo`. Następny przebieg zawsze tworzy świeży
-run i świeży plan; nie reużywa poprzedniego planu.
+## Sterowanie w Linear
 
-Trzy kolejne odpowiedzi `404` dla runu Mastry zatrzymują cichą adopcję. Ticket
-przechodzi do jawnej blokady z instrukcją użycia `/restart`; timeout lub błąd
-transportu pozostaje bezpiecznym retry i nie unieważnia runu.
+Fabryka używa wyłącznie stanów `Todo → In Progress → In Review → Done` oraz
+`👤 ⛔ Zablokowany` i `Canceled`. Zmiana fazy przez przeciąganie karty nie jest
+decyzją workflow.
+
+- `/approve` — zatwierdza bieżący plan;
+- `/reject <powód>` — zatrzymuje plan;
+- `/answer <odpowiedź>` — odpowiada na pytania plannera (maks. dwie rundy);
+- `/retry` — ponawia wyłącznie zatrzymany etap;
+- `/replan <powód>` — unieważnia plan i tworzy nową generację;
+- `/restart` — tymczasowy alias `/replan`;
+- `/done` — potwierdza ręczne wykonanie zatwierdzonej checklisty ops.
+
+Komentarz autora przed buildem zmienia input hash i wymusza nowy plan. Podczas
+lub po buildzie zatrzymuje proces, zachowując branch i checkpoint.
 
 ## Najważniejsze pliki
 
-- `src/pipeline/ticket-pipeline.ts` — graf workflow i bramki jakościowe,
-- `src/sources/poll-linear.ts` — orkiestracja Lineara, adopcja runów i merge watcher,
-- `src/sources/mastra-client.ts` — sprawdzany klient start/resume/cancel,
-- `src/sources/run-recovery.ts` — lost-run guard i idempotentny `/restart`,
-- `src/pipeline/run-registry.ts` — trwały stan ticketu i outbox komend,
-- `src/pipeline/quality.ts` — wspólny runner checks/e2e i pełny diff brancha,
-- `src/pipeline/github-ci.ts` — gate wymaganych checks dla dokładnego PR head SHA,
-- `src/pipeline/scope.ts` — porównanie faktycznych zmian z kontraktem `plan.files`,
-- `projects.yaml` — repozytoria, limity, checks i prod smoke,
-- `routing.yaml` — routing ról do adapterów silników,
-- `runs/<ticket>/<run>/` — artefakty audytowe konkretnego przebiegu.
+- `src/pipeline/factory-job.ts` — jedyny krótki workflow Mastry;
+- `src/pipeline/coordinator.ts` — czysta maszyna przejść lifecycle;
+- `src/pipeline/lifecycle-store.ts` — registry v2, próby i outbox w SQLite;
+- `src/sources/poll-linear-v2.ts` — preflight, dispatch, reconciliation i GitHub;
+- `src/pipeline/preflight.ts` — odczytowe sprawdzenie zależności przed claimem;
+- `src/pipeline/process-control.ts` — AbortSignal, TERM/KILL grupy procesu;
+- `src/pipeline/legacy-migration.ts` — read-only import zatwierdzonego planu,
+  checkpointu i jawnie przypiętego PR-a z registry v1;
+- `src/pipeline/scope.ts` — warnings dla zwykłych odchyleń i blokada
+  sekretów/niezatwierdzonych ścieżek chronionych;
+- `projects.yaml` i `routing.yaml` — projekty, checks, budżety i adaptery.
 
-## Zasady bezpieczeństwa
+`ticket-pipeline.ts`, `poll-linear.ts` i `run-registry.ts` pozostają kodem legacy
+do odczytu/testów migracji, ale nie są podpięte do runtime.
 
-- Plan, verify i review kończą się ścisłym blokiem `factory`; brak/niepoprawny
-  kontrakt jest wynikiem negatywnym.
-- Build działa w osobnym worktree. Codex ma sandbox `workspace-write`; role
-  read-only dostają sandbox/whitelistę narzędzi.
-- Procesy agentów dostają allowlistę zmiennych środowiskowych, bez tokenów
-  Lineara, storage i powiadomień.
-- Niesandboxowany Kimi jest domyślnie wyłączony i wymaga jawnego
-  `FACTORY_ALLOW_UNSANDBOXED_KIMI=1`.
-- Merge pozostaje decyzją człowieka. Fabryka publikuje draft PR, wykonuje review,
-  re-verify po przesunięciu `main` i sprząta dopiero po merge/zamknięciu.
-- Każdy nowy SHA po synchronizacji z `main` lub poprawce review ponownie przechodzi
-  checks/e2e i acceptance verification. `PR ready` wymaga `sha === verifiedSha`
-  oraz zielonego GitHub CI dla tego samego SHA.
-- Projekt bez deterministycznych checks/required checks oraz zmiana pliku spoza
-  zatwierdzonego planu są blokowane fail-closed.
+## Gwarancje
+
+- Build tworzy jeden checkpoint. Brak finału CLI, timeout lub błąd logowania
+  zatrzymuje etap bez automatycznego drugiego buildera.
+- Testy i E2E biegną bez AI na świeżym checkoutcie dokładnego SHA.
+- Po FAIL poprawka buildera powstaje wyłącznie po `/retry`.
+- `factory.files` jest oczekiwaniem. Dodatkowy zwykły plik daje warning;
+  sekret lub niezatwierdzony workflow/ops/migracja blokują publikację.
+- PR jest identyfikowany tylko przez trwałe `prUrl`; historyczne komentarze są
+  ignorowane. Publish wykrywa istniejący branch/draft PR.
+- Każda zmiana PR head SHA unieważnia test/CI i uruchamia scope audit + testy
+  nowego SHA, nigdy pełny rebuild.
+- Review AI jest advisory i może ponowić wyłącznie review raz. Nigdy nie odpala
+  buildera.
+- `Done` dla ticketu kodowego wymaga merge dokładnie śledzonego PR-a. Smoke FAIL
+  blokuje już zmergowany ticket bez automatycznego rollbacku.
+- Budżet jest wspólny dla wszystkich krótkich jobów ticketu.
