@@ -49,8 +49,16 @@ export async function runQualityCommands(
   return results;
 }
 
-export function allQualityCommands(ticket: { checks?: string[]; e2e?: string }): string[] {
-  return [...(ticket.checks ?? []), ...(ticket.e2e ? [ticket.e2e] : [])];
+export function allQualityCommands(ticket: {
+  checks?: string[];
+  e2e?: string;
+  /** true = `--config auto`; string = ścieżka reguł w repo (projects.yaml security.semgrep). */
+  semgrep?: boolean | string;
+}): string[] {
+  const semgrep = ticket.semgrep
+    ? [`semgrep scan --error --quiet --config ${typeof ticket.semgrep === "string" ? ticket.semgrep : "auto"} .`]
+    : [];
+  return [...(ticket.checks ?? []), ...semgrep, ...(ticket.e2e ? [ticket.e2e] : [])];
 }
 
 async function mergeBaseWith(workspaceDir: string, defaultBranch: string): Promise<string> {

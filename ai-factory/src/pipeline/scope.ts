@@ -58,31 +58,70 @@ export function isSecretPath(path: string): boolean {
     /(^|\/)service-account[^/]*\.json$/.test(normalized);
 }
 
+/**
+ * Pliki, których niezadeklarowana zmiana blokuje: etap test WYKONUJE je
+ * (npm ci → lifecycle scripts, configi testów/buildu) z uprawnieniami
+ * użytkownika, więc "warning w PR" to za mało (wektor postinstall → RCE).
+ */
+const PROTECTED_BASENAMES = new Set([
+  "package.json",
+  "package-lock.json",
+  "npm-shrinkwrap.json",
+  "pnpm-lock.yaml",
+  "yarn.lock",
+  "bun.lock",
+  "bun.lockb",
+  ".npmrc",
+]);
+
+const PROTECTED_BASENAME_PATTERNS = [
+  /^tsconfig[^/]*\.json$/,
+  /^(vitest|vite|next|playwright|jest|babel|eslint|webpack|rollup|tsup)\.config\.[a-z]+$/,
+];
+
 export function isProtectedPath(path: string): boolean {
   const normalized = normalize(path);
+  const name = basename(path);
   return normalized.startsWith(".github/") ||
     normalized.startsWith("ai-factory/ops/") ||
     normalized === "ops" ||
     normalized.startsWith("ops/") ||
     normalized === "migrations" ||
     normalized.startsWith("migrations/") ||
-    normalized.includes("/migrations/");
+    normalized.includes("/migrations/") ||
+    normalized === "scripts" ||
+    normalized.startsWith("scripts/") ||
+    normalized.includes("/scripts/") ||
+    PROTECTED_BASENAMES.has(name) ||
+    PROTECTED_BASENAME_PATTERNS.some((pattern) => pattern.test(name));
 }
 
 /**
  * `factory.files` jest oczekiwaniem, nie kruchą allowlistą.
  * Sekrety są zawsze blokowane, a niezadeklarowane ścieżki o wysokim ryzyku
  * wymagają jawnej aprobaty w planie. Pozostałe odchylenia trafiają do PR-a.
+ * `extraProtected` to per-projektowe ścieżki z projects.yaml (scope.protected):
+ * dopasowanie po pełnej ścieżce, prefiksie katalogu albo basename.
  */
-export function auditScope(declaredFiles: string[], changedFiles: string[]): ScopeAudit {
+export function auditScope(
+  declaredFiles: string[],
+  changedFiles: string[],
+  extraProtected: string[] = []
+): ScopeAudit {
   const declared = new Set(declaredFiles.map(normalize).filter(Boolean));
+  const extras = extraProtected.map(normalize).filter(Boolean);
+  const isExtraProtected = (path: string) => extras.some((entry) =>
+    path === entry ||
+    path.startsWith(`${entry.replace(/\/+$/, "")}/`) ||
+    basename(path) === entry.toLowerCase()
+  );
   const warnings: string[] = [];
   const blocked: string[] = [];
 
   for (const raw of [...new Set(changedFiles.map(normalize).filter(Boolean))]) {
     if (isSecretPath(raw)) {
       blocked.push(`${raw}: plik sekretu/klucza`);
-    } else if (isProtectedPath(raw) && !declared.has(raw)) {
+    } else if ((isProtectedPath(raw) || isExtraProtected(raw)) && !declared.has(raw)) {
       blocked.push(`${raw}: chroniona ścieżka nie została zatwierdzona w planie`);
     } else if (!declared.has(raw)) {
       warnings.push(`${raw}: poza oczekiwaną listą factory.files`);

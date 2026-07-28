@@ -27,6 +27,15 @@ function parseSpec(spec: string): { engineName: string; model?: string; effort?:
   return { engineName, model: model || undefined, effort: effort || undefined };
 }
 
+export interface RouteOptions {
+  /**
+   * Dywersyfikacja cross-engine: jeżeli rozstrzygnięty silnik jest równy
+   * wykluczonemu (np. reviewer == builder), routing przechodzi na
+   * `<etap>.diverse`; brak fallbacku = fail-closed.
+   */
+  excludeEngine?: string;
+}
+
 /**
  * Kolejność rozstrzygania (od najbardziej szczegółowego):
  * 1. label `engine:<silnik[/model]>` na tickecie (ręczne wskazanie),
@@ -37,7 +46,8 @@ function parseSpec(spec: string): { engineName: string; model?: string; effort?:
 export async function resolveRoute(
   stage: Stage,
   ticket: { project: string; labels?: string[] },
-  domain?: string
+  domain?: string,
+  options: RouteOptions = {}
 ): Promise<Route> {
   const raw = await readFile(findUpFile("routing.yaml"), "utf8");
   const cfg = parse(raw) as RoutingFile;
@@ -47,7 +57,7 @@ export async function resolveRoute(
   const label = stage === "build" ? (ticket.labels ?? []).find((l) => l.startsWith("engine:")) : undefined;
   const projectCfg = cfg.projects?.[ticket.project];
 
-  const spec =
+  let spec =
     label?.slice("engine:".length) ??
     (domain ? projectCfg?.[`${stage}.${domain}`] : undefined) ??
     projectCfg?.[stage] ??
@@ -56,6 +66,20 @@ export async function resolveRoute(
 
   if (!spec) {
     throw new Error(`Brak routingu dla etapu "${stage}" (projekt: ${ticket.project}) w routing.yaml`);
+  }
+
+  if (options.excludeEngine && parseSpec(spec).engineName === options.excludeEngine) {
+    const diverse = projectCfg?.[`${stage}.diverse`] ?? cfg.defaults?.[`${stage}.diverse`];
+    if (!diverse) {
+      throw new Error(
+        `Routing ${stage}: silnik "${options.excludeEngine}" jest wykluczony (ten sam co builder), ` +
+        `a routing.yaml nie ma fallbacku "${stage}.diverse".`
+      );
+    }
+    if (parseSpec(diverse).engineName === options.excludeEngine) {
+      throw new Error(`Routing ${stage}.diverse wskazuje wykluczony silnik "${options.excludeEngine}".`);
+    }
+    spec = diverse;
   }
 
   const { engineName, model, effort } = parseSpec(spec);

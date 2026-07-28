@@ -240,6 +240,27 @@ function failedJobOutput(command: LifecycleCommand, report: string): FactoryJobO
 }
 
 /**
+ * Payload joba wzbogacony poller-side: review dostaje harness buildera z
+ * podpisu ostatniej próby build, żeby routing mógł wykluczyć ten sam silnik
+ * (dywersyfikacja reviewer ≠ builder). Klucz idempotencji i zapisany payload
+ * komendy pozostają nietknięte.
+ */
+function jobInputData(
+  deps: PollerDependencies,
+  command: LifecycleCommand,
+  run: LifecycleRun
+): Record<string, unknown> {
+  if (command.payload.kind !== "review") return command.payload;
+  // Format podpisu: "ai-factory · <harness> · <model> · <profil>"; harness może
+  // nieść wersję CLI ("codex@0.44") — do wykluczenia liczy się sama nazwa.
+  const signature = deps.store.latestAttempt(run.ticketId, "build")?.signature;
+  const buildHarness = signature?.split(" · ")[1]?.split("@")[0]?.trim();
+  return buildHarness && buildHarness !== "unavailable"
+    ? { ...command.payload, buildHarness }
+    : command.payload;
+}
+
+/**
  * Stall lease: job Mastry, który wisi w pending/running dłużej niż budżet roli
  * + grace, jest anulowany i kończy się JOB_STALLED zamiast wisieć bez końca
  * (np. po SIGKILL serwera Mastry snapshot zostaje "running" na zawsze).
@@ -332,6 +353,7 @@ async function dispatchJob(
     return;
   }
 
+  const inputData = jobInputData(deps, command, run);
   let jobRunId = command.externalId;
   if (!jobRunId) {
     jobRunId = stableRunId(command.key);
@@ -345,7 +367,7 @@ async function dispatchJob(
     deps.store.startAttempt(run.ticketId, command.stage, attempt, jobRunId, attemptDetails);
     deps.store.markCommand(command.key, "dispatched", { externalId: jobRunId });
     if (!existing || runStatus(existing) === "pending") {
-      await deps.mastra.startRun(jobRunId, command.payload);
+      await deps.mastra.startRun(jobRunId, inputData);
     }
     return;
   }
@@ -354,7 +376,7 @@ async function dispatchJob(
   const status = runStatus(snapshot);
   if (status === "pending" || status === "running") {
     if (await handleStalledJob(deps, command, run, attempt, jobRunId, status)) return;
-    if (status === "pending") await deps.mastra.startRun(jobRunId, command.payload);
+    if (status === "pending") await deps.mastra.startRun(jobRunId, inputData);
     return;
   }
 
@@ -692,9 +714,13 @@ async function runExactShaTests(
       project.default_branch ?? "main",
       controller.signal
     );
-    const scope = auditScope(run.planFiles, changedFiles);
+    const scope = auditScope(run.planFiles, changedFiles, project.scope?.protected ?? []);
     if (scope.blocked.length) throw new Error(`Scope audit:\n${scope.blocked.join("\n")}`);
-    const commands = allQualityCommands({ checks: project.checks, e2e: project.qa?.e2e });
+    const commands = allQualityCommands({
+      checks: project.checks,
+      e2e: project.qa?.e2e,
+      semgrep: project.security?.semgrep,
+    });
     const results = await runQualityCommands(checkout.dir, commands, {
       env: cleanExecutionEnv(),
       timeoutMs: 20 * 60_000,

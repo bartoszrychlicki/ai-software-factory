@@ -4,7 +4,23 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { changeManifest, fullBranchDiff, QualityGateError, runQualityCommands } from "../pipeline/quality";
+import { allQualityCommands, changeManifest, fullBranchDiff, QualityGateError, runQualityCommands } from "../pipeline/quality";
+
+test("semgrep jako opt-in wchodzi między checks a e2e i jest blokujący jak każdy check", () => {
+  assert.deepEqual(allQualityCommands({ checks: ["npm test"], e2e: "npm run e2e" }), [
+    "npm test",
+    "npm run e2e",
+  ]);
+  assert.deepEqual(allQualityCommands({ checks: ["npm test"], semgrep: true }), [
+    "npm test",
+    "semgrep scan --error --quiet --config auto .",
+  ]);
+  assert.deepEqual(allQualityCommands({ checks: ["npm test"], semgrep: ".semgrep/rules.yaml", e2e: "npm run e2e" }), [
+    "npm test",
+    "semgrep scan --error --quiet --config .semgrep/rules.yaml .",
+    "npm run e2e",
+  ]);
+});
 
 const git = (cwd: string, ...args: string[]) =>
   execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8" });

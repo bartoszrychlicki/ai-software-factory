@@ -26,6 +26,10 @@ export interface ProjectConfig {
     e2e?: string;
     prodChecks?: { name: string; url: string; status?: number; textIncludes?: string; headerIncludes?: string }[];
   };
+  /** Dodatkowe chronione ścieżki projektu (pełna ścieżka, prefiks katalogu albo basename). */
+  scope?: { protected?: string[] };
+  /** Deterministyczne bramki bezpieczeństwa: semgrep true = `--config auto`, string = ścieżka reguł w repo. */
+  security?: { semgrep?: boolean | string };
 }
 
 export const DEFAULT_VERIFY_BUDGET_MINUTES = 5;

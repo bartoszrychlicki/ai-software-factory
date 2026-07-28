@@ -48,6 +48,12 @@ export async function runPreflight(
   if (!project) return { ok: false, errors, warnings, localExactShaCi };
 
   await access(project.repo).catch(() => errors.push(`Repo nie istnieje lub jest niedostępne: ${project.repo}`));
+  if (project.security?.semgrep) {
+    await exec("sh", ["-c", `command -v "$1" >/dev/null`, "preflight", "semgrep"])
+      .catch(() => errors.push(
+        `Projekt "${projectKey}" wymaga semgrep (security.semgrep), ale binarium nie jest w PATH.`
+      ));
+  }
   await exec("git", ["-C", project.repo, "remote", "get-url", "origin"])
     .catch((error) => errors.push(`Repo/remote origin: ${error instanceof Error ? error.message : error}`));
   await exec("gh", ["auth", "status"], { cwd: project.repo })

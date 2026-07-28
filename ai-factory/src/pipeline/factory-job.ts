@@ -43,6 +43,8 @@ export const factoryJobInputSchema = z.object({
   planDomain: z.string().optional(),
   feedback: z.string().optional(),
   headSha: z.string().optional(),
+  /** Harness buildera tego ticketu — review wyklucza go w routingu (dywersyfikacja). */
+  buildHarness: z.string().optional(),
 });
 
 export const factoryJobOutputSchema = z.object({
@@ -75,7 +77,8 @@ export interface FactoryJobRuntime {
   route(
     stage: Stage,
     ticket: { project: string; labels?: string[] },
-    domain?: string
+    domain?: string,
+    options?: { excludeEngine?: string }
   ): Promise<Route>;
   project(key: string): Promise<ProjectConfig>;
 }
@@ -209,7 +212,11 @@ async function runBuild(
         "git",
         ["-C", project.repo, "diff", "--name-only", "-z", `${base.trim()}...${verified}`]
       );
-      const checkpointAudit = auditScope(input.planFiles, names.split("\0").filter(Boolean));
+      const checkpointAudit = auditScope(
+        input.planFiles,
+        names.split("\0").filter(Boolean),
+        project.scope?.protected ?? []
+      );
       if (checkpointAudit.blocked.length) {
         throw new Error(`Checkpoint narusza aktualny plan:\n${checkpointAudit.blocked.join("\n")}`);
       }
@@ -314,7 +321,7 @@ async function runBuild(
     };
   }
 
-  const audit = auditScope(input.planFiles, changedFiles);
+  const audit = auditScope(input.planFiles, changedFiles, project.scope?.protected ?? []);
   if (audit.blocked.length) {
     return {
       kind: "build",
@@ -403,7 +410,9 @@ async function runReview(
 ): Promise<FactoryJobOutput> {
   if (!input.headSha) throw new Error("Review wymaga dokładnego PR head SHA.");
   const project = await runtime.project(input.ticket.project);
-  const route = await runtime.route("review", input.ticket, input.planDomain);
+  const route = await runtime.route("review", input.ticket, input.planDomain, {
+    excludeEngine: input.buildHarness,
+  });
   const signature = buildSignature("review", route);
   const checkout = await createCheckout(project.repo, input.headSha, `${input.ticket.id}-review-${runId}`);
   const startedAt = Date.now();

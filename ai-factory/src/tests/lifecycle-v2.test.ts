@@ -328,6 +328,86 @@ test("/retry odtwarza tylko zatrzymany deterministyczny etap", () => {
   assert.equal(ciRetry.commands.length, 0);
 });
 
+test("mark-pr-ready dopiero po werdykcie review; komentarz przed zdjęciem draftu", () => {
+  const base: LifecycleRun = {
+    ticketId: "BAR-R1",
+    project: "br-factory",
+    generation: 1,
+    stage: "ci",
+    status: "waiting_external",
+    manifest,
+    planFiles: ["src/a.ts"],
+    clarifyRound: 0,
+    branch: "agent/BAR-R1",
+    headSha: "a".repeat(40),
+    testedSha: "a".repeat(40),
+    prUrl: "https://github.test/o/r/pull/9",
+    createdAt: "x",
+    updatedAt: "x",
+  };
+  const ciPass = reduceLifecycle(base, {
+    type: "ci-result", outcome: "pass", sha: base.headSha!, report: "quality", nextReviewAttempt: 1,
+  });
+  assert.deepEqual(ciPass.commands.map((command) => command.kind), ["run-job"]);
+
+  const reviewRun: LifecycleRun = { ...base, stage: "review", status: "running", reviewStatus: "running" };
+  const verdict = reduceLifecycle(reviewRun, {
+    type: "job-finished",
+    attempt: 1,
+    output: {
+      kind: "review",
+      outcome: "success",
+      report: "uwagi doradcze",
+      signature: "reviewer",
+      durationMs: 1,
+      files: [],
+      changedFiles: [],
+      scopeWarnings: [],
+      headSha: base.headSha,
+      reviewVerdict: "advisory-fix",
+    },
+  });
+  // Komentarz recenzenta istnieje ZANIM PR wyjdzie z draftu; advisory nadal nie blokuje.
+  assert.deepEqual(verdict.commands.map((command) => command.kind), ["comment-pr", "mark-pr-ready"]);
+  assert.deepEqual([verdict.transition.stage, verdict.transition.status], ["merge", "waiting_human"]);
+});
+
+test("/retry review: bez werdyktu ponawia joba, z werdyktem tylko mark-pr-ready", () => {
+  const blockedReview: LifecycleRun = {
+    ticketId: "BAR-R2",
+    project: "br-factory",
+    generation: 1,
+    stage: "review",
+    status: "blocked",
+    manifest,
+    planFiles: [],
+    clarifyRound: 0,
+    headSha: "b".repeat(40),
+    prUrl: "https://github.test/o/r/pull/10",
+    blockedStage: "review",
+    errorCode: "REVIEW_UNAVAILABLE",
+    reviewStatus: "unavailable",
+    createdAt: "x",
+    updatedAt: "x",
+  };
+  const jobRetry = reduceLifecycle(blockedReview, { type: "retry", commentId: "c1", nextAttempt: 3 });
+  assert.deepEqual(jobRetry.commands.map((command) => command.kind), ["run-job"]);
+  assert.deepEqual([jobRetry.transition.stage, jobRetry.transition.status], ["review", "running"]);
+
+  const readyRetry = reduceLifecycle(
+    { ...blockedReview, errorCode: "OUTBOX_FAILED", reviewStatus: "lgtm" },
+    { type: "retry", commentId: "c2" }
+  );
+  assert.deepEqual(readyRetry.commands.map((command) => command.kind), ["mark-pr-ready"]);
+  assert.deepEqual([readyRetry.transition.stage, readyRetry.transition.status], ["merge", "waiting_human"]);
+
+  const stalled = reduceLifecycle(
+    { ...blockedReview, errorCode: "JOB_STALLED", reviewStatus: "running" },
+    { type: "retry", commentId: "c3", nextAttempt: 2 }
+  );
+  assert.deepEqual(stalled.commands.map((command) => command.kind), ["run-job"]);
+});
+
 test("br-budget używa lokalnego exact-SHA jako jedynego fallbacku CI", () => {
   const sha = "1".repeat(40);
   assert.equal(localExactShaCiResult("br-factory", sha, sha), undefined);

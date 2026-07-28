@@ -21,12 +21,15 @@ test("adapter silnika nie dziedziczy sekretów aplikacji", () => {
     TURSO_AUTH_TOKEN: "secret",
     FACTORY_CB_USD_PER_H: "25",
     HTTPS_PROXY: "http://proxy",
+    SSH_AUTH_SOCK: "/tmp/ssh-agent.sock",
   });
   assert.equal(env.PATH, "/bin");
   assert.equal(env.HTTPS_PROXY, "http://proxy");
   assert.equal(env.LINEAR_API_KEY, undefined);
   assert.equal(env.TURSO_AUTH_TOKEN, undefined);
   assert.equal(env.FACTORY_CB_USD_PER_H, undefined);
+  // Agent nie może używać żywego agenta SSH właściciela (push robi fabryka).
+  assert.equal(env.SSH_AUTH_SOCK, undefined);
 });
 
 test("bramka ops przyjmuje ruch do Weryfikacji i ścisłą komendę /done", () => {

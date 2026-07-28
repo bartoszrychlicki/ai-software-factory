@@ -393,25 +393,34 @@ export function reduceLifecycle(run: LifecycleRun, event: CoordinatorEvent): Coo
       if (!retryable.includes(run.errorCode ?? "") || !run.prUrl || !run.headSha) {
         throw new Error("Review nie ma bezpiecznej operacji do ponowienia.");
       }
-      const attempt = event.nextAttempt ?? 1;
-      return {
-        transition: {
-          stage: "review",
-          status: "running",
-          actor: "human",
-          reason: `/retry ${event.commentId}: ready-and-review`,
-          patch: { blockedStage: undefined, errorCode: undefined, errorMessage: undefined },
-        },
-        commands: [
-          {
+      // Werdykt już jest → brakuje tylko zdjęcia draftu; bez werdyktu → sam job.
+      if (run.reviewStatus === "lgtm" || run.reviewStatus === "advisory-fix") {
+        return {
+          transition: {
+            stage: "merge",
+            status: "waiting_human",
+            actor: "human",
+            reason: `/retry ${event.commentId}: mark-ready-only`,
+            patch: { blockedStage: undefined, errorCode: undefined, errorMessage: undefined },
+          },
+          commands: [{
             key: key(run, `ready:${run.headSha}:retry:${event.commentId}`),
             ticketId: run.ticketId,
             kind: "mark-pr-ready",
             stage: "review",
             payload: { prUrl: run.prUrl, sha: run.headSha },
-          },
-          jobCommand(run, "review", "review", attempt),
-        ],
+          }],
+        };
+      }
+      return {
+        transition: {
+          stage: "review",
+          status: "running",
+          actor: "human",
+          reason: `/retry ${event.commentId}: review-job`,
+          patch: { blockedStage: undefined, errorCode: undefined, errorMessage: undefined },
+        },
+        commands: [jobCommand(run, "review", "review", event.nextAttempt ?? 1)],
       };
     }
     if (run.blockedStage === "build" || run.blockedStage === "plan") {
@@ -568,6 +577,8 @@ export function reduceLifecycle(run: LifecycleRun, event: CoordinatorEvent): Coo
     if (event.output.reviewVerdict === "unavailable") {
       return blocked(run, "review", "REVIEW_UNAVAILABLE", event.output.report.slice(0, 6000));
     }
+    // Advisory zostaje advisory: lgtm i advisory-fix odblokowują ready, ale
+    // komentarz recenzenta jest dispatchowany PRZED zdjęciem draftu.
     return {
       transition: {
         stage: "merge",
@@ -576,13 +587,22 @@ export function reduceLifecycle(run: LifecycleRun, event: CoordinatorEvent): Coo
         reason: event.output.reviewVerdict ?? "advisory-review",
         patch: { reviewStatus: event.output.reviewVerdict ?? "unavailable" },
       },
-      commands: [{
-        key: key(run, `pr-comment:review:${event.attempt}`),
-        ticketId: run.ticketId,
-        kind: "comment-pr",
-        stage: "review",
-        payload: { prUrl: run.prUrl, body: event.output.report, signature: event.output.signature },
-      }],
+      commands: [
+        {
+          key: key(run, `pr-comment:review:${event.attempt}`),
+          ticketId: run.ticketId,
+          kind: "comment-pr",
+          stage: "review",
+          payload: { prUrl: run.prUrl, body: event.output.report, signature: event.output.signature },
+        },
+        {
+          key: key(run, `ready:${run.headSha}`),
+          ticketId: run.ticketId,
+          kind: "mark-pr-ready",
+          stage: "review",
+          payload: { prUrl: run.prUrl, sha: run.headSha },
+        },
+      ],
     };
   }
 
@@ -685,6 +705,8 @@ export function reduceLifecycle(run: LifecycleRun, event: CoordinatorEvent): Coo
       };
     }
     if (event.outcome === "fail") return blocked(run, "ci", "CI_FAILED", event.report);
+    // PR zostaje draftem do werdyktu review — mark-pr-ready enqueue'uje dopiero
+    // gałąź werdyktu, żeby komentarz recenzenta istniał zanim PR wyjdzie z draftu.
     return {
       transition: {
         stage: "review",
@@ -693,16 +715,7 @@ export function reduceLifecycle(run: LifecycleRun, event: CoordinatorEvent): Coo
         reason: "ci-pass",
         patch: { reviewStatus: "running" },
       },
-      commands: [
-        {
-          key: key(run, `ready:${event.sha}`),
-          ticketId: run.ticketId,
-          kind: "mark-pr-ready",
-          stage: "review",
-          payload: { prUrl: run.prUrl, sha: event.sha },
-        },
-        jobCommand(run, "review", "review", event.nextReviewAttempt ?? 1),
-      ],
+      commands: [jobCommand(run, "review", "review", event.nextReviewAttempt ?? 1)],
     };
   }
 
