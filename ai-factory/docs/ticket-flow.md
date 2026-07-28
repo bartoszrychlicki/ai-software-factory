@@ -68,6 +68,9 @@ flowchart TD
       R2["Mastra storage<br/>snapshot workflow"]
       R3["runs/<ticket>/<run>/*<br/>plan, approval, verify, review, screenshots"]
       R4["Restart pollera<br/>adopcja wszystkich unfinished runów"]
+      R5{"Run istnieje w Mastrze?"}
+      R6["3× 404: jawny lost-run<br/>zwolnienie rezerwacji"]
+      R7["Linear: /restart [powód]<br/>cancel → audyt → Todo → świeży plan"]
     end
 
     D -.-> R1
@@ -79,6 +82,10 @@ flowchart TD
     W -.-> R3
     R4 -.-> R1
     R4 -.-> R2
+    R4 --> R5
+    R5 -- "nie" --> R6
+    R6 --> R7
+    R7 --> A
 ```
 
 ## Gwarancje i granice
@@ -100,3 +107,6 @@ flowchart TD
 8. Projekt bez deterministycznych `checks` lub GitHub `ci.requiredChecks` jest
    odrzucany przy intake. Zmiany buildera i remediation muszą mieścić się w
    zatwierdzonym `factory.files`.
+9. Trzy potwierdzone odpowiedzi `404` kończą adopcję jako `lost-run`; timeouty
+   pozostają retry. `/restart` jest idempotentny po UUID komentarza, wymaga
+   potwierdzonego anulowania i wymusza nowy run ze świeżym planem.

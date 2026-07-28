@@ -32,11 +32,24 @@ katalog output destrukcyjnie.
 Tryb developerski (`npm run dev`) jest wyłącznie do pracy lokalnej. Hot reload
 nie może być używany podczas aktywnego runu ticketu.
 
+## Komendy operatora w Linear
+
+Komenda musi być pierwszym tokenem komentarza. `/restart [powód]` działa dla
+aktywnego ticketu bez opublikowanego PR-a: najpierw potwierdza anulowanie starego
+runu (brakujący run jest traktowany jako już anulowany), zwalnia jego rezerwacje,
+zapisuje audyt i oddaje ticket do `Todo`. Następny przebieg zawsze tworzy świeży
+run i świeży plan; nie reużywa poprzedniego planu.
+
+Trzy kolejne odpowiedzi `404` dla runu Mastry zatrzymują cichą adopcję. Ticket
+przechodzi do jawnej blokady z instrukcją użycia `/restart`; timeout lub błąd
+transportu pozostaje bezpiecznym retry i nie unieważnia runu.
+
 ## Najważniejsze pliki
 
 - `src/pipeline/ticket-pipeline.ts` — graf workflow i bramki jakościowe,
 - `src/sources/poll-linear.ts` — orkiestracja Lineara, adopcja runów i merge watcher,
 - `src/sources/mastra-client.ts` — sprawdzany klient start/resume/cancel,
+- `src/sources/run-recovery.ts` — lost-run guard i idempotentny `/restart`,
 - `src/pipeline/run-registry.ts` — trwały stan ticketu i outbox komend,
 - `src/pipeline/quality.ts` — wspólny runner checks/e2e i pełny diff brancha,
 - `src/pipeline/github-ci.ts` — gate wymaganych checks dla dokładnego PR head SHA,

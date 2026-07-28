@@ -24,6 +24,19 @@ interface LinearIssue {
   team: { states: { nodes: { id: string; name: string; type: string }[] } };
 }
 
+export interface LinearComment {
+  id: string;
+  body: string;
+  createdAt: string;
+}
+
+export interface LinearCommandCandidate {
+  id: string;
+  stateName: string;
+  stateType: string;
+  comments: LinearComment[];
+}
+
 export class LinearSource implements TicketSource {
   name = "linear";
 
@@ -120,12 +133,12 @@ export class LinearSource implements TicketSource {
   /** Issues projektu w danym stanie, z komentarzami — dla merge-watchera i adopcji sierot. */
   async listWithComments(
     stateName: string
-  ): Promise<{ id: string; comments: { body: string; createdAt: string }[] }[]> {
+  ): Promise<{ id: string; comments: LinearComment[] }[]> {
     const data = await this.gql<{
-      issues: { nodes: { identifier: string; comments: { nodes: { body: string; createdAt: string }[] } }[] };
+      issues: { nodes: { identifier: string; comments: { nodes: LinearComment[] } }[] };
     }>(
       `query($filter: IssueFilter) { issues(filter: $filter, first: 50) {
-        nodes { identifier comments { nodes { body createdAt } } } } }`,
+        nodes { identifier comments { nodes { id body createdAt } } } } }`,
       { filter: { project: { name: { eq: this.project } }, state: { name: { eq: stateName } } } }
     );
     return data.issues.nodes.map((i) => ({
@@ -134,10 +147,36 @@ export class LinearSource implements TicketSource {
     }));
   }
 
+  /** Nieterminalne tickety projektu z komentarzami — globalne komendy operatorskie. */
+  async listCommandCandidates(): Promise<LinearCommandCandidate[]> {
+    const data = await this.gql<{
+      issues: {
+        nodes: {
+          identifier: string;
+          state: { name: string; type: string };
+          comments: { nodes: LinearComment[] };
+        }[];
+      };
+    }>(
+      `query($filter: IssueFilter) { issues(filter: $filter, first: 100) {
+        nodes { identifier state { name type } comments { nodes { id body createdAt } } }
+      } }`,
+      { filter: { project: { name: { eq: this.project } } } }
+    );
+    return data.issues.nodes
+      .filter((issue) => !LINEAR_STATE_MAP.terminal.includes(issue.state.name))
+      .map((issue) => ({
+        id: issue.identifier,
+        stateName: issue.state.name,
+        stateType: issue.state.type,
+        comments: issue.comments.nodes.sort((a, b) => a.createdAt.localeCompare(b.createdAt)),
+      }));
+  }
+
   /** Komentarze issue rosnąco po dacie — do nasłuchiwania decyzji człowieka. */
-  async listComments(id: string): Promise<{ body: string; createdAt: string }[]> {
-    const data = await this.gql<{ issue: { comments: { nodes: { body: string; createdAt: string }[] } } }>(
-      `query($id: String!) { issue(id: $id) { comments { nodes { body createdAt } } } }`,
+  async listComments(id: string): Promise<LinearComment[]> {
+    const data = await this.gql<{ issue: { comments: { nodes: LinearComment[] } } }>(
+      `query($id: String!) { issue(id: $id) { comments { nodes { id body createdAt } } } }`,
       { id }
     );
     return data.issue.comments.nodes.sort((a, b) => a.createdAt.localeCompare(b.createdAt));

@@ -2,7 +2,11 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { once } from "node:events";
-import { MastraWorkflowClient } from "../sources/mastra-client";
+import {
+  isWorkflowRunMissing,
+  MastraHttpError,
+  MastraWorkflowClient,
+} from "../sources/mastra-client";
 
 test("klient używa nieblokujących tras sterujących i sprawdza HTTP", async () => {
   const requests: { method?: string; url?: string; body: string }[] = [];
@@ -58,4 +62,14 @@ test("odpowiedź HTTP spoza 2xx jest błędem, nie cichym sukcesem", async () =>
     server.close();
     await once(server, "close");
   }
+});
+
+test("404 konkretnego runu jest rozróżnialne od awarii transportu", async () => {
+  const missing = new MastraHttpError(404, "/workflows/ticketPipeline/runs/gone", "Workflow run not found");
+  const unavailable = new MastraHttpError(503, "/workflows/ticketPipeline/runs/gone", "offline");
+  const other404 = new MastraHttpError(404, "/workflows", "not found");
+
+  assert.equal(isWorkflowRunMissing(missing), true);
+  assert.equal(isWorkflowRunMissing(unavailable), false);
+  assert.equal(isWorkflowRunMissing(other404), false);
 });

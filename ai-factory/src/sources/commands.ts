@@ -1,5 +1,8 @@
 import type { DecisionKind } from "../pipeline/run-registry";
 
+export type OperatorCommandKind = "restart";
+export type CommandKind = DecisionKind | OperatorCommandKind;
+
 /**
  * Komendy jako JEDYNY tekstowy kanał decyzji — furtka z telefonu, gdy
  * przeciągnięcie karty jest niewygodne.
@@ -8,17 +11,24 @@ import type { DecisionKind } from "../pipeline/run-registry";
  * token linii, dokładnie równy jednej z komend. Wszystko inne = brak decyzji
  * (i podpowiedź od fabryki), nigdy „chyba chodziło mu o…".
  */
-export const COMMANDS: Record<string, DecisionKind> = {
+export const COMMANDS: Record<string, CommandKind> = {
   "/approve": "approve",
   "/reject": "reject",
   "/answer": "answer",
   "/done": "done",
+  "/restart": "restart",
 };
 
 export interface ParsedCommand {
-  kind: DecisionKind;
+  kind: CommandKind;
   /** Reszta komentarza po komendzie — DANE (powód, odpowiedzi), nie sterowanie. */
   payload?: string;
+}
+
+const DECISION_COMMANDS = new Set<DecisionKind>(["start", "approve", "reject", "answer", "done"]);
+
+export function isDecisionCommand(kind: CommandKind): kind is DecisionKind {
+  return DECISION_COMMANDS.has(kind as DecisionKind);
 }
 
 /** Zwraca komendę tylko dla dokładnego dopasowania pierwszego tokenu. */
