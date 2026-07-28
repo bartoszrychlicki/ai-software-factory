@@ -21,6 +21,7 @@ Fabryka software: ticket → intake → plan (+gate niejasności) → human gate
 - `src/pipeline/workspace.ts` — worktree per ticket w `~/.ai-factory/worktrees/<repo>/<ticket>`; retry może przenieść poprzedni SHA dopiero po `checkpointWithinScope`, jako bezkonfliktowy cherry-pick na świeży `origin/main`; `createCheckout` = świeży detached checkout SHA dla verify.
 - `src/pipeline/projects.ts` — rejestr projektów (`projects.yaml`); `findUpFile` szuka configów w górę drzewa (mastra dev ma cwd w `src/mastra/public`!).
 - `src/mastra/storage-url.ts` — trwała lokalizacja bazy workflow: `FACTORY_ROOT/runs/mastra.db`, nigdy względne `./mastra.db` w regenerowanym `.mastra/output`.
+- `src/sources/merge-tracking.ts` — merge-watcher śledzi wyłącznie `prUrl` bieżącego, zakończonego sukcesem runu; stare URL-e PR z komentarzy są fallbackiem tylko dla ticketów bez trwałego rejestru.
 - `src/pipeline/routing.ts` — `resolveRoute(etap, ticket, domena?)`; kolejność: label `engine:*` > `projects.<p>.<etap[.domena]>` > `defaults.<etap.domena>` > `defaults.<etap>`; spec = `silnik[/model]`.
 - `src/pipeline/signature.ts` — jednolity podpis akcji fabryki: agent, harness CLI, model i profil roli; używany w commitach, PR-ach, review i artefaktach runa.
 - `routing.yaml`, `projects.yaml` — konfiguracja (checks weryfikacyjne są per projekt w projects.yaml).
