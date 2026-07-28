@@ -66,13 +66,28 @@ bootstrap_agent() {
   done
 }
 
-find_unfinished_runs() {
+find_blocking_runs() {
   '/Users/senioraiconsultant/.local/bin/node' -e '
 const fs=require("fs"), p=require("path"), root=p.join(process.argv[1],"runs");
 let ids=[];
 if(fs.existsSync(root)) for(const ticket of fs.readdirSync(root)) {
   const file=p.join(root,ticket,"state.json");
-  try { const s=JSON.parse(fs.readFileSync(file,"utf8")); if(s.lifecycle!=="finalized") ids.push(ticket); } catch {}
+  try {
+    const s=JSON.parse(fs.readFileSync(file,"utf8"));
+    if(s.lifecycle!=="finalized" && s.lifecycle!=="awaiting_decision") ids.push(ticket);
+  } catch {}
+}
+process.stdout.write(ids.join(","));
+' "$FACTORY_DIR"
+}
+
+find_suspended_runs() {
+  '/Users/senioraiconsultant/.local/bin/node' -e '
+const fs=require("fs"), p=require("path"), root=p.join(process.argv[1],"runs");
+let ids=[];
+if(fs.existsSync(root)) for(const ticket of fs.readdirSync(root)) {
+  const file=p.join(root,ticket,"state.json");
+  try { const s=JSON.parse(fs.readFileSync(file,"utf8")); if(s.lifecycle==="awaiting_decision") ids.push(ticket); } catch {}
 }
 process.stdout.write(ids.join(","));
 ' "$FACTORY_DIR"
@@ -94,13 +109,20 @@ bootout_agent "$POLLER_SERVICE"
 
 # Nie przełączamy runtime'u pod aktywnym workflow. Najpierw trzeba pozwolić
 # pollerowi domknąć run albo świadomie go anulować w Linear.
-UNFINISHED="$(find_unfinished_runs)"
-if [[ -n "$UNFINISHED" ]]; then
+BLOCKING="$(find_blocking_runs)"
+if [[ -n "$BLOCKING" ]]; then
   if [[ "$POLLER_WAS_LOADED" == "true" && -f "$POLLER_PLIST" ]]; then
     bootstrap_agent "$POLLER_SERVICE" "$POLLER_PLIST"
   fi
-  echo "Aktywne runy: $UNFINISHED — instalacja przerwana, poller przywrócony." >&2
+  echo "Aktywne runy wykonawcze: $BLOCKING — instalacja przerwana, poller przywrócony." >&2
   exit 1
+fi
+
+# Suspend na human gate jest trwały w Mastra + rejestrze. Można bezpiecznie
+# przełączyć runtime; po bootstrapie poller adoptuje run i zachowa bramkę.
+SUSPENDED="$(find_suspended_runs)"
+if [[ -n "$SUSPENDED" ]]; then
+  echo "Trwałe runy awaiting_decision: $SUSPENDED — przełączam runtime; poller zaadoptuje je po restarcie."
 fi
 
 bootout_agent "$SERVER_SERVICE"
