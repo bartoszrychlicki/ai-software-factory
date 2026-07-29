@@ -214,6 +214,52 @@ export function formatClarifyQuestions(raw: string): string {
   return [preamble, ...formattedQuestions].filter(Boolean).join("\n\n");
 }
 
+/**
+ * Wyszukuje w treści bloku zbalansowane obiekty `{...}` (świadome stringów
+ * i escape'ów JSON-a) i zwraca OSTATNI, który parsuje się jako obiekt.
+ *
+ * To NIE jest rozpoznawanie werdyktu z prozy (BAR-101/108 nie wraca): agent
+ * już jawnie wszedł w maszynowy kanał ```factory — tolerujemy wyłącznie
+ * śmieciowy tekst wokół JSON-a WEWNĄTRZ bloku. Incydent BAR-180: dwa różne
+ * silniki (haiku i sol@xhigh) wkleiły do bloku etykietę z instrukcji przed
+ * JSON-em i poprawne werdykty przepadały fail-closed.
+ */
+function lastJsonObjectInBlock(block: string): Record<string, unknown> | undefined {
+  const candidates: string[] = [];
+  const stack: number[] = [];
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < block.length; i += 1) {
+    const char = block[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === '"') inString = false;
+      continue;
+    }
+    if (char === '"') inString = true;
+    else if (char === "{") stack.push(i);
+    else if (char === "}" && stack.length) {
+      const start = stack.pop()!;
+      // Kandydatem jest KAŻDY domknięty obiekt, nie tylko najbardziej
+      // zewnętrzny: osierocony `{` przed werdyktem trzymałby stos niepusty
+      // i poprawny obiekt nigdy nie zostałby zapisany (uwaga CodeRabbit,
+      // PR #31). Zewnętrzny obiekt i tak domyka się później, więc przy
+      // zagnieżdżeniu odwrotna kolejność parsowania preferuje całość.
+      candidates.push(block.slice(start, i + 1));
+    }
+  }
+  for (const candidate of candidates.reverse()) {
+    try {
+      const parsed = JSON.parse(candidate) as unknown;
+      if (typeof parsed === "object" && parsed !== null) return parsed as Record<string, unknown>;
+    } catch {
+      // kandydat nie jest poprawnym JSON-em — próbuj wcześniejszego
+    }
+  }
+  return undefined;
+}
+
 /** Blok `​```factory {...}​``` z końca raportu — ostatni wygrywa. */
 function structuredBlock(report: string): Record<string, unknown> | undefined {
   const blocks = [...report.matchAll(/```factory\s*\n([\s\S]*?)```/g)];
@@ -223,7 +269,7 @@ function structuredBlock(report: string): Record<string, unknown> | undefined {
     const parsed = JSON.parse(last.trim()) as unknown;
     return typeof parsed === "object" && parsed !== null ? (parsed as Record<string, unknown>) : undefined;
   } catch {
-    return undefined;
+    return lastJsonObjectInBlock(last);
   }
 }
 
@@ -232,30 +278,49 @@ export const MISSING_VERDICT =
   "Agent nie oddał bloku ```factory z werdyktem (kontrakt wyjścia). " +
   "Traktuję to fail-closed jako wynik negatywny — sprawdź pełny raport w artefaktach runu.";
 
-/** Instrukcja doklejana do promptu roli — kontrakt wyjścia agenta. */
+/**
+ * Instrukcja doklejana do promptu roli — kontrakt wyjścia agenta.
+ *
+ * Lekcja BAR-180: gdy opisy kształtów stały WEWNĄTRZ przykładowego fence'a,
+ * dwa różne silniki (haiku, sol@xhigh) wkleiły etykietę „Opis: " do realnego
+ * bloku przed JSON-em. Opisy żyją teraz POZA fencem, a fence pokazuje
+ * wyłącznie goły JSON.
+ */
 export function verdictInstruction(kind: "plan" | "verify" | "review" | "triage" | "critique"): string {
   const shapes =
     kind === "plan"
       ? [
-          `Gdy plan jest gotowy: {"verdict":"ok","screenshots":["/sciezka"],"files":["src/x.ts"],"domain":"frontend|backend|fullstack|ops"}`,
-          `Gdy potrzebujesz odpowiedzi człowieka: {"verdict":"blocked","questions":"<pytania A/B/C>","screenshots":[],"files":[],"domain":"frontend|backend|fullstack|ops"}`,
-          "Przy verdict=ok pomiń pole questions.",
+          `- gotowy plan: {"verdict":"ok","screenshots":["/sciezka"],"files":["src/x.ts"],"domain":"frontend|backend|fullstack|ops"} (bez pola questions)`,
+          `- potrzebujesz odpowiedzi człowieka: {"verdict":"blocked","questions":"<pytania A/B/C>","screenshots":[],"files":[],"domain":"frontend|backend|fullstack|ops"}`,
         ]
       : kind === "triage"
         ? [
-            `Rekomendacja ścieżki planowania: {"verdict":"solo"|"deep","type":"feature|bug|refactor|analytical|ops","size":"S|M|L","risk":["<flagi ryzyka>"],"domain":"frontend|backend|fullstack|ops"}`,
-            `Braki w tickecie / podejrzenie duplikatu lub "już zaimplementowane" (z dowodem): {"verdict":"questions","questions":"<ponumerowane pytania A/B/C z rekomendacją>"}`,
+            `- rekomendacja ścieżki planowania: {"verdict":"solo"|"deep","type":"feature|bug|refactor|analytical|ops","size":"S|M|L","risk":["<flagi ryzyka>"],"domain":"frontend|backend|fullstack|ops"}`,
+            `- braki w tickecie / podejrzenie duplikatu lub "już zaimplementowane" (z dowodem): {"verdict":"questions","questions":"<ponumerowane pytania A/B/C z rekomendacją>"}`,
           ]
         : kind === "critique"
           ? [
-              `Plan bez zastrzeżeń: {"verdict":"ok"}`,
-              `Plan wymaga poprawy: {"verdict":"issues","issues":"<konkretne, ponumerowane uwagi z priorytetem>"}`,
+              `- plan bez zastrzeżeń: {"verdict":"ok"}`,
+              `- plan wymaga poprawy: {"verdict":"issues","issues":"<konkretne, ponumerowane uwagi z priorytetem>"}`,
             ]
-          : [kind === "verify" ? `{"verdict":"pass"|"fail"}` : `{"verdict":"lgtm"|"fix"}`];
+          : [kind === "verify" ? `- werdykt: {"verdict":"pass"|"fail"}` : `- werdykt: {"verdict":"lgtm"|"fix"}`];
+  const example =
+    kind === "plan"
+      ? '{"verdict":"ok","screenshots":[],"files":["src/x.ts"],"domain":"backend"}'
+      : kind === "triage"
+        ? '{"verdict":"deep","type":"feature","size":"M","risk":[],"domain":"frontend"}'
+        : kind === "critique"
+          ? '{"verdict":"ok"}'
+          : kind === "verify"
+            ? '{"verdict":"pass"}'
+            : '{"verdict":"lgtm"}';
   return [
-    "ZAKOŃCZ odpowiedź blokiem kodu (dokładnie taki nagłówek) z werdyktem maszynowym:",
-    "```factory",
+    "ZAKOŃCZ odpowiedź blokiem kodu z nagłówkiem ```factory, zawierającym WYŁĄCZNIE goły JSON werdyktu — bez etykiet, prefiksów, komentarzy ani tekstu wokół.",
+    "Dozwolone kształty JSON-a (opisy to dokumentacja, NIE część bloku):",
     ...shapes,
+    "Przykład poprawnego zakończenia odpowiedzi:",
+    "```factory",
+    example,
     "```",
     "Blok MUSI być ostatnim elementem odpowiedzi — po nim NIE dopisuj komentarzy, podsumowań ani uwag o agentach pomocniczych.",
     "Bez tego bloku Twoja praca zostanie odrzucona: fabryka nie zgaduje werdyktu z treści raportu.",
