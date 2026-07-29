@@ -32,6 +32,7 @@ import {
   maybeBackupLifecycleDb,
   pollOnce,
   reconcileRun,
+  sweepScores,
   type PollerDependencies,
 } from "../sources/poll-linear-v2";
 import { MastraHttpError } from "../sources/mastra-client";
@@ -251,6 +252,162 @@ test("zmiana inputu przed buildem replanuje z nową generacją, po buildzie blok
   assert.equal(stopped.transition.status, "blocked");
   assert.equal(stopped.transition.patch?.branch, undefined);
   assert.equal(build.branch, "agent/keep");
+});
+
+test("literówka komendy dostaje dokładnie jeden hint bez replanu i zmiany input hash", async () => {
+  const root = await mkdtemp(join(tmpdir(), "factory-unknown-command-"));
+  const previousRoot = process.env.FACTORY_ROOT;
+  const store = new LifecycleStore(join(root, "registry.db"));
+  const ticket = {
+    id: "BAR-184",
+    title: "Bramki odporne na literówki",
+    description: "Opis",
+    labels: [] as string[],
+  };
+  const comments = [{
+    id: "comment-typo",
+    body: "/anwser cokolwiek",
+    createdAt: "2026-07-29T10:00:00.000Z",
+  }];
+  try {
+    await writeHarnessFixture(root);
+    process.env.FACTORY_ROOT = root;
+    const inputHash = buildCommentContextSnapshot(
+      ticket.id,
+      ticket.title,
+      ticket.description,
+      []
+    ).effectiveInputHash;
+    store.createRun(ticket.id, "harness", { ...ticket, inputHash });
+    store.transition(ticket.id, {
+      stage: "approval",
+      status: "waiting_human",
+      actor: "test",
+      reason: "plan-ready",
+      patch: { plan: "plan", planFiles: ["src/a.ts"], planDomain: "backend" },
+    });
+
+    const source = {
+      async listComments() { return comments; },
+      async getTicket() {
+        return {
+          ...ticket,
+          source: "linear",
+          stateName: "In Progress",
+          url: `https://linear.test/${ticket.id}`,
+        };
+      },
+      async getStateName() { return "In Progress"; },
+      async setStateByName() {},
+      async comment(_ticketId: string, body: string) {
+        comments.push({
+          id: `factory-${comments.length}`,
+          body,
+          createdAt: "2026-07-29T10:01:00.000Z",
+        });
+      },
+    };
+    const deps: PollerDependencies = {
+      store,
+      mastra: {
+        async cancelRun() {},
+      } as unknown as PollerDependencies["mastra"],
+      sources: new Map([["harness", source as never]]),
+      notifier: async () => {},
+    };
+
+    await reconcileRun(deps, store.getRun(ticket.id)!);
+    const hintCommands = store.outstandingCommands(100).filter((command) =>
+      command.kind === "linear-comment" &&
+      command.key === `${ticket.id}:g1:unknown-command:comment-typo`
+    );
+    assert.equal(hintCommands.length, 1);
+    assert.match(String(hintCommands[0].payload.body), /Nieznana komenda `\/anwser`/);
+    assert.equal(hintCommands[0].payload.progress, undefined);
+    assert.equal(store.isCommentProcessed("comment-typo"), true);
+    assert.equal(store.getRun(ticket.id)?.generation, 1);
+    assert.equal(store.getRun(ticket.id)?.manifest.inputHash, inputHash);
+
+    await dispatchOutbox(deps);
+    const postedHints = comments.filter((comment) => comment.body.includes("Nieznana komenda"));
+    assert.equal(postedHints.length, 1);
+    assert.match(postedHints[0].body, /\[linear:BAR-184:v2\]/);
+    assert.match(
+      postedHints[0].body,
+      /\[factory-outbox:BAR-184:g1:unknown-command:comment-typo\]/
+    );
+    const snapshotWithHint = buildCommentContextSnapshot(
+      ticket.id,
+      ticket.title,
+      ticket.description,
+      comments
+    );
+    assert.equal(snapshotWithHint.effectiveInputHash, inputHash);
+
+    await reconcileRun(deps, store.getRun(ticket.id)!);
+    assert.equal(comments.filter((comment) => comment.body.includes("Nieznana komenda")).length, 1);
+    assert.equal(store.getRun(ticket.id)?.generation, 1);
+  } finally {
+    store.close();
+    if (previousRoot === undefined) delete process.env.FACTORY_ROOT;
+    else process.env.FACTORY_ROOT = previousRoot;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("sweep Done odpowiada hintem /score na nierozpoznaną próbę komendy", async () => {
+  const root = await mkdtemp(join(tmpdir(), "factory-unknown-score-"));
+  const previousRoot = process.env.FACTORY_ROOT;
+  const store = new LifecycleStore(join(root, "registry.db"));
+  const comments = [{
+    id: "comment-score-typo",
+    body: "/scroe 5",
+    createdAt: "2026-07-29T10:00:00.000Z",
+  }];
+  try {
+    await writeHarnessFixture(root);
+    process.env.FACTORY_ROOT = root;
+    store.createRun("BAR-SCORE-TYPO", "harness", manifest);
+    store.transition("BAR-SCORE-TYPO", {
+      stage: "smoke",
+      status: "done",
+      actor: "test",
+      reason: "done",
+    });
+    const source = {
+      async listComments() { return comments; },
+      async setStateByName() {},
+      async comment(_ticketId: string, body: string) {
+        comments.push({
+          id: `factory-${comments.length}`,
+          body,
+          createdAt: "2026-07-29T10:01:00.000Z",
+        });
+      },
+    };
+    const deps: PollerDependencies = {
+      store,
+      mastra: {} as unknown as PollerDependencies["mastra"],
+      sources: new Map([["harness", source as never]]),
+      notifier: async () => {},
+    };
+
+    await sweepScores(deps);
+    assert.equal(store.isCommentProcessed("comment-score-typo"), true);
+    const hint = store.outstandingCommands(100).find((command) =>
+      command.key === "BAR-SCORE-TYPO:g1:unknown-command:comment-score-typo"
+    );
+    assert.match(String(hint?.payload.body), /`\/score 1-5 \[komentarz\]`/);
+
+    await dispatchOutbox(deps);
+    assert.equal(comments.filter((comment) => comment.body.includes("Nieznana komenda")).length, 1);
+    assert.match(comments[1].body, /\[linear:BAR-SCORE-TYPO:v2\]/);
+  } finally {
+    store.close();
+    if (previousRoot === undefined) delete process.env.FACTORY_ROOT;
+    else process.env.FACTORY_ROOT = previousRoot;
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("brak werdyktu review ponawia tylko review raz w generacji, niezależnie od globalnego numeru próby", () => {

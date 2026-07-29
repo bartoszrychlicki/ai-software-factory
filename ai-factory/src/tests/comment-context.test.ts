@@ -57,3 +57,55 @@ test("snapshot jest deterministyczny, zachowuje najnowsze komentarze i zmienia h
   assert.equal(first.effectiveInputHash, same.effectiveInputHash);
   assert.notEqual(first.effectiveInputHash, changed.effectiveInputHash);
 });
+
+test("nieudane próby komend nie zmieniają snapshotu ani effectiveInputHash", () => {
+  const withoutComments = buildCommentContextSnapshot(
+    "BAR-184",
+    "Bramki odporne na literówki",
+    "Opis",
+    []
+  );
+  const withTypo = buildCommentContextSnapshot(
+    "BAR-184",
+    "Bramki odporne na literówki",
+    "Opis",
+    [{ body: "/anwser cokolwiek", createdAt: "2026-07-29T10:00:00.000Z" }]
+  );
+  const withInvalidPayload = buildCommentContextSnapshot(
+    "BAR-184",
+    "Bramki odporne na literówki",
+    "Opis",
+    [{ body: "/approve tak", createdAt: "2026-07-29T10:00:00.000Z" }]
+  );
+
+  assert.equal(withTypo.effectiveInputHash, withoutComments.effectiveInputHash);
+  assert.equal(withInvalidPayload.effectiveInputHash, withoutComments.effectiveInputHash);
+  assert.deepEqual(withTypo.comments, []);
+  assert.deepEqual(withInvalidPayload.comments, []);
+});
+
+test("zwykły komentarz i ścieżka pliku pozostają treścią planistyczną", () => {
+  const withoutComments = buildCommentContextSnapshot(
+    "BAR-184",
+    "Bramki odporne na literówki",
+    "Opis",
+    []
+  );
+  const ordinary = buildCommentContextSnapshot(
+    "BAR-184",
+    "Bramki odporne na literówki",
+    "Opis",
+    [{ body: "Dodaj też test regresji", createdAt: "2026-07-29T10:00:00.000Z" }]
+  );
+  const filePath = buildCommentContextSnapshot(
+    "BAR-184",
+    "Bramki odporne na literówki",
+    "Opis",
+    [{ body: "/src/x.ts wymaga poprawki", createdAt: "2026-07-29T10:01:00.000Z" }]
+  );
+
+  assert.notEqual(ordinary.effectiveInputHash, withoutComments.effectiveInputHash);
+  assert.notEqual(filePath.effectiveInputHash, withoutComments.effectiveInputHash);
+  assert.equal(ordinary.comments[0]?.body, "Dodaj też test regresji");
+  assert.equal(filePath.comments[0]?.body, "/src/x.ts wymaga poprawki");
+});

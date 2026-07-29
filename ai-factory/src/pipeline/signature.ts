@@ -92,6 +92,10 @@ export function signatureFooter(signature: ActionSignature): string {
   return `\n\n> 🖋️ ${signatureLine(signature)}`;
 }
 
+export function signatureHeader(signature: ActionSignature): string {
+  return `🖋️ ${signature.model} · ${signature.profile}`;
+}
+
 export function signatureMeta(signature: ActionSignature): Record<string, string> {
   return {
     agent: signature.agent,

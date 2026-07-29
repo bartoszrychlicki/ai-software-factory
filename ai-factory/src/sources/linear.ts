@@ -3,6 +3,7 @@ import { LINEAR_STATE_MAP } from "./state-map";
 import {
   POLLER_SIGNATURE,
   signatureFooter,
+  signatureHeader,
   type ActionSignature,
 } from "../pipeline/signature";
 
@@ -207,9 +208,12 @@ export class LinearSource implements TicketSource {
     signature: ActionSignature = POLLER_SIGNATURE
   ): Promise<void> {
     const issue = await this.fetchIssue(id);
+    const signedBody = signature.profile === "orchestrator"
+      ? body
+      : `${signatureHeader(signature)}\n\n${body}`;
     await this.gql(
       `mutation($input: CommentCreateInput!) { commentCreate(input: $input) { success } }`,
-      { input: { issueId: issue.id, body: body + signatureFooter(signature) } }
+      { input: { issueId: issue.id, body: signedBody + signatureFooter(signature) } }
     );
   }
 

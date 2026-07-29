@@ -108,7 +108,7 @@ test("mapa milestones obejmuje siedem przejść pełnego cyklu kodowego", () => 
   );
 });
 
-test("verbose dodaje research, krytykę, retry, replan i degradacje w chwili wystąpienia", () => {
+test("verbose dodaje research, krytykę, retry i degradacje w chwili wystąpienia", () => {
   const triageStart = progressComment(
     runAt("plan", "pending"),
     runAt("triage", "running"),
@@ -137,13 +137,7 @@ test("verbose dodaje research, krytykę, retry, replan i degradacje w chwili wys
     runAt("build", "running"),
     "/retry c-retry: fix-after-test"
   );
-  const replan = progressComment(
-    runAt("approval", "waiting_human"),
-    runAt("triage", "running", { generation: 2 }),
-    "/replan c-replan"
-  );
-
-  for (const comment of [triageStart, researchStart, researchFailure, revision, retry, replan]) {
+  for (const comment of [triageStart, researchStart, researchFailure, revision, retry]) {
     assert.equal(comment?.level, "verbose");
   }
   assert.match(researchStart!.body, /recon, solution-a, solution-b/);
@@ -154,6 +148,34 @@ test("verbose dodaje research, krytykę, retry, replan i degradacje w chwili wys
   );
   assert.match(revision!.body, /rewizję syntezy/);
   assert.match(retry!.body, /retry/);
+});
+
+test("input-changed i /replan emitują idempotentny milestone nowej generacji", () => {
+  const before = runAt("approval", "waiting_human");
+  const afterInputChange = runAt("plan", "pending", { generation: 2 });
+  const inputChange = progressComment(
+    before,
+    afterInputChange,
+    "input-changed-before-build"
+  );
+  const inputChangeRepeated = progressComment(
+    before,
+    afterInputChange,
+    "input-changed-before-build"
+  );
+  const replan = progressComment(
+    before,
+    runAt("triage", "running", { generation: 2 }),
+    "/replan c-replan"
+  );
+
+  assert.equal(inputChange?.level, "milestones");
+  assert.match(inputChange!.body, /Wykryto edycję treści\/nowy komentarz/);
+  assert.match(inputChange!.body, /generacja 2/);
+  assert.match(inputChange!.body, /komentarz jest w kontekście plannera/);
+  assert.equal(inputChange?.key, inputChangeRepeated?.key);
+  assert.equal(replan?.level, "milestones");
+  assert.match(replan!.body, /`\/replan` przyjęty/);
   assert.match(replan!.body, /generacja 2/);
 });
 

@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { parseCommand } from "./commands";
+import { isCommandAttempt, parseCommand } from "./commands";
 import type { LinearComment } from "./linear";
 
 export interface RelevantComment {
@@ -36,7 +36,12 @@ export function extractRelevantComments(
       const body = comment.body.trim();
       if (!body || hasFactoryMarker(body, ticketId)) return [];
       const command = parseCommand(body);
-      if (!command) return [{ body, createdAt: comment.createdAt }];
+      if (!command) {
+        // Nieudana próba komendy nie jest treścią planistyczną i nie może
+        // zmieniać effectiveInputHash ani uruchamiać input-changed.
+        if (isCommandAttempt(body)) return [];
+        return [{ body, createdAt: comment.createdAt }];
+      }
       if ((command.kind === "answer" || command.kind === "reject") && command.payload) {
         return [{ body: command.payload.trim(), createdAt: comment.createdAt }];
       }
