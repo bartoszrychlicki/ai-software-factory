@@ -49,8 +49,8 @@ Fabryka software: ticket → intake → plan (+gate niejasności) → human gate
 - `src/pipeline/routing.ts` — `resolveRoute(etap, ticket, domena?)`; kolejność: label `engine:*` > `projects.<p>.<etap[.domena]>` > `defaults.<etap.domena>` > `defaults.<etap>`; spec = `silnik[/model]`.
 - `src/pipeline/signature.ts` — jednolity podpis akcji fabryki: `agent · harness@wersja · model@effort · profil`; używany w commitach, PR-ach, review, artefaktach runa i komentarzach w Linear. Aktywny runtime v2 zapisuje podpis faktycznej próby w `lifecycle_stage_attempts.signature`, przenosi go w trwałym payloadzie outboxu `linear-comment`, a `LinearSource.comment` dokleja stopkę. Pytania/plan/blokady wynikające z joba zachowują rolę plannera, buildera lub reviewera po retry i restarcie; tylko komentarze orkiestratora bez poprawnego podpisu próby używają podpisu pollera.
 - `routing.yaml`, `projects.yaml` — konfiguracja (checks weryfikacyjne są per projekt w projects.yaml).
-- Projekty fabryki: pilot-app (`~/Development/Edu/ai-sdlc/pilot-app`, publiczny, main chroniony) i **br-budget** (`~/Development/Clients/Bartosz/br-budget`, Next.js, PRYWATNY — bez branch protection na free planie, checks: ci+lint+build+test, bez screenshotu bo next wymaga env/bazy).
-- Repo pilotowe: `~/Development/Edu/ai-sdlc/pilot-app` (przeniesione do wnętrza ai-sdlc, w `.gitignore`; GitHub `bartoszrychlicki/pilot-app`, `main` chroniony: wymagany PR, enforce_admins, bez force-push).
+- Projekty fabryki: pilot-app (`~/Dev/pilot-app`, publiczny, main chroniony) i **br-budget** (`~/Dev/br-budget`, Next.js, PRYWATNY — bez branch protection na free planie, checks: ci+lint+build+test, bez screenshotu bo next wymaga env/bazy).
+- Repo pilotowe: `~/Dev/pilot-app` (GitHub `bartoszrychlicki/pilot-app`, `main` chroniony: wymagany PR, enforce_admins, bez force-push).
 
 ## Komendy
 

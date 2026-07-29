@@ -8,6 +8,8 @@ import { Observability, MastraStorageExporter, MastraPlatformExporter, Sensitive
 import { factoryJob } from "../pipeline/factory-job";
 import { resolveMastraStorageUrl } from "./storage-url";
 
+const duckDBStore = new DuckDBStore();
+
 export const mastra = new Mastra({
   workflows: { factoryJob },
   storage: new MastraCompositeStore({
@@ -19,7 +21,7 @@ export const mastra = new Mastra({
       authToken: process.env.TURSO_AUTH_TOKEN,
     }),
     domains: {
-      observability: await new DuckDBStore().getStore('observability'),
+      observability: duckDBStore.observability,
     }
   }),
   logger: new PinoLogger({

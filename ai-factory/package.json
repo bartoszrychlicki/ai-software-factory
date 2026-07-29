@@ -8,7 +8,7 @@
     "check": "tsc --noEmit",
     "dev": "mastra dev",
     "build": "mastra build --studio",
-    "start": "mastra start",
+    "start": "FACTORY_ROOT=${FACTORY_ROOT:-$PWD} mastra start",
     "poller": "tsx src/sources/poll-linear-v2.ts"
   },
   "keywords": [],
