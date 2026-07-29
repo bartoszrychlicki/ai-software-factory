@@ -1070,6 +1070,30 @@ export async function reconcileRun(deps: PollerDependencies, run: LifecycleRun):
     });
     return;
   }
+  // Strażnik zombie: run "running" bez żadnego niedokończonego joba w outboxie
+  // nie ma się z czego wznowić (incydent BAR-177: retry-key kolidował z komendą
+  // anulowaną przed dispatchem i INSERT OR IGNORE zjadł joba po cichu).
+  if (
+    current.status === "running" &&
+    ["plan", "build", "review"].includes(current.stage) &&
+    !deps.store.hasOutstandingJob(current.ticketId)
+  ) {
+    applyDecision(deps, current.ticketId, {
+      transition: {
+        stage: current.stage,
+        status: "blocked",
+        actor: "coordinator",
+        reason: "job-missing",
+        patch: {
+          blockedStage: current.stage,
+          errorCode: "JOB_MISSING",
+          errorMessage: "Run w stanie running nie ma żadnego joba w outboxie. Wznowienie: /retry.",
+        },
+      },
+      commands: [],
+    });
+    return;
+  }
   if (current.stage === "smoke" && current.status === "pending") await runSmoke(deps, current);
   else if (current.stage === "test" && current.status === "pending") enqueueTestRun(deps, current);
   else if (current.stage === "ci" && current.status === "waiting_external") await reconcileCi(deps, current);

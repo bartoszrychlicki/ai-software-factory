@@ -539,6 +539,15 @@ test("Linear Done nadal pozwala rozpoznać merge śledzonego PR-a i wykonać smo
         prUrl: "https://github.test/o/r/pull/2",
       },
     });
+    // Realny stan review/running zawsze ma job w outboxie — bez niego strażnik
+    // zombie słusznie by zablokował (JOB_MISSING).
+    store.enqueue({
+      key: `${reviewTicket.id}:g1:job:review:review:a1`,
+      ticketId: reviewTicket.id,
+      kind: "run-job",
+      stage: "review",
+      payload: { kind: "review", attempt: 1 },
+    });
     process.env.FACTORY_TEST_PR_STATE = "open";
     await reconcileRun(deps, store.getRun(reviewTicket.id)!);
     assert.deepEqual(
@@ -553,7 +562,8 @@ test("Linear Done nadal pozwala rozpoznać merge śledzonego PR-a i wykonać smo
     else process.env.PATH = previousPath;
     if (previousPrState === undefined) delete process.env.FACTORY_TEST_PR_STATE;
     else process.env.FACTORY_TEST_PR_STATE = previousPrState;
-    await rm(root, { recursive: true, force: true });
+    // recordRunOutcome (fire-and-forget) może jeszcze dopisywać stan breakera.
+    await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -1291,6 +1301,88 @@ test("preflight rejestruje wersje CLI i ostrzega przy zmianie harnessu", async (
       `oczekiwano warninga o zmianie wersji, dostałem: ${second.warnings.join(" | ")}`
     );
   } finally {
+    if (previousRoot === undefined) delete process.env.FACTORY_ROOT;
+    else process.env.FACTORY_ROOT = previousRoot;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("incydent BAR-177: /retry po komendzie anulowanej przed dispatchem tworzy NOWY job", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "factory-retry-key-"));
+  const store = new LifecycleStore(join(dir, "registry.db"));
+  try {
+    const deps: PollerDependencies = {
+      store,
+      mastra: {} as unknown as PollerDependencies["mastra"],
+      sources: new Map(),
+      notifier: async () => {},
+    };
+    let run = store.createRun("BAR-RK1", "harness", manifest);
+    applyDecision(deps, run.ticketId, reduceLifecycle(run, { type: "start" }));
+    applyDecision(deps, run.ticketId, reduceLifecycle(store.getRun("BAR-RK1")!, {
+      type: "job-finished", attempt: 1, output: planOutput,
+    }));
+    // /approve enqueue'uje build a1...
+    applyDecision(deps, run.ticketId, reduceLifecycle(store.getRun("BAR-RK1")!, {
+      type: "approve", commentId: "c-approve", nextAttempt: 1,
+    }));
+    assert.equal(store.hasOutstandingJob("BAR-RK1"), true);
+    // ...ale sekundę później wejście się zmienia: blokada + cancel PRZED dispatchem
+    // (zero prób w rejestrze → nextAttempt dalej zwróci 1).
+    applyDecision(deps, run.ticketId, reduceLifecycle(store.getRun("BAR-RK1")!, {
+      type: "input-changed", inputHash: "hash-2",
+    }));
+    assert.equal(store.getRun("BAR-RK1")!.errorCode, "INPUT_CHANGED_AFTER_BUILD");
+    assert.equal(store.hasOutstandingJob("BAR-RK1"), false);
+    // /retry z tym samym numerem próby NIE może kolidować z anulowaną komendą.
+    applyDecision(deps, run.ticketId, reduceLifecycle(store.getRun("BAR-RK1")!, {
+      type: "retry", commentId: "c-retry", nextAttempt: 1,
+    }));
+    run = store.getRun("BAR-RK1")!;
+    assert.deepEqual([run.stage, run.status], ["build", "running"]);
+    assert.equal(store.hasOutstandingJob("BAR-RK1"), true, "retry musi zostawić żywy job w outboxie");
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("strażnik zombie: running bez joba w outboxie blokuje z JOB_MISSING", async () => {
+  const root = await mkdtemp(join(tmpdir(), "factory-zombie-"));
+  const previousRoot = process.env.FACTORY_ROOT;
+  const store = new LifecycleStore(join(root, "registry.db"));
+  const notifications: string[] = [];
+  try {
+    await writeHarnessFixture(root);
+    process.env.FACTORY_ROOT = root;
+    const ticket = { id: "BAR-Z1", title: "Zombie", description: "opis", labels: [] as string[] };
+    const inputHash = buildCommentContextSnapshot(ticket.id, ticket.title, ticket.description, [])
+      .effectiveInputHash;
+    store.createRun(ticket.id, "harness", { ...ticket, inputHash });
+    store.transition(ticket.id, {
+      stage: "build", status: "running", actor: "test", reason: "zombie-setup",
+      patch: { plan: "plan", planFiles: [], approvedAt: "2026-07-29T10:00:00Z" },
+    });
+    const source = {
+      async listComments() { return []; },
+      async getTicket() { return { ...ticket, source: "linear", stateName: "In Progress", url: "" }; },
+      async getStateName() { return "In Progress"; },
+    };
+    const deps: PollerDependencies = {
+      store,
+      mastra: {} as unknown as PollerDependencies["mastra"],
+      sources: new Map([["harness", source as never]]),
+      notifier: async (title) => { notifications.push(title); },
+    };
+    await reconcileRun(deps, store.getRun(ticket.id)!);
+    const run = store.getRun(ticket.id)!;
+    assert.deepEqual([run.status, run.errorCode], ["blocked", "JOB_MISSING"]);
+    assert.ok(notifications.some((title) => title.includes("zablokowany")));
+    // /retry po JOB_MISSING enqueue'uje świeży job (unikalny klucz).
+    applyDecision(deps, ticket.id, reduceLifecycle(run, { type: "retry", commentId: "c-z", nextAttempt: 1 }));
+    assert.equal(store.hasOutstandingJob(ticket.id), true);
+  } finally {
+    store.close();
     if (previousRoot === undefined) delete process.env.FACTORY_ROOT;
     else process.env.FACTORY_ROOT = previousRoot;
     await rm(root, { recursive: true, force: true });

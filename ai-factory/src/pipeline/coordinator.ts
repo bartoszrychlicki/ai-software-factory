@@ -53,10 +53,18 @@ function jobCommand(
   kind: "plan" | "build" | "review",
   stage: LifecycleStage,
   attempt: number,
-  extra: Record<string, unknown> = {}
+  extra: Record<string, unknown> = {},
+  /**
+   * Dodatkowy dyskryminator klucza dla jobów z /retry. Komenda anulowana PRZED
+   * dispatchem (np. INPUT_CHANGED_AFTER_BUILD tuż po /approve) nie zostawia
+   * próby w rejestrze, więc nextAttempt liczy ten sam numer — bez suffixu
+   * INSERT OR IGNORE po cichu zjadłby retry i run wisiałby jako zombie
+   * (incydent BAR-177, 2026-07-29).
+   */
+  keySuffix = ""
 ): NewCommand {
   return {
-    key: key(run, `job:${kind}:${stage}:a${attempt}`),
+    key: key(run, `job:${kind}:${stage}:a${attempt}${keySuffix}`),
     ticketId: run.ticketId,
     kind: "run-job",
     stage,
@@ -383,13 +391,13 @@ export function reduceLifecycle(run: LifecycleRun, event: CoordinatorEvent): Coo
         commands: [jobCommand(run, "build", "build", attempt, {
           feedback: run.errorMessage,
           headSha: run.headSha,
-        })],
+        }, `:retry:${event.commentId}`)],
       };
     }
     if (run.blockedStage === "review") {
       // Ludzki /retry jest świadomy — dopuszczamy go także po wyczerpaniu
       // pojedynczego automatycznego ponowienia (REVIEW_UNAVAILABLE) i po stallu.
-      const retryable = ["OUTBOX_FAILED", "REVIEW_UNAVAILABLE", "JOB_STALLED"];
+      const retryable = ["OUTBOX_FAILED", "REVIEW_UNAVAILABLE", "JOB_STALLED", "JOB_MISSING"];
       if (!retryable.includes(run.errorCode ?? "") || !run.prUrl || !run.headSha) {
         throw new Error("Review nie ma bezpiecznej operacji do ponowienia.");
       }
@@ -420,7 +428,7 @@ export function reduceLifecycle(run: LifecycleRun, event: CoordinatorEvent): Coo
           reason: `/retry ${event.commentId}: review-job`,
           patch: { blockedStage: undefined, errorCode: undefined, errorMessage: undefined },
         },
-        commands: [jobCommand(run, "review", "review", event.nextAttempt ?? 1)],
+        commands: [jobCommand(run, "review", "review", event.nextAttempt ?? 1, {}, `:retry:${event.commentId}`)],
       };
     }
     if (run.blockedStage === "build" || run.blockedStage === "plan") {
@@ -433,7 +441,7 @@ export function reduceLifecycle(run: LifecycleRun, event: CoordinatorEvent): Coo
           reason: `/retry ${event.commentId}: stage-only`,
           patch: { blockedStage: undefined, errorCode: undefined, errorMessage: undefined },
         },
-        commands: [jobCommand(run, kind, run.blockedStage, event.nextAttempt ?? 2)],
+        commands: [jobCommand(run, kind, run.blockedStage, event.nextAttempt ?? 2, {}, `:retry:${event.commentId}`)],
       };
     }
     if (run.blockedStage === "approval") {
