@@ -7,7 +7,7 @@ OPS_DIR="$(cd "$(dirname "$0")" && pwd)"
 FACTORY_DIR="$(cd "$OPS_DIR/.." && pwd)"
 AGENTS_DIR="$HOME/Library/LaunchAgents"
 UID_NUM="$(id -u)"
-FACTORY_NPM_BIN="/Users/senioraiconsultant/.local/bin/npm"
+FACTORY_NPM_BIN="/opt/homebrew/bin/npm"
 SERVER_SERVICE="com.ai-factory.server"
 POLLER_SERVICE="com.ai-factory.poller"
 SERVER_PLIST="$AGENTS_DIR/$SERVER_SERVICE.plist"
@@ -67,7 +67,7 @@ bootstrap_agent() {
 }
 
 find_blocking_runs() {
-  '/Users/senioraiconsultant/.local/bin/node' -e '
+  '/opt/homebrew/bin/node' -e '
 const fs=require("fs"), p=require("path"), root=p.join(process.argv[1],"runs");
 const ids=new Set(), imported=new Set();
 const dbFile=p.join(root,"lifecycle.db");
@@ -93,7 +93,7 @@ process.stdout.write([...ids].join(","));
 }
 
 find_suspended_runs() {
-  '/Users/senioraiconsultant/.local/bin/node' -e '
+  '/opt/homebrew/bin/node' -e '
 const fs=require("fs"), p=require("path"), root=p.join(process.argv[1],"runs");
 const ids=new Set(), imported=new Set();
 const dbFile=p.join(root,"lifecycle.db");
