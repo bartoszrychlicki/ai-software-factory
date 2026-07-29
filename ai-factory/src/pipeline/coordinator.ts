@@ -94,14 +94,18 @@ function linearComment(
   run: LifecycleRun,
   suffix: string,
   body: string,
-  stage: LifecycleStage
+  stage: LifecycleStage,
+  signature?: string
 ): NewCommand {
   return {
     key: key(run, `linear-comment:${suffix}`),
     ticketId: run.ticketId,
     kind: "linear-comment",
     stage,
-    payload: { body },
+    payload: {
+      body,
+      ...(signature ? { signature } : {}),
+    },
   };
 }
 
@@ -109,7 +113,8 @@ function blocked(
   run: LifecycleRun,
   stage: LifecycleStage,
   code: string,
-  message: string
+  message: string,
+  signature?: string
 ): CoordinatorDecision {
   return {
     transition: {
@@ -124,7 +129,8 @@ function blocked(
         run,
         `${stage}:${code}`,
         `❌ **Proces zatrzymany (${stage})**\n\n${message}\n\nWznowienie tylko przez \`/retry\` albo \`/replan <powód>\`.`,
-        stage
+        stage,
+        signature
       ),
     ],
   };
@@ -487,7 +493,13 @@ export function reduceLifecycle(run: LifecycleRun, event: CoordinatorEvent): Coo
       assertStage(run, "plan", event.type);
       if (event.output.outcome === "questions") {
         if (run.clarifyRound >= 2) {
-          return blocked(run, "plan", "PLAN_MAX_QUESTIONS", "Planner wyczerpał dwie rundy pytań.");
+          return blocked(
+            run,
+            "plan",
+            "PLAN_MAX_QUESTIONS",
+            "Planner wyczerpał dwie rundy pytań.",
+            event.output.signature
+          );
         }
         return {
           transition: {
@@ -501,7 +513,8 @@ export function reduceLifecycle(run: LifecycleRun, event: CoordinatorEvent): Coo
             run,
             `questions:${run.clarifyRound + 1}`,
             `❓ **Pytania do planu — runda ${run.clarifyRound + 1}/2**\n\n${event.output.questions}\n\nOdpowiedz: \`/answer <odpowiedź>\`.`,
-            "plan"
+            "plan",
+            event.output.signature
           )],
         };
       }
@@ -510,7 +523,8 @@ export function reduceLifecycle(run: LifecycleRun, event: CoordinatorEvent): Coo
           run,
           "plan",
           event.output.errorCode ?? "PLAN_FAILED",
-          event.output.report.slice(0, 6000)
+          event.output.report.slice(0, 6000),
+          event.output.signature
         );
       }
       return {
@@ -530,7 +544,8 @@ export function reduceLifecycle(run: LifecycleRun, event: CoordinatorEvent): Coo
           run,
           `plan:${event.attempt}`,
           `🧠 **Plan gotowy**\n\n${event.output.plan}\n\nZatwierdź wyłącznie komendą \`/approve\` albo odrzuć: \`/reject <powód>\`.`,
-          "approval"
+          "approval",
+          event.output.signature
         )],
       };
     }
@@ -542,7 +557,8 @@ export function reduceLifecycle(run: LifecycleRun, event: CoordinatorEvent): Coo
           run,
           "build",
           event.output.errorCode ?? "BUILD_FAILED",
-          event.output.report.slice(0, 6000)
+          event.output.report.slice(0, 6000),
+          event.output.signature
         );
         decision.transition.patch = {
           ...decision.transition.patch,
@@ -583,7 +599,13 @@ export function reduceLifecycle(run: LifecycleRun, event: CoordinatorEvent): Coo
       };
     }
     if (event.output.reviewVerdict === "unavailable") {
-      return blocked(run, "review", "REVIEW_UNAVAILABLE", event.output.report.slice(0, 6000));
+      return blocked(
+        run,
+        "review",
+        "REVIEW_UNAVAILABLE",
+        event.output.report.slice(0, 6000),
+        event.output.signature
+      );
     }
     // Advisory zostaje advisory: lgtm i advisory-fix odblokowują ready, ale
     // komentarz recenzenta jest dispatchowany PRZED zdjęciem draftu.

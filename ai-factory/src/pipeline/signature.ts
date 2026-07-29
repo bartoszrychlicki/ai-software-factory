@@ -40,7 +40,11 @@ export function buildSignature(stage: Stage, route: Route): ActionSignature {
   return {
     agent: "ai-factory",
     harness,
-    model: route.model ?? "(domyślny CLI)",
+    model: route.model
+      ? route.effort
+        ? `${route.model}@${route.effort}`
+        : route.model
+      : "(domyślny CLI)",
     profile: PROFILE_BY_STAGE[stage],
   };
 }
@@ -56,6 +60,19 @@ export function signatureTrailer(signature: ActionSignature): string {
 
 export function signatureLine(signature: ActionSignature): string {
   return `${signature.agent} · ${signature.harness} · ${signature.model} · ${signature.profile}`;
+}
+
+export function parseSignatureLine(line: string): ActionSignature | undefined {
+  const parts = line.split(" · ").map((part) => part.trim());
+  if (parts.length !== 4 || parts.some((part) => !part)) return undefined;
+  const [agent, harness, model, profile] = parts;
+  if (!Object.prototype.hasOwnProperty.call(ACTION_PROFILES, profile)) return undefined;
+  return {
+    agent,
+    harness,
+    model,
+    profile: profile as ActionProfile,
+  };
 }
 
 export function signatureFooter(signature: ActionSignature): string {
