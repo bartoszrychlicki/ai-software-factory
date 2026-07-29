@@ -1,6 +1,13 @@
 import type { Route, Stage } from "./routing";
 
-export type ActionProfile = "planner" | "builder" | "verifier" | "reviewer" | "orchestrator";
+export type ActionProfile =
+  | "planner"
+  | "builder"
+  | "verifier"
+  | "reviewer"
+  | "orchestrator"
+  | "researcher"
+  | "critic";
 
 export interface ActionSignature {
   agent: string;
@@ -22,6 +29,8 @@ const ACTION_PROFILES = {
   verifier: true,
   reviewer: true,
   orchestrator: true,
+  researcher: true,
+  critic: true,
 } satisfies Record<ActionProfile, true>;
 
 const PROFILE_BY_STAGE: Record<Stage, ActionProfile> = {
@@ -29,6 +38,10 @@ const PROFILE_BY_STAGE: Record<Stage, ActionProfile> = {
   build: "builder",
   verify: "verifier",
   review: "reviewer",
+  triage: "planner",
+  research: "researcher",
+  synthesis: "planner",
+  critique: "critic",
 };
 
 export function buildSignature(stage: Stage, route: Route): ActionSignature {

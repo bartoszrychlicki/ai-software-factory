@@ -42,6 +42,10 @@ test("buildSignature mapuje każdy etap na właściwy profil", () => {
     build: "builder",
     verify: "verifier",
     review: "reviewer",
+    triage: "planner",
+    research: "researcher",
+    synthesis: "planner",
+    critique: "critic",
   };
 
   for (const [stage, profile] of Object.entries(profiles) as [Stage, string][]) {
