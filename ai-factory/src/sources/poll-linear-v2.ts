@@ -67,6 +67,7 @@ import { notify } from "../pipeline/notify";
 import { parseSignatureLine, POLLER_SIGNATURE } from "../pipeline/signature";
 import { progressComment, type ProgressCommentContext } from "../pipeline/progress";
 import { resolveRoute } from "../pipeline/routing";
+import { extendedStatusName } from "./state-map";
 
 const POLL_INTERVAL_MS = Number(process.env.FACTORY_POLL_INTERVAL_MS ?? 60_000);
 const marker = (ticketId: string) => `[linear:${ticketId}:v2]`;
@@ -81,6 +82,8 @@ export interface PollerDependencies {
   store: LifecycleStore;
   mastra: MastraWorkflowClient;
   sources: Map<string, LinearSource>;
+  /** Projekty, dla których kolumna Linear odzwierciedla dokładną fazę lifecycle. */
+  extendedStatuses?: Set<string>;
   /** Kanał powiadomień; testy wstrzykują rejestrator zamiast realnego notify. */
   notifier?: typeof notify;
   /** Start detached runnera testów; testy wstrzykują stub zwracający PID. */
@@ -100,7 +103,8 @@ function sourceFor(deps: PollerDependencies, run: LifecycleRun): LinearSource {
   return source;
 }
 
-function statusName(run: LifecycleRun): string {
+function statusName(run: LifecycleRun, extended: boolean): string {
+  if (extended) return extendedStatusName(run);
   if (run.errorCode === "CANCELED") return "Canceled";
   if (run.status === "blocked") return "👤 ⛔ Zablokowany";
   if (run.status === "done") return "Done";
@@ -108,11 +112,11 @@ function statusName(run: LifecycleRun): string {
   return "In Progress";
 }
 
-function statusCommand(run: LifecycleRun, reason: string): Omit<
+function statusCommand(run: LifecycleRun, reason: string, extended: boolean): Omit<
   LifecycleCommand,
   "state" | "attempts" | "createdAt" | "updatedAt" | "availableAt"
 > {
-  const state = statusName(run);
+  const state = statusName(run, extended);
   const transitionId = createHash("sha256")
     .update(`${run.stage}:${run.status}:${state}:${reason}`)
     .digest("hex")
@@ -173,7 +177,11 @@ export function applyDecision(
     ...decision.transition,
     commands: [
       ...decision.commands,
-      statusCommand(projected, decision.transition.reason),
+      statusCommand(
+        projected,
+        decision.transition.reason,
+        deps.extendedStatuses?.has(projected.project) ?? false
+      ),
       ...(progress ? [{
         key: progress.key,
         ticketId,
@@ -1558,10 +1566,17 @@ async function main(): Promise<void> {
   if (!apiKey) throw new Error("Brak LINEAR_API_KEY.");
   const projects = (process.env.LINEAR_PROJECTS ?? process.env.LINEAR_PROJECT ?? "pilot-app")
     .split(",").map((value) => value.trim()).filter(Boolean);
+  const sources = new Map(projects.map((project) => [project, new LinearSource(apiKey, project)]));
+  const extendedStatuses = new Set<string>();
+  for (const projectKey of projects) {
+    const project = await getProject(projectKey);
+    if (project.statuses === "extended") extendedStatuses.add(projectKey);
+  }
   const deps: PollerDependencies = {
     store: new LifecycleStore(),
     mastra: new MastraWorkflowClient(process.env.FACTORY_API ?? "http://localhost:4111/api", "factoryJob"),
-    sources: new Map(projects.map((project) => [project, new LinearSource(apiKey, project)])),
+    sources,
+    extendedStatuses,
   };
   ensureSingleWriter(deps.store);
   const release = () => {
