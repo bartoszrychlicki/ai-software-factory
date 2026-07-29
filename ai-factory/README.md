@@ -43,6 +43,61 @@ FACTORY_ROOT="$(pwd)" npm run poller -- --once
 Produkcja nadal korzysta z instalatora `ops/install-launchd.sh`. Nie buduj bundle'a
 pod działającym serwerem i nie uruchamiaj drugiej Mastry na tym samym storage.
 
+## Konfiguracja per host
+
+`projects.yaml` i `routing.yaml` są wspólne dla wszystkich hostów. Wartości
+specyficzne dla maszyny (ścieżki repo, lokalne eksperymenty budżetowe/modelowe)
+trzymaj w opcjonalnych, **gitignorowanych** plikach obok bazowych:
+
+- `projects.local.yaml` — nadpisania per projekt,
+- `routing.local.yaml` — nadpisania sekcji `defaults` i `projects.<projekt>`
+  (inne sekcje najwyższego poziomu są błędem konfiguracji).
+
+Semantyka: **płytki merge per projekt/klucz, local wygrywa**. Klucz podany w
+`.local` zastępuje klucz bazowy w całości — także obiekty, więc np. lokalny
+`budget:` musi być kompletny (`maxUsd` **i** `maxMinutes`). Klucze niewymienione
+w `.local` zostają z bazy; projekt obecny tylko w `.local` dochodzi w całości.
+Fail-closed: brak pliku `.local` = brak nadpisań, ale plik istniejący
+a nieparsowalny albo o złym kształcie zatrzymuje fabrykę twardym błędem — nigdy
+nie jest po cichu ignorowany. Walidacje `getProject` (checks, `ci.requiredChecks`)
+działają na wyniku merge'a, więc `.local` nie może ich obejść.
+
+Przykład (host produkcyjny nadpisuje ścieżkę repo, budżet i model verify):
+
+```yaml
+# projects.local.yaml
+br-budget:
+  repo: /Users/senioraiconsultant/Development/Clients/Bartosz/br-budget
+  budget:
+    maxUsd: 15
+    maxMinutes: 90
+```
+
+```yaml
+# routing.local.yaml
+projects:
+  br-budget:
+    verify: claude-code/claude-opus-5@high
+```
+
+Zmiany merytoryczne wspólne dla wszystkich hostów commituj do plików bazowych;
+`.local` jest wyłącznie na różnice per maszyna. Testy czytają commitowane yaml-e
+przez kopię w katalogu tymczasowym, więc lokalne nadpisania hosta nie zmieniają
+ich wyniku.
+
+### Plisty launchd bez ścieżek per host
+
+`ops/install-launchd.sh` generuje plisty z szablonów
+`ops/com.ai-factory.{server,poller}.plist.template`: npm/node wykrywa
+`command -v`, `claude` preferencyjnie z `~/.local/bin/claude`, katalog fabryki
+z położenia repo, logi pod `$HOME`. Wykryte katalogi node/npm dochodzą do
+`PATH` usług (launchd startuje z minimalnym `PATH` — patrz pułapka BAR-92).
+Podgląd wyrenderowanych plistów bez instalacji:
+
+```shell
+bash ops/install-launchd.sh --render-only /tmp/ai-factory-plisty
+```
+
 ## Sterowanie w Linear
 
 Fabryka używa wyłącznie stanów `Todo → In Progress → In Review → Done` oraz
@@ -80,7 +135,8 @@ lub po buildzie zatrzymuje proces, zachowując branch i checkpoint.
   checkpointu i jawnie przypiętego PR-a z registry v1;
 - `src/pipeline/scope.ts` — warnings dla zwykłych odchyleń i blokada
   sekretów/niezatwierdzonych ścieżek chronionych;
-- `projects.yaml` i `routing.yaml` — projekty, checks, budżety i adaptery.
+- `projects.yaml` i `routing.yaml` — projekty, checks, budżety i adaptery
+  (+ opcjonalne gitignorowane `*.local.yaml` per host — sekcja wyżej).
 
 `ticket-pipeline.ts`, `poll-linear.ts` i `run-registry.ts` pozostają kodem legacy
 do odczytu/testów migracji, ale nie są podpięte do runtime.
