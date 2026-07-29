@@ -518,8 +518,17 @@ test("komendy /score: ścisła walidacja i parsowanie payloadu", () => {
 
 test("incydent BAR-180: etykieta przed JSON-em w bloku factory nie gubi werdyktu", async () => {
   const { verdictInstruction } = await import("../pipeline/verdicts");
-  for (const kind of ["plan", "triage", "critique", "review"] as const) {
-    assert.match(verdictInstruction(kind), /WYŁĄCZNIE goły JSON/);
+  for (const kind of ["plan", "triage", "critique", "review", "verify"] as const) {
+    const instruction = verdictInstruction(kind);
+    assert.match(instruction, /WYŁĄCZNIE goły JSON/);
+    // Wyrenderowany przykładowy fence zawiera WYŁĄCZNIE goły JSON — bez
+    // etykiet i dokumentacji, które modele kopiowały do realnego bloku.
+    const fence = instruction.match(/```factory\n([\s\S]*?)```/);
+    assert.ok(fence, `instrukcja ${kind} musi zawierać przykładowy blok factory`);
+    assert.doesNotThrow(
+      () => JSON.parse(fence![1].trim()),
+      `przykładowy fence ${kind} musi być czystym JSON-em`
+    );
   }
   // Dokładna reprodukcja outputu haiku (triage): etykieta z instrukcji przed
   // JSON-em WEWNĄTRZ bloku — kanał maszynowy jest jawny, więc ratujemy JSON.
@@ -552,6 +561,29 @@ test("incydent BAR-180: etykieta przed JSON-em w bloku factory nie gubi werdyktu
     "```",
   ].join("\n");
   assert.equal(parseCritiqueVerdict(noisy).verdict, "ok");
+
+  // Osierocony `{` przed werdyktem nie może zablokować ratowania (stos nigdy
+  // się nie opróżnia, ale wewnętrzny domknięty obiekt jest kandydatem).
+  const stray = [
+    "```factory",
+    '{junk {"verdict":"ok"}',
+    "```",
+  ].join("\n");
+  assert.equal(parseCritiqueVerdict(stray).verdict, "ok");
+
+  // Przy zagnieżdżeniu wygrywa obiekt zewnętrzny (domyka się później).
+  const nested = [
+    "```factory",
+    '{"verdict":"issues","issues":"zewnętrzny"} tekst {"meta":{"verdict":"ok"}}',
+    "```",
+  ].join("\n");
+  assert.equal(parseCritiqueVerdict(nested).verdict, "unavailable"); // ostatni obiekt nie pasuje do kontraktu — fail-closed
+  const nestedValid = [
+    "```factory",
+    'nota {"verdict":"issues","issues":"całość"}',
+    "```",
+  ].join("\n");
+  assert.equal(parseCritiqueVerdict(nestedValid).issues, "całość");
 });
 
 test("kontrakty triage i krytyki parsują się fail-closed", () => {

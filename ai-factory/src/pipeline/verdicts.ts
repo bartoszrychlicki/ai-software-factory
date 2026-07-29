@@ -241,7 +241,12 @@ function lastJsonObjectInBlock(block: string): Record<string, unknown> | undefin
     else if (char === "{") stack.push(i);
     else if (char === "}" && stack.length) {
       const start = stack.pop()!;
-      if (!stack.length) candidates.push(block.slice(start, i + 1));
+      // Kandydatem jest KAŻDY domknięty obiekt, nie tylko najbardziej
+      // zewnętrzny: osierocony `{` przed werdyktem trzymałby stos niepusty
+      // i poprawny obiekt nigdy nie zostałby zapisany (uwaga CodeRabbit,
+      // PR #31). Zewnętrzny obiekt i tak domyka się później, więc przy
+      // zagnieżdżeniu odwrotna kolejność parsowania preferuje całość.
+      candidates.push(block.slice(start, i + 1));
     }
   }
   for (const candidate of candidates.reverse()) {
