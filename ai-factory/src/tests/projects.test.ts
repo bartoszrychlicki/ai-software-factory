@@ -62,7 +62,7 @@ test("pilot-app nadpisuje budżet verify na 15 minut", async () => {
 
 test("br-factory jest bezpiecznie zarejestrowany jako projekt self-hosted", async () => {
   const project = await getProject("br-factory");
-  assert.equal(project.repo, "/Users/senioraiconsultant/Development/Edu/ai-sdlc");
+  assert.equal(project.repo, "/Users/bartoszrychlicki/Dev/ai-software-factory");
   assert.equal(project.github, "bartoszrychlicki/ai-software-factory");
   assert.equal(project.default_branch, "main");
   assert.equal(project.statuses, "extended");

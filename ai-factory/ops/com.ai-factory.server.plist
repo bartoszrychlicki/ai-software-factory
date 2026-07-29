@@ -7,22 +7,22 @@
 
   <key>ProgramArguments</key>
   <array>
-    <string>/Users/senioraiconsultant/.local/bin/npm</string>
+    <string>/opt/homebrew/bin/npm</string>
     <string>run</string>
     <string>start</string>
   </array>
 
   <key>WorkingDirectory</key>
-  <string>/Users/senioraiconsultant/Development/Edu/ai-sdlc/ai-factory</string>
+  <string>/Users/bartoszrychlicki/Dev/ai-software-factory/ai-factory</string>
 
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
-    <string>/Users/senioraiconsultant/.local/bin:/Users/senioraiconsultant/.kimi-code/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <string>/Users/bartoszrychlicki/.local/bin:/Users/bartoszrychlicki/.kimi-code/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     <key>FACTORY_ROOT</key>
-    <string>/Users/senioraiconsultant/Development/Edu/ai-sdlc/ai-factory</string>
+    <string>/Users/bartoszrychlicki/Dev/ai-software-factory/ai-factory</string>
     <key>CLAUDE_BIN</key>
-    <string>/Users/senioraiconsultant/.local/bin/claude</string>
+    <string>/Users/bartoszrychlicki/.local/bin/claude</string>
   </dict>
 
   <key>RunAtLoad</key>
@@ -33,8 +33,8 @@
   <integer>15</integer>
 
   <key>StandardOutPath</key>
-  <string>/Users/senioraiconsultant/.ai-factory/logs/server.log</string>
+  <string>/Users/bartoszrychlicki/.ai-factory/logs/server.log</string>
   <key>StandardErrorPath</key>
-  <string>/Users/senioraiconsultant/.ai-factory/logs/server.err.log</string>
+  <string>/Users/bartoszrychlicki/.ai-factory/logs/server.err.log</string>
 </dict>
 </plist>

@@ -1,7 +1,7 @@
 pilot-app:
   statuses: extended   # tablica Linear odzwierciedla fazy fabryki
   max_concurrent_tickets: 2   # BAR-122: równoległość ponad 2 rozjeżdżała maina (noc 2026-07-22)
-  repo: /Users/senioraiconsultant/Development/Edu/ai-sdlc/pilot-app
+  repo: /Users/bartoszrychlicki/Dev/pilot-app
   github: bartoszrychlicki/pilot-app
   default_branch: main
   checks:
@@ -20,7 +20,7 @@ pilot-app:
 
 br-budget:
   max_concurrent_tickets: 1   # produkcyjne repo — jeden ticket naraz do czasu dojrzałości merge-queue
-  repo: /Users/senioraiconsultant/Development/Clients/Bartosz/br-budget
+  repo: /Users/bartoszrychlicki/Dev/br-budget
   github: bartoszrychlicki/br-budget
   default_branch: main
   checks:
@@ -54,7 +54,7 @@ br-budget:
 br-factory:
   statuses: extended
   max_concurrent_tickets: 1
-  repo: /Users/senioraiconsultant/Development/Edu/ai-sdlc
+  repo: /Users/bartoszrychlicki/Dev/ai-software-factory
   github: bartoszrychlicki/ai-software-factory
   default_branch: main
   checks:

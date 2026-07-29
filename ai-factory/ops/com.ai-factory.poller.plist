@@ -7,18 +7,18 @@
 
   <key>ProgramArguments</key>
   <array>
-    <string>/Users/senioraiconsultant/.local/bin/npm</string>
+    <string>/opt/homebrew/bin/npm</string>
     <string>run</string>
     <string>poller</string>
   </array>
 
   <key>WorkingDirectory</key>
-  <string>/Users/senioraiconsultant/Development/Edu/ai-sdlc/ai-factory</string>
+  <string>/Users/bartoszrychlicki/Dev/ai-software-factory/ai-factory</string>
 
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
-    <string>/Users/senioraiconsultant/.local/bin:/Users/senioraiconsultant/.kimi-code/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <string>/Users/bartoszrychlicki/.local/bin:/Users/bartoszrychlicki/.kimi-code/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     <key>FACTORY_CB_USD_PER_H</key>
     <string>25</string>
   </dict>
@@ -31,8 +31,8 @@
   <integer>15</integer>
 
   <key>StandardOutPath</key>
-  <string>/Users/senioraiconsultant/.ai-factory/logs/poller.log</string>
+  <string>/Users/bartoszrychlicki/.ai-factory/logs/poller.log</string>
   <key>StandardErrorPath</key>
-  <string>/Users/senioraiconsultant/.ai-factory/logs/poller.err.log</string>
+  <string>/Users/bartoszrychlicki/.ai-factory/logs/poller.err.log</string>
 </dict>
 </plist>
