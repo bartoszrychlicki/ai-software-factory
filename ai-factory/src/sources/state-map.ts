@@ -1,4 +1,5 @@
 import type { FactoryPhase, Gate, DecisionKind } from "../pipeline/run-registry";
+import type { LifecycleStage } from "../pipeline/lifecycle-store";
 
 /**
  * Deklaratywna mapa: fazy fabryki i decyzje człowieka ↔ prymitywy trackera.
@@ -49,6 +50,63 @@ export const LINEAR_STATE_MAP: StateMap = {
   },
   labelParams: { engine: "engine:", domain: "domain:", planMode: "plan:" },
 };
+
+export interface ExtendedStatusRun {
+  stage: LifecycleStage;
+  status: string;
+  errorCode?: string;
+  planDomain?: string;
+  approvedAt?: string;
+}
+
+const EXTENDED_STAGE_STATUS: Record<LifecycleStage, string> = {
+  triage: LINEAR_STATE_MAP.phases.planning,
+  research: LINEAR_STATE_MAP.phases.planning,
+  synthesis: LINEAR_STATE_MAP.phases.planning,
+  critique: LINEAR_STATE_MAP.phases.planning,
+  plan: LINEAR_STATE_MAP.phases.planning,
+  approval: LINEAR_STATE_MAP.phases["plan-approval"],
+  build: LINEAR_STATE_MAP.phases.build,
+  test: LINEAR_STATE_MAP.phases.verify,
+  publish: LINEAR_STATE_MAP.phases.verify,
+  ci: LINEAR_STATE_MAP.phases.verify,
+  review: LINEAR_STATE_MAP.phases.review,
+  merge: LINEAR_STATE_MAP.phases["pr-ready"],
+  smoke: LINEAR_STATE_MAP.phases.verify,
+};
+
+const CLARIFY_STAGES = new Set<LifecycleStage>(["triage", "plan", "synthesis"]);
+
+/** Projekcja durable lifecycle v2/v3 na rozszerzone kolumny tablicy Linear. */
+export function extendedStatusName(run: ExtendedStatusRun): string {
+  if (run.errorCode === "CANCELED") return "Canceled";
+  if (run.status === "blocked") return LINEAR_STATE_MAP.phases.blocked;
+  if (run.status === "done") return "Done";
+  if (run.status === "waiting_human" && CLARIFY_STAGES.has(run.stage)) {
+    return LINEAR_STATE_MAP.phases.questions;
+  }
+  if (
+    run.stage === "approval" &&
+    run.status === "waiting_human" &&
+    run.planDomain === "ops" &&
+    run.approvedAt
+  ) {
+    return LINEAR_STATE_MAP.phases["ops-checklist"];
+  }
+  return EXTENDED_STAGE_STATUS[run.stage];
+}
+
+/** Wszystkie stany, których może użyć projekcja `statuses: extended`. */
+export function extendedRequiredStateNames(): string[] {
+  return [...new Set([
+    "Canceled",
+    LINEAR_STATE_MAP.phases.blocked,
+    "Done",
+    LINEAR_STATE_MAP.phases.questions,
+    LINEAR_STATE_MAP.phases["ops-checklist"],
+    ...Object.values(EXTENDED_STAGE_STATUS),
+  ])];
+}
 
 /** Faza odpowiadająca nazwie stanu (odwrotność phases) — do zapisu w rejestrze. */
 export function phaseOfState(map: StateMap, stateName: string): FactoryPhase | undefined {

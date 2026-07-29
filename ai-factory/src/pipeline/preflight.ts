@@ -3,6 +3,7 @@ import { dirname, join } from "node:path";
 import { execFileControlled } from "./process-control";
 import { findUpFile, getProject } from "./projects";
 import { resolveRoute } from "./routing";
+import { extendedRequiredStateNames } from "../sources/state-map";
 
 export interface PreflightDependency {
   linearStateNames(): Promise<string[]>;
@@ -66,6 +67,13 @@ export async function runPreflight(
   });
   for (const required of ["Todo", "In Progress", "In Review", "Done", "Canceled", "👤 ⛔ Zablokowany"]) {
     if (!stateNames.includes(required)) errors.push(`Linear: brak wymaganego stanu "${required}"`);
+  }
+  if (project.statuses === "extended") {
+    for (const required of extendedRequiredStateNames()) {
+      if (!stateNames.includes(required)) {
+        errors.push(`Linear: brak stanu "${required}" wymaganego przez statuses: extended`);
+      }
+    }
   }
   if (!await dependency.mastraUp()) errors.push("Mastra /workflows jest niedostępna.");
 
