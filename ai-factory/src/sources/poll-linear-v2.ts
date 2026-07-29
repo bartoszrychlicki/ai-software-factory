@@ -58,6 +58,7 @@ import { execFileControlled } from "../pipeline/process-control";
 import { evaluateGithubChecks, inspectPullRequestChecks } from "../pipeline/github-ci";
 import { runProdChecks } from "../pipeline/prod-smoke";
 import { notify } from "../pipeline/notify";
+import { parseSignatureLine, POLLER_SIGNATURE } from "../pipeline/signature";
 
 const POLL_INTERVAL_MS = Number(process.env.FACTORY_POLL_INTERVAL_MS ?? 60_000);
 const marker = (ticketId: string) => `[linear:${ticketId}:v2]`;
@@ -514,9 +515,13 @@ async function dispatchExternal(
     const tag = `[factory-outbox:${command.key}]`;
     const exists = (await source.listComments(run.ticketId)).some((comment) => comment.body.includes(tag));
     if (!exists) {
+      const signature = typeof command.payload.signature === "string"
+        ? parseSignatureLine(command.payload.signature)
+        : undefined;
       await source.comment(
         run.ticketId,
-        `${String(command.payload.body)}\n\n${marker(run.ticketId)} ${tag}`
+        `${String(command.payload.body)}\n\n${marker(run.ticketId)} ${tag}`,
+        signature ?? POLLER_SIGNATURE
       );
     }
   } else if (command.kind === "publish-pr") {

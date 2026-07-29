@@ -36,6 +36,10 @@ import {
 } from "../sources/poll-linear-v2";
 import { MastraHttpError } from "../sources/mastra-client";
 import { buildCommentContextSnapshot } from "../sources/comment-context";
+import {
+  POLLER_SIGNATURE,
+  type ActionSignature,
+} from "../pipeline/signature";
 
 const manifest: TicketManifestV2 = {
   title: "Lifecycle v2",
@@ -280,6 +284,132 @@ test("brak werdyktu review ponawia tylko review raz w generacji, niezależnie od
     { type: "job-finished", attempt: 8, output: unavailable }
   );
   assert.equal(second.transition.status, "blocked");
+});
+
+test("komentarze wynikające z joba zachowują podpis jego faktycznej roli", () => {
+  const plannerSignature = "ai-factory · claude-code@2.1 · claude-fable-5@high · planner";
+  const builderSignature = "ai-factory · codex@0.44 · gpt-5.6-sol@high · builder";
+  const reviewerSignature = "ai-factory · claude-code@2.1 · claude-opus-4@high · reviewer";
+  const planRun: LifecycleRun = {
+    ticketId: "BAR-SIG1",
+    project: "br-factory",
+    generation: 1,
+    stage: "plan",
+    status: "running",
+    manifest,
+    planFiles: [],
+    clarifyRound: 0,
+    createdAt: "x",
+    updatedAt: "x",
+  };
+  const questionsOutput: FactoryJobOutput = {
+    kind: "plan",
+    outcome: "questions",
+    report: "potrzebuję odpowiedzi",
+    questions: "1. Tryb?",
+    signature: plannerSignature,
+    durationMs: 1,
+    files: [],
+    changedFiles: [],
+    scopeWarnings: [],
+  };
+  const questions = reduceLifecycle(planRun, {
+    type: "job-finished",
+    attempt: 1,
+    output: questionsOutput,
+  });
+  assert.equal(questions.commands[0].payload.signature, plannerSignature);
+
+  const maxQuestions = reduceLifecycle(
+    { ...planRun, clarifyRound: 2 },
+    { type: "job-finished", attempt: 3, output: questionsOutput }
+  );
+  assert.equal(maxQuestions.commands[0].payload.signature, plannerSignature);
+
+  const ready = reduceLifecycle(planRun, {
+    type: "job-finished",
+    attempt: 2,
+    output: {
+      ...planOutput,
+      signature: plannerSignature,
+    },
+  });
+  assert.equal(ready.commands[0].payload.signature, plannerSignature);
+
+  const failedPlan = reduceLifecycle(planRun, {
+    type: "job-finished",
+    attempt: 1,
+    output: {
+      ...questionsOutput,
+      outcome: "failed",
+      questions: undefined,
+      errorCode: "PLAN_ENGINE_FAILED",
+    },
+  });
+  assert.equal(failedPlan.commands[0].payload.signature, plannerSignature);
+
+  const buildRun: LifecycleRun = {
+    ...planRun,
+    ticketId: "BAR-SIG2",
+    stage: "build",
+    plan: "plan",
+  };
+  const failedBuild = reduceLifecycle(buildRun, {
+    type: "job-finished",
+    attempt: 1,
+    output: {
+      kind: "build",
+      outcome: "failed",
+      report: "builder failed",
+      errorCode: "BUILD_ENGINE_FAILED",
+      signature: builderSignature,
+      durationMs: 1,
+      files: ["src/a.ts"],
+      changedFiles: [],
+      scopeWarnings: [],
+    },
+  });
+  assert.equal(failedBuild.commands[0].payload.signature, builderSignature);
+
+  const reviewRun: LifecycleRun = {
+    ...planRun,
+    ticketId: "BAR-SIG3",
+    stage: "review",
+    headSha: "a".repeat(40),
+    prUrl: "https://github.test/o/r/pull/1",
+    reviewStatus: "unavailable",
+  };
+  const unavailableReview: FactoryJobOutput = {
+    kind: "review",
+    outcome: "failed",
+    report: "review unavailable",
+    signature: reviewerSignature,
+    durationMs: 1,
+    files: [],
+    changedFiles: [],
+    scopeWarnings: [],
+    reviewVerdict: "unavailable",
+  };
+  const failedReview = reduceLifecycle(reviewRun, {
+    type: "job-finished",
+    attempt: 2,
+    output: unavailableReview,
+  });
+  assert.equal(failedReview.commands[0].payload.signature, reviewerSignature);
+
+  const advisory = reduceLifecycle(
+    { ...reviewRun, reviewStatus: "running" },
+    {
+      type: "job-finished",
+      attempt: 3,
+      output: {
+        ...unavailableReview,
+        outcome: "success",
+        reviewVerdict: "advisory-fix",
+      },
+    }
+  );
+  assert.equal(advisory.commands[0].payload.signature, reviewerSignature);
 });
 
 test("ścisłe komendy odrzucają brak wymaganej treści i nadmiarowe argumenty", () => {
@@ -763,6 +893,150 @@ async function writeHarnessFixture(root: string, extraProjectYaml: string[] = []
     ...extraProjectYaml,
   ].join("\n"));
 }
+
+test("linear-comment zachowuje podpis plannera po retry outboxu i restarcie store", async () => {
+  const root = await mkdtemp(join(tmpdir(), "factory-signature-retry-"));
+  const db = join(root, "registry.db");
+  const previousRoot = process.env.FACTORY_ROOT;
+  let store = new LifecycleStore(db);
+  const signatureLine = "ai-factory · claude-code@2.1 · claude-fable-5@high · planner";
+  const expectedSignature: ActionSignature = {
+    agent: "ai-factory",
+    harness: "claude-code@2.1",
+    model: "claude-fable-5@high",
+    profile: "planner",
+  };
+  const received: (ActionSignature | undefined)[] = [];
+  let commentAttempts = 0;
+  try {
+    await writeHarnessFixture(root);
+    process.env.FACTORY_ROOT = root;
+    let run = store.createRun("BAR-SIG4", "harness", manifest);
+    run = apply(store, run, {
+      type: "job-finished",
+      attempt: 1,
+      output: {
+        kind: "plan",
+        outcome: "questions",
+        report: "potrzebuję odpowiedzi",
+        questions: "1. Tryb?",
+        signature: signatureLine,
+        durationMs: 1,
+        files: [],
+        changedFiles: [],
+        scopeWarnings: [],
+      },
+    });
+    const key = "BAR-SIG4:g1:linear-comment:questions:1";
+    assert.equal(store.getCommand(key)?.payload.signature, signatureLine);
+
+    const source = {
+      async setStateByName() {},
+      async listComments() { return []; },
+      async comment(_id: string, _body: string, signature?: ActionSignature) {
+        received.push(signature);
+        commentAttempts += 1;
+        if (commentAttempts === 1) {
+          throw new Error("connect ECONNRESET 127.0.0.1:443");
+        }
+      },
+    };
+    let deps: PollerDependencies = {
+      store,
+      mastra: {} as unknown as PollerDependencies["mastra"],
+      sources: new Map([["harness", source as never]]),
+      notifier: async () => {},
+    };
+
+    await dispatchOutbox(deps);
+    assert.equal(store.getCommand(key)?.state, "pending");
+    assert.equal(store.getCommand(key)?.payload.signature, signatureLine);
+
+    store.close();
+    store = new LifecycleStore(db);
+    assert.equal(store.getCommand(key)?.payload.signature, signatureLine);
+    store.markCommand(key, "pending", {
+      retryAt: new Date(Date.now() - 1000).toISOString(),
+    });
+    deps = { ...deps, store };
+    await dispatchOutbox(deps);
+
+    assert.equal(store.getCommand(key)?.state, "done");
+    assert.deepEqual(received, [expectedSignature, expectedSignature]);
+  } finally {
+    store.close();
+    if (previousRoot === undefined) delete process.env.FACTORY_ROOT;
+    else process.env.FACTORY_ROOT = previousRoot;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("komentarz spoza joba i niepoprawny podpis próby dostają podpis pollera", async () => {
+  const root = await mkdtemp(join(tmpdir(), "factory-signature-fallback-"));
+  const previousRoot = process.env.FACTORY_ROOT;
+  const store = new LifecycleStore(join(root, "registry.db"));
+  const received: (ActionSignature | undefined)[] = [];
+  try {
+    await writeHarnessFixture(root);
+    process.env.FACTORY_ROOT = root;
+    store.createRun("BAR-SIG5", "harness", manifest);
+    const run = store.transition("BAR-SIG5", {
+      stage: "test",
+      status: "pending",
+      actor: "test",
+      reason: "checkpoint",
+      patch: {
+        plan: "plan",
+        planFiles: ["src/a.ts"],
+        headSha: "a".repeat(40),
+      },
+    });
+    const decision = reduceLifecycle(run, {
+      type: "test-result",
+      ok: false,
+      sha: run.headSha!,
+      report: "e2e failed",
+    });
+    store.transition(run.ticketId, {
+      ...decision.transition,
+      commands: decision.commands,
+    });
+    const commentCommand = decision.commands.find((command) => command.kind === "linear-comment");
+    assert.equal(commentCommand?.payload.signature, undefined);
+    store.enqueue({
+      key: "BAR-SIG5:g1:linear-comment:invalid-signature",
+      ticketId: run.ticketId,
+      kind: "linear-comment",
+      stage: "plan",
+      payload: {
+        body: "job zakończył się przed zbudowaniem podpisu",
+        signature: "ai-factory · unavailable · unavailable · unavailable",
+      },
+    });
+
+    const source = {
+      async setStateByName() {},
+      async listComments() { return []; },
+      async comment(_id: string, _body: string, signature?: ActionSignature) {
+        received.push(signature);
+      },
+    };
+    const deps: PollerDependencies = {
+      store,
+      mastra: {} as unknown as PollerDependencies["mastra"],
+      sources: new Map([["harness", source as never]]),
+      notifier: async () => {},
+    };
+    await dispatchOutbox(deps);
+
+    assert.deepEqual(received, [POLLER_SIGNATURE, POLLER_SIGNATURE]);
+  } finally {
+    store.close();
+    if (previousRoot === undefined) delete process.env.FACTORY_ROOT;
+    else process.env.FACTORY_ROOT = previousRoot;
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 test("stall lease: wiszący job Mastry kończy się JOB_STALLED i pozwala na /retry", async () => {
   const root = await mkdtemp(join(tmpdir(), "factory-stall-"));

@@ -15,6 +15,7 @@ import type { Route, Stage } from "../pipeline/routing";
 import { questionsArtifactMarkdown } from "../pipeline/ticket-pipeline";
 import {
   buildSignature,
+  parseSignatureLine,
   parseSignatureMeta,
   POLLER_SIGNATURE,
   signatureFooter,
@@ -28,9 +29,10 @@ const engine: EngineAdapter = {
   run: async () => ({ ok: true, report: "ok" }),
 };
 
-const route = (model?: string): Route => ({
+const route = (model?: string, effort?: string): Route => ({
   engine,
   model,
+  effort,
   spec: model ? `${engine.name}/${model}` : engine.name,
 });
 
@@ -54,6 +56,24 @@ test("buildSignature mapuje każdy etap na właściwy profil", () => {
 
 test("buildSignature jawnie oznacza model domyślny CLI", () => {
   assert.equal(buildSignature("build", route()).model, "(domyślny CLI)");
+});
+
+test("buildSignature dopisuje reasoning effort do modelu, gdy routing go ustawia", () => {
+  const signature = buildSignature("build", {
+    ...route("gpt-5.6-sol", "high"),
+    cliVersion: "0.44",
+  });
+
+  assert.equal(signature.model, "gpt-5.6-sol@high");
+  assert.equal(
+    signatureLine(signature),
+    "ai-factory · codex@0.44 · gpt-5.6-sol@high · builder",
+  );
+  assert.equal(
+    signatureFooter(signature),
+    "\n\n> 🖋️ ai-factory · codex@0.44 · gpt-5.6-sol@high · builder",
+  );
+  assert.equal(buildSignature("build", route("gpt-5.6-sol")).model, "gpt-5.6-sol");
 });
 
 test("harness niesie wersję CLI, a 'unknown' nie brudzi podpisu", () => {
@@ -118,6 +138,23 @@ test("parseSignatureMeta odrzuca śmieci i niepełny nagłówek", () => {
   );
   assert.equal(
     parseSignatureMeta("---\nagent: ai-factory\nharness: codex\nmodel: sol\nprofile: toString\n---\n"),
+    undefined,
+  );
+});
+
+test("parseSignatureLine odtwarza stabilny podpis i odrzuca niepoprawne payloady", () => {
+  const signature = buildSignature("review", {
+    ...route("provider/model", "xhigh"),
+    cliVersion: "1.2.3",
+  });
+
+  assert.deepEqual(parseSignatureLine(signatureLine(signature)), signature);
+  assert.equal(parseSignatureLine(""), undefined);
+  assert.equal(parseSignatureLine("ai-factory · codex · model"), undefined);
+  assert.equal(parseSignatureLine("ai-factory · codex · model · unknown"), undefined);
+  assert.equal(parseSignatureLine("ai-factory · codex · model · toString"), undefined);
+  assert.equal(
+    parseSignatureLine("ai-factory · unavailable · unavailable · unavailable"),
     undefined,
   );
 });
