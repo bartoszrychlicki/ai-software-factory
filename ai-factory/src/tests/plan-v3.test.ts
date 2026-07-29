@@ -516,6 +516,21 @@ test("komendy /score: ścisła walidacja i parsowanie payloadu", () => {
   assert.equal(parseScorePayload("6"), undefined);
 });
 
+test("verdictInstruction każe umieścić w bloku wyłącznie goły JSON (incydent BAR-180)", async () => {
+  const { verdictInstruction } = await import("../pipeline/verdicts");
+  for (const kind of ["plan", "triage", "critique", "review"] as const) {
+    assert.match(verdictInstruction(kind), /WYŁĄCZNIE goły JSON/);
+  }
+  // Dokładna reprodukcja błędu haiku: etykieta z instrukcji wklejona do bloku
+  // przed JSON-em = kontrakt złamany, fail-closed (nigdy zgadywanie).
+  const prefixed = [
+    "```factory",
+    'Rekomendacja ścieżki planowania: {"verdict":"deep","risk":[]}',
+    "```",
+  ].join("\n");
+  assert.equal(parseTriageVerdict(prefixed).source, "missing");
+});
+
 test("kontrakty triage i krytyki parsują się fail-closed", () => {
   const triage = parseTriageVerdict([
     "analiza…",

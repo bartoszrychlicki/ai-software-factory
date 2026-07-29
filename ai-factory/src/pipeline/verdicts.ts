@@ -257,6 +257,10 @@ export function verdictInstruction(kind: "plan" | "verify" | "review" | "triage"
     "```factory",
     ...shapes,
     "```",
+    // Lekcja BAR-180: słabszy model wkleił do bloku etykietę z tej instrukcji
+    // („Rekomendacja ścieżki planowania: {...}") i JSON.parse padł fail-closed.
+    "W bloku umieść WYŁĄCZNIE goły JSON werdyktu — bez etykiet, prefiksów i tekstu wokół",
+    "(opisy przed dwukropkiem powyżej to dokumentacja formatu, NIE część bloku).",
     "Blok MUSI być ostatnim elementem odpowiedzi — po nim NIE dopisuj komentarzy, podsumowań ani uwag o agentach pomocniczych.",
     "Bez tego bloku Twoja praca zostanie odrzucona: fabryka nie zgaduje werdyktu z treści raportu.",
   ].join("\n");
