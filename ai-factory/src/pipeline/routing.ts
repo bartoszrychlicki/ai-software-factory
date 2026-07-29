@@ -1,7 +1,6 @@
-import { readFile } from "node:fs/promises";
-import { parse } from "yaml";
 import { engines } from "../engines";
 import type { EngineAdapter } from "../engines/types";
+import { ensureMapping, localConfigPath, mergeSection, readLocalOverride, readYamlMapping } from "./local-config";
 import { findUpFile } from "./projects";
 
 export type Stage =
@@ -39,6 +38,40 @@ function parseSpec(spec: string): { engineName: string; model?: string; effort?:
   return { engineName, model: model || undefined, effort: effort || undefined };
 }
 
+/**
+ * routing.yaml + opcjonalny, gitignorowany routing.local.yaml per host.
+ * Merge jest płytki per klucz: defaults klucz-po-kluczu, projects per
+ * projekt/klucz — local wygrywa, klucze niewymienione zostają z bazy.
+ */
+async function loadRoutingConfig(): Promise<RoutingFile> {
+  const basePath = findUpFile("routing.yaml");
+  const base = await readYamlMapping(basePath);
+  const local = await readLocalOverride(basePath);
+  if (!local) return base as RoutingFile;
+
+  const localPath = localConfigPath(basePath);
+  const unknownSections = Object.keys(local).filter((section) => section !== "defaults" && section !== "projects");
+  if (unknownSections.length) {
+    throw new Error(
+      `${localPath}: nieznane sekcje "${unknownSections.join('", "')}" — dozwolone są wyłącznie "defaults" i "projects".`
+    );
+  }
+
+  const defaults = mergeSection(base.defaults, local.defaults, `${localPath}: defaults`) as Record<string, string>;
+  const baseProjects = ensureMapping(base.projects, `${basePath}: projects`);
+  const localProjects = ensureMapping(local.projects, `${localPath}: projects`);
+  const projects = { ...baseProjects } as Record<string, Record<string, string>>;
+  for (const [projectKey, override] of Object.entries(localProjects)) {
+    if (override === null || override === undefined) continue; // pusty stub sekcji = brak nadpisań
+    projects[projectKey] = mergeSection(
+      baseProjects[projectKey],
+      override,
+      `${localPath}: projects.${projectKey}`
+    ) as Record<string, string>;
+  }
+  return { defaults, projects };
+}
+
 export interface RouteOptions {
   /**
    * Dywersyfikacja cross-engine: jeżeli rozstrzygnięty silnik jest równy
@@ -61,8 +94,7 @@ export async function resolveRoute(
   domain?: string,
   options: RouteOptions = {}
 ): Promise<Route> {
-  const raw = await readFile(findUpFile("routing.yaml"), "utf8");
-  const cfg = parse(raw) as RoutingFile;
+  const cfg = await loadRoutingConfig();
 
   // label wybiera BUILDERA; role read-only (plan/verify/review) idą wg configu —
   // nie każdy silnik ma read-only (kimi-code), a override "wszystkiego" nie ma sensownego użycia

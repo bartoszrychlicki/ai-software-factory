@@ -11,3 +11,6 @@ dist
 *.duckdb
 *.duckdb.wal
 runs/
+# nadpisania konfiguracji per host (README: „Konfiguracja per host")
+projects.local.yaml
+routing.local.yaml

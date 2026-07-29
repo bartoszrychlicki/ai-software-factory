@@ -1,7 +1,6 @@
-import { readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { parse } from "yaml";
+import { localConfigPath, mergeSection, readLocalOverride, readYamlMapping } from "./local-config";
 
 export interface ProjectConfig {
   repo: string;
@@ -59,9 +58,18 @@ export function findUpFile(name: string): string {
 }
 
 export async function getProject(key: string): Promise<ProjectConfig> {
-  const raw = await readFile(findUpFile("projects.yaml"), "utf8");
-  const all = parse(raw) as Record<string, ProjectConfig>;
-  const project = all[key];
+  const basePath = findUpFile("projects.yaml");
+  const all = await readYamlMapping(basePath);
+  // Opcjonalny, gitignorowany projects.local.yaml per host: płytki merge per
+  // projekt/klucz, local wygrywa; walidacja fail-closed niżej działa na wyniku.
+  const local = await readLocalOverride(basePath);
+  if (local) {
+    for (const [projectKey, override] of Object.entries(local)) {
+      if (override === null || override === undefined) continue; // pusty stub sekcji = brak nadpisań
+      all[projectKey] = mergeSection(all[projectKey], override, `${localConfigPath(basePath)}: ${projectKey}`);
+    }
+  }
+  const project = all[key] as ProjectConfig | undefined;
   if (!project) throw new Error(`Nieznany projekt "${key}" — brak wpisu w projects.yaml`);
   const checks = project.checks?.map((command) => command.trim()).filter(Boolean) ?? [];
   if (!checks.length) {

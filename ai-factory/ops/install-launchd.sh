@@ -1,22 +1,123 @@
 #!/bin/bash
 # Instalacja fabryki jako usług launchd (auto-start przy logowaniu, auto-restart po padzie).
-# Użycie: bash ops/install-launchd.sh   (idempotentne — przeładowuje, jeśli już zainstalowane)
+# Użycie: bash ops/install-launchd.sh                    (idempotentne — przeładowuje, jeśli już zainstalowane)
+#         bash ops/install-launchd.sh --render-only DIR  (tylko wyrenderuj plisty do DIR — podgląd bez instalacji)
+#
+# Plisty powstają z szablonów ops/*.plist.template: npm/node/claude, katalog
+# fabryki i $HOME są wykrywane na hoście (command -v), nie hardcodowane —
+# te same pliki działają na każdej maszynie. Analogicznie yaml-e konfiguracyjne
+# nadpisuje się per host przez projects.local.yaml / routing.local.yaml (README).
 set -euo pipefail
 
 OPS_DIR="$(cd "$(dirname "$0")" && pwd)"
 FACTORY_DIR="$(cd "$OPS_DIR/.." && pwd)"
 AGENTS_DIR="$HOME/Library/LaunchAgents"
 UID_NUM="$(id -u)"
-FACTORY_NPM_BIN="/opt/homebrew/bin/npm"
 SERVER_SERVICE="com.ai-factory.server"
 POLLER_SERVICE="com.ai-factory.poller"
 SERVER_PLIST="$AGENTS_DIR/$SERVER_SERVICE.plist"
 POLLER_PLIST="$AGENTS_DIR/$POLLER_SERVICE.plist"
+SERVER_TEMPLATE="$OPS_DIR/$SERVER_SERVICE.plist.template"
+POLLER_TEMPLATE="$OPS_DIR/$POLLER_SERVICE.plist.template"
+
+RENDER_ONLY_DIR=""
+case "${1:-}" in
+  "") ;;
+  --render-only)
+    RENDER_ONLY_DIR="${2:-}"
+    if [[ -z "$RENDER_ONLY_DIR" ]]; then
+      echo "--render-only wymaga katalogu docelowego." >&2
+      exit 2
+    fi
+    ;;
+  *)
+    echo "Nieznany argument: $1 (dozwolone: --render-only DIR)" >&2
+    exit 2
+    ;;
+esac
 
 preflight_terminal_notifier() {
   if ! command -v terminal-notifier >/dev/null 2>&1; then
     echo "terminal-notifier nie jest zainstalowany. Zainstaluj: brew install terminal-notifier" >&2
     exit 1
+  fi
+}
+
+# --- wykrywanie toolchainu hosta (zamiast hardcodowanych /opt/homebrew/bin/*) ---
+
+detect_bin() {
+  local name="$1" found=""
+  if ! found="$(command -v "$name" 2>/dev/null)"; then
+    echo "Nie znaleziono \"$name\" w PATH — instalacja przerwana (fail-closed)." >&2
+    return 1
+  fi
+  printf '%s\n' "$found"
+}
+
+# Wartości wchodzą do sed z separatorem "|"; znak specjalny = twardy błąd
+# zamiast cicho uszkodzonego plista.
+assert_sed_safe() {
+  local name="$1" value="$2"
+  case "$value" in
+    *"|"* | *"&"* | *$'\n'* | *"@@"*)
+      echo "Wartość $name zawiera niedozwolony znak (| & @@ albo nową linię): $value" >&2
+      return 1
+      ;;
+  esac
+}
+
+prepend_service_path_dir() {
+  local dir="$1"
+  case ":$SERVICE_PATH:" in
+    *":$dir:"*) ;;
+    *) SERVICE_PATH="$dir:$SERVICE_PATH" ;;
+  esac
+}
+
+detect_toolchain() {
+  FACTORY_NPM_BIN="$(detect_bin npm)"
+  FACTORY_NODE_BIN="$(detect_bin node)"
+  # claude przez pełną ścieżkę (funkcja shellowa przechwytuje gołą komendę);
+  # najpierw standardowa lokalizacja instalatora, dopiero potem PATH.
+  if [[ -x "$HOME/.local/bin/claude" ]]; then
+    CLAUDE_BIN="$HOME/.local/bin/claude"
+  else
+    CLAUDE_BIN="$(detect_bin claude)"
+  fi
+  # PATH usług launchd (minimalny systemowy nie zawiera CLI agentów — BAR-92):
+  # katalogi per host wyprowadzone z $HOME + wykryte lokalizacje node/npm.
+  SERVICE_PATH="$HOME/.local/bin:$HOME/.kimi-code/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+  prepend_service_path_dir "$(dirname "$FACTORY_NODE_BIN")"
+  prepend_service_path_dir "$(dirname "$FACTORY_NPM_BIN")"
+
+  assert_sed_safe HOME "$HOME"
+  assert_sed_safe FACTORY_DIR "$FACTORY_DIR"
+  assert_sed_safe FACTORY_NPM_BIN "$FACTORY_NPM_BIN"
+  assert_sed_safe CLAUDE_BIN "$CLAUDE_BIN"
+  assert_sed_safe SERVICE_PATH "$SERVICE_PATH"
+}
+
+render_plist() {
+  local template="$1" target="$2"
+  if [[ ! -f "$template" ]]; then
+    echo "Brak szablonu $template." >&2
+    return 1
+  fi
+  sed \
+    -e "s|@@NPM_BIN@@|$FACTORY_NPM_BIN|g" \
+    -e "s|@@CLAUDE_BIN@@|$CLAUDE_BIN|g" \
+    -e "s|@@FACTORY_DIR@@|$FACTORY_DIR|g" \
+    -e "s|@@SERVICE_PATH@@|$SERVICE_PATH|g" \
+    -e "s|@@HOME@@|$HOME|g" \
+    "$template" > "$target"
+  if grep -q "@@" "$target"; then
+    echo "Po renderze $target zostały niepodstawione placeholdery:" >&2
+    grep -n "@@" "$target" >&2
+    return 1
+  fi
+  # plutil jest zawsze na macOS (tylko tam działa launchd); na CI Linux pomijamy lint.
+  if command -v plutil >/dev/null 2>&1; then
+    plutil -lint "$target" >/dev/null
   fi
 }
 
@@ -67,7 +168,7 @@ bootstrap_agent() {
 }
 
 find_blocking_runs() {
-  '/opt/homebrew/bin/node' -e '
+  "$FACTORY_NODE_BIN" -e '
 const fs=require("fs"), p=require("path"), root=p.join(process.argv[1],"runs");
 const ids=new Set(), imported=new Set();
 const dbFile=p.join(root,"lifecycle.db");
@@ -93,7 +194,7 @@ process.stdout.write([...ids].join(","));
 }
 
 find_suspended_runs() {
-  '/opt/homebrew/bin/node' -e '
+  "$FACTORY_NODE_BIN" -e '
 const fs=require("fs"), p=require("path"), root=p.join(process.argv[1],"runs");
 const ids=new Set(), imported=new Set();
 const dbFile=p.join(root,"lifecycle.db");
@@ -115,7 +216,19 @@ process.stdout.write([...ids].join(","));
 ' "$FACTORY_DIR"
 }
 
+# Podgląd plistów bez dotykania launchd/builda — np. weryfikacja nowego hosta.
+if [[ -n "$RENDER_ONLY_DIR" ]]; then
+  detect_toolchain
+  mkdir -p "$RENDER_ONLY_DIR"
+  render_plist "$SERVER_TEMPLATE" "$RENDER_ONLY_DIR/$SERVER_SERVICE.plist"
+  render_plist "$POLLER_TEMPLATE" "$RENDER_ONLY_DIR/$POLLER_SERVICE.plist"
+  echo "Wyrenderowano plisty do $RENDER_ONLY_DIR (npm: $FACTORY_NPM_BIN, node: $FACTORY_NODE_BIN, claude: $CLAUDE_BIN)."
+  exit 0
+fi
+
 preflight_terminal_notifier
+
+detect_toolchain
 
 mkdir -p "$HOME/.ai-factory/logs"
 mkdir -p "$AGENTS_DIR"
@@ -141,7 +254,7 @@ if [[ -n "$BLOCKING" ]]; then
 fi
 
 # Suspend na human gate jest trwały w Mastra + rejestrze. Można bezpiecznie
-# przełączyć runtime; po bootstrapie poller adoptuje run i zachowa bramkę.
+# przełączyć runtime; po bootstrapie poller zaadoptuje run i zachowa bramkę.
 SUSPENDED="$(find_suspended_runs)"
 if [[ -n "$SUSPENDED" ]]; then
   echo "Trwałe runy awaiting_decision: $SUSPENDED — przełączam runtime; poller zaadoptuje je po restarcie."
@@ -169,7 +282,7 @@ for artifact in index.mjs mastra.mjs tools.mjs studio/index.html; do
   fi
 done
 
-cp "$OPS_DIR/com.ai-factory.server.plist" "$SERVER_PLIST"
+render_plist "$SERVER_TEMPLATE" "$SERVER_PLIST"
 bootstrap_agent "$SERVER_SERVICE" "$SERVER_PLIST"
 echo "✓ $SERVER_SERVICE załadowany"
 
@@ -188,7 +301,7 @@ for attempt in {1..30}; do
   sleep 1
 done
 
-cp "$OPS_DIR/com.ai-factory.poller.plist" "$POLLER_PLIST"
+render_plist "$POLLER_TEMPLATE" "$POLLER_PLIST"
 bootstrap_agent "$POLLER_SERVICE" "$POLLER_PLIST"
 echo "✓ $POLLER_SERVICE załadowany"
 
