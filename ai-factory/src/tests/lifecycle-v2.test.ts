@@ -1628,6 +1628,41 @@ test("incydent BAR-177: /retry po komendzie anulowanej przed dispatchem tworzy N
   }
 });
 
+test("incydent BAR-180 g2: /replan anuluje joby starej generacji, NIE zjadając joba nowej", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "factory-replan-order-"));
+  const store = new LifecycleStore(join(dir, "registry.db"));
+  try {
+    const deps: PollerDependencies = {
+      store,
+      mastra: {
+        async cancelRun() {},
+      } as unknown as PollerDependencies["mastra"],
+      sources: new Map(),
+      notifier: async () => {},
+    };
+    let run = store.createRun("BAR-RO1", "harness", manifest);
+    applyDecision(deps, run.ticketId, reduceLifecycle(run, { type: "start" }));
+    store.markCommand("BAR-RO1:g1:job:plan:plan:a1", "dispatched", { externalId: "job-old" });
+    assert.equal(store.hasOutstandingJob("BAR-RO1"), true);
+
+    applyDecision(deps, run.ticketId, reduceLifecycle(store.getRun("BAR-RO1")!, {
+      type: "replan",
+      commentId: "c-replan",
+      reason: "nowa koncepcja",
+      nextAttempts: { plan: 2 },
+    }));
+    run = store.getRun("BAR-RO1")!;
+    assert.deepEqual([run.generation, run.stage, run.status], [2, "plan", "running"]);
+    // Stary job anulowany, nowy PRZEŻYŁ tę samą transakcję.
+    assert.equal(store.getCommand("BAR-RO1:g1:job:plan:plan:a1")?.lastError, "canceled-by-replan");
+    assert.equal(store.getCommand("BAR-RO1:g2:job:plan:plan:a2")?.state, "pending");
+    assert.equal(store.hasOutstandingJob("BAR-RO1"), true, "run nowej generacji nie może rodzić się jako zombie");
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("strażnik zombie: running bez joba w outboxie blokuje z JOB_MISSING", async () => {
   const root = await mkdtemp(join(tmpdir(), "factory-zombie-"));
   const previousRoot = process.env.FACTORY_ROOT;
