@@ -1,3 +1,5 @@
+# Opcjonalny kanał komentarzy postępu per projekt:
+# progress: off | milestones | verbose (domyślnie milestones).
 pilot-app:
   statuses: extended   # tablica Linear odzwierciedla fazy fabryki
   max_concurrent_tickets: 2   # BAR-122: równoległość ponad 2 rozjeżdżała maina (noc 2026-07-22)

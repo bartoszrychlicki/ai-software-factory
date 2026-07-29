@@ -1608,6 +1608,14 @@ test("incydent BAR-177: /retry po komendzie anulowanej przed dispatchem tworzy N
       type: "approve", commentId: "c-approve", nextAttempt: 1,
     }));
     assert.equal(store.hasOutstandingJob("BAR-RK1"), true);
+    assert.ok(
+      store.outstandingCommands(100).some((command) =>
+        command.kind === "linear-comment" &&
+        command.payload.progress === "milestones" &&
+        String(command.payload.body).includes("build startuje")
+      ),
+      "/approve musi atomowo enqueue'ować milestone startu builda"
+    );
     // ...ale sekundę później wejście się zmienia: blokada + cancel PRZED dispatchem
     // (zero prób w rejestrze → nextAttempt dalej zwróci 1).
     applyDecision(deps, run.ticketId, reduceLifecycle(store.getRun("BAR-RK1")!, {

@@ -85,6 +85,21 @@ Registry v1 jest tylko do odczytu. Import wymaga zatwierdzonego planu,
 jednoznacznego checkpointu lub jawnie wskazanego bieżącego PR-a oraz świeżego
 odczytu Lineara/GitHuba/repo przed apply.
 
+## Komentarze postępu
+
+Każde objęte mapą przejście lifecycle atomowo enqueue'uje komentarz w tym samym
+outboxie co pozostałe efekty. Klucz
+`<ticket>:g<generacja>:progress:<hash-przejścia>` oraz tag
+`[factory-outbox:<key>]` zapobiegają duplikatom po restarcie. Marker
+`[linear:<ticket>:v2]` wyklucza komentarz ze snapshotu autora i
+`effectiveInputHash`.
+
+Poziom projektu `progress: off | milestones | verbose` (domyślnie
+`milestones`, z obsługą `projects.local.yaml`) jest sprawdzany przy dispatchu.
+`milestones` raportuje 7 głównych przejść od `/approve` do startu smoke;
+`verbose` dodaje etapy deep-planu, retry/replan i degradacje. Bramki, blokady i
+komentarze finałowe są osobnym kanałem i nie zależą od tego ustawienia.
+
 ## Deep-plan v3 (projekty z `planPipeline: v3`)
 
 Cel: wyższa jakość planu przez synergiczną pracę równoległych agentów zamiast

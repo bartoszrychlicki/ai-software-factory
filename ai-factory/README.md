@@ -53,6 +53,12 @@ trzymaj w opcjonalnych, **gitignorowanych** plikach obok bazowych:
 - `routing.local.yaml` — nadpisania sekcji `defaults` i `projects.<projekt>`
   (inne sekcje najwyższego poziomu są błędem konfiguracji).
 
+Kanał krótkich komentarzy lifecycle ustawia się per projekt przez
+`progress: off | milestones | verbose` (także w `projects.local.yaml`).
+Domyślne `milestones` raportuje aprobatę, checkpoint, testy, draft PR, CI,
+werdykt review i merge; `verbose` dodaje research, krytykę, retry/replan oraz
+degradacje. `off` wyłącza tylko komentarze postępu — bramki i finały pozostają.
+
 Semantyka: **płytki merge per projekt/klucz, local wygrywa**. Klucz podany w
 `.local` zastępuje klucz bazowy w całości — także obiekty, więc np. lokalny
 `budget:` musi być kompletny (`maxUsd` **i** `maxMinutes`). Klucze niewymienione
@@ -119,6 +125,7 @@ Labele `plan:solo` / `plan:deep` wymuszają ścieżkę planowania w projektach v
 
 Komentarz autora przed buildem zmienia input hash i wymusza nowy plan. Podczas
 lub po buildzie zatrzymuje proces, zachowując branch i checkpoint.
+Komentarze postępu mają marker fabryki i nie wchodzą do tego input hash.
 
 ## Najważniejsze pliki
 
