@@ -69,11 +69,22 @@ export async function runPreflight(
   }
   if (!await dependency.mastraUp()) errors.push("Mastra /workflows jest niedostępna.");
 
-  const routes = await Promise.all([
+  const routePromises = [
     resolveRoute("plan", { project: projectKey }),
     resolveRoute("build", { project: projectKey }),
     resolveRoute("review", { project: projectKey }),
-  ]).catch((error) => {
+  ];
+  if (project.planPipeline === "v3") {
+    routePromises.push(
+      resolveRoute("triage", { project: projectKey }),
+      resolveRoute("research", { project: projectKey }, "recon"),
+      resolveRoute("research", { project: projectKey }, "solution-a"),
+      resolveRoute("research", { project: projectKey }, "solution-b"),
+      resolveRoute("synthesis", { project: projectKey }),
+      resolveRoute("critique", { project: projectKey })
+    );
+  }
+  const routes = await Promise.all(routePromises).catch((error) => {
     errors.push(`Routing: ${error instanceof Error ? error.message : error}`);
     return [];
   });

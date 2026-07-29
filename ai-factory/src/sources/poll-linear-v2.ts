@@ -21,7 +21,7 @@ import { hostname } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { buildCommentContextSnapshot } from "./comment-context";
-import { parseCommand } from "./commands";
+import { parseCommand, parseScorePayload } from "./commands";
 import { LinearSource } from "./linear";
 import {
   isWorkflowRunMissing,
@@ -31,6 +31,10 @@ import {
 } from "./mastra-client";
 import {
   LifecycleStore,
+  RESEARCH_ROLES,
+  researchAttemptStage,
+  runStageOf,
+  type AttemptStage,
   type LifecycleCommand,
   type LifecycleRun,
 } from "../pipeline/lifecycle-store";
@@ -38,7 +42,9 @@ import {
   reduceLifecycle,
   type CoordinatorDecision,
   type CoordinatorEvent,
+  type NextAttempts,
 } from "../pipeline/coordinator";
+import { appendExperimentRow, buildExperimentSummary } from "../metrics/experiments";
 import {
   factoryJobOutputSchema,
   JOB_BUDGET_MINUTES,
@@ -144,7 +150,25 @@ export function applyDecision(
   });
   emitTransitionNotification(deps, current, updated, decision.transition.reason);
   recordBreakerOutcome(current, updated);
+  recordExperimentOutcome(deps, current, updated);
   return updated;
+}
+
+/**
+ * Wiersz eksperymentu przy ukończeniu ticketu (fire-and-forget) — porównanie
+ * kosztów/jakości wariantów procesu (solo vs deep) i konfiguracji modeli.
+ */
+function recordExperimentOutcome(
+  deps: PollerDependencies,
+  before: LifecycleRun,
+  after: LifecycleRun
+): void {
+  if (before.status === "done" || after.status !== "done" || after.errorCode === "CANCELED") return;
+  try {
+    void appendExperimentRow(buildExperimentSummary(deps.store, after)).catch(() => {});
+  } catch (error) {
+    console.error("Wiersz eksperymentu nie zapisany:", error instanceof Error ? error.message : error);
+  }
 }
 
 /** Decyzje człowieka nie nabijają serii breakera — tylko realne porażki fabryki. */
@@ -193,7 +217,10 @@ function emitTransitionNotification(
   } else if (after.stage === "approval" && after.status === "waiting_human") {
     title = `⏳ ${after.ticketId}: plan do akceptacji`;
     message = "Zatwierdź `/approve` albo odrzuć `/reject <powód>`.";
-  } else if (after.stage === "plan" && after.status === "waiting_human") {
+  } else if (
+    (after.stage === "plan" || after.stage === "triage" || after.stage === "synthesis") &&
+    after.status === "waiting_human"
+  ) {
     title = `❓ ${after.ticketId}: pytania planera`;
     message = `Runda ${after.clarifyRound}/2 — odpowiedz \`/answer <treść>\`.`;
   } else if (after.stage === "merge" && after.status === "waiting_human" && before.stage !== "merge") {
@@ -237,6 +264,7 @@ function runError(snapshot: MastraRunSnapshot): string {
 
 function failedJobOutput(command: LifecycleCommand, report: string): FactoryJobOutput {
   const kind = String(command.payload.kind) as FactoryJobOutput["kind"];
+  const researchRole = command.payload.researchRole;
   return {
     kind,
     outcome: "failed",
@@ -250,7 +278,26 @@ function failedJobOutput(command: LifecycleCommand, report: string): FactoryJobO
     changedFiles: [],
     scopeWarnings: [],
     reviewVerdict: kind === "review" ? "unavailable" : undefined,
+    critiqueVerdict: kind === "critique" ? "unavailable" : undefined,
+    // Echo roli — koordynator musi wiedzieć, KTÓRY job researchu padł.
+    researchRole: kind === "research" && typeof researchRole === "string"
+      ? researchRole as FactoryJobOutput["researchRole"]
+      : undefined,
   };
+}
+
+/** Kolejne numery prób per stage — reducer nie może ich liczyć sam (czysty). */
+function followUpAttempts(store: LifecycleStore, ticketId: string): NextAttempts {
+  const stages: AttemptStage[] = [
+    "plan",
+    "build",
+    "review",
+    "triage",
+    "synthesis",
+    "critique",
+    ...RESEARCH_ROLES.map((role) => researchAttemptStage(role)),
+  ];
+  return Object.fromEntries(stages.map((stage) => [stage, store.nextAttempt(ticketId, stage)]));
 }
 
 /**
@@ -264,14 +311,22 @@ function jobInputData(
   command: LifecycleCommand,
   run: LifecycleRun
 ): Record<string, unknown> {
-  if (command.payload.kind !== "review") return command.payload;
   // Format podpisu: "ai-factory · <harness> · <model> · <profil>"; harness może
   // nieść wersję CLI ("codex@0.44") — do wykluczenia liczy się sama nazwa.
-  const signature = deps.store.latestAttempt(run.ticketId, "build")?.signature;
-  const buildHarness = signature?.split(" · ")[1]?.split("@")[0]?.trim();
-  return buildHarness && buildHarness !== "unavailable"
-    ? { ...command.payload, buildHarness }
-    : command.payload;
+  const harnessOf = (stage: AttemptStage): string | undefined => {
+    const signature = deps.store.latestAttempt(run.ticketId, stage)?.signature;
+    const harness = signature?.split(" · ")[1]?.split("@")[0]?.trim();
+    return harness && harness !== "unavailable" ? harness : undefined;
+  };
+  if (command.payload.kind === "review") {
+    const buildHarness = harnessOf("build");
+    return buildHarness ? { ...command.payload, buildHarness } : command.payload;
+  }
+  if (command.payload.kind === "critique") {
+    const synthesisHarness = harnessOf("synthesis");
+    return synthesisHarness ? { ...command.payload, synthesisHarness } : command.payload;
+  }
+  return command.payload;
 }
 
 /**
@@ -311,7 +366,13 @@ async function handleStalledJob(
   applyDecision(
     deps,
     run.ticketId,
-    reduceLifecycle(run, { type: "job-finished", attempt, output }),
+    reduceLifecycle(run, {
+      type: "job-finished",
+      attempt,
+      output,
+      nextAttempts: followUpAttempts(deps.store, run.ticketId),
+      usage: deps.store.totalUsage(run.ticketId),
+    }),
     command.key
   );
   return true;
@@ -361,7 +422,13 @@ async function dispatchJob(
     applyDecision(
       deps,
       run.ticketId,
-      reduceLifecycle(run, { type: "job-finished", attempt, output }),
+      reduceLifecycle(run, {
+        type: "job-finished",
+        attempt,
+        output,
+        nextAttempts: followUpAttempts(deps.store, run.ticketId),
+        usage: deps.store.totalUsage(run.ticketId),
+      }),
       command.key
     );
     return;
@@ -409,6 +476,8 @@ async function dispatchJob(
       type: "job-finished",
       attempt,
       output: fallback,
+      nextAttempts: followUpAttempts(deps.store, run.ticketId),
+      usage: deps.store.totalUsage(run.ticketId),
     }), command.key);
     return;
   }
@@ -429,6 +498,8 @@ async function dispatchJob(
     type: "job-finished",
     attempt,
     output,
+    nextAttempts: followUpAttempts(deps.store, run.ticketId),
+    usage: deps.store.totalUsage(run.ticketId),
   }), command.key);
 }
 
@@ -634,14 +705,15 @@ export async function dispatchOutbox(deps: PollerDependencies): Promise<void> {
       }
       const lifecycleCritical = ["run-job", "publish-pr", "mark-pr-ready"].includes(command.kind);
       if (deadLettered && lifecycleCritical) {
+        const stage = runStageOf(command.stage);
         applyDecision(deps, run.ticketId, {
           transition: {
-            stage: command.stage,
+            stage,
             status: "blocked",
             actor: "outbox",
             reason: "side-effect-failed",
             patch: {
-              blockedStage: command.stage,
+              blockedStage: stage,
               errorCode: "OUTBOX_FAILED",
               errorMessage: message,
             },
@@ -919,6 +991,32 @@ async function runSmoke(deps: PollerDependencies, run: LifecycleRun): Promise<vo
   }));
 }
 
+/** Zapis oceny /score (aktywny albo ukończony run) + wiersz eksperymentu + potwierdzenie. */
+async function recordScore(
+  deps: PollerDependencies,
+  run: LifecycleRun,
+  source: LinearSource,
+  commentId: string,
+  payload: string | undefined
+): Promise<void> {
+  const parsed = parseScorePayload(payload);
+  if (!parsed) return;
+  deps.store.setScore(run.ticketId, parsed.value, parsed.comment);
+  deps.store.markCommentProcessed(run.ticketId, commentId, "score");
+  void appendExperimentRow({
+    kind: "score",
+    ticket: run.ticketId,
+    generation: run.generation,
+    project: run.project,
+    score: parsed.value,
+    comment: parsed.comment,
+  }).catch(() => {});
+  await source.comment(
+    run.ticketId,
+    `✅ Zapisano ocenę **${parsed.value}/5**${parsed.comment ? ` („${parsed.comment}")` : ""} do danych eksperymentu.\n\n${marker(run.ticketId)}`
+  ).catch(() => {});
+}
+
 async function processCommands(deps: PollerDependencies, run: LifecycleRun): Promise<void> {
   const source = sourceFor(deps, run);
   const comments = await source.listComments(run.ticketId);
@@ -926,6 +1024,10 @@ async function processCommands(deps: PollerDependencies, run: LifecycleRun): Pro
     if (deps.store.isCommentProcessed(comment.id) || comment.body.includes(marker(run.ticketId))) continue;
     const parsed = parseCommand(comment.body);
     if (!parsed) continue;
+    if (parsed.kind === "score") {
+      await recordScore(deps, run, source, comment.id, parsed.payload);
+      continue;
+    }
     let event: CoordinatorEvent | undefined;
     if (parsed.kind === "approve") event = {
       type: "approve",
@@ -944,9 +1046,10 @@ async function processCommands(deps: PollerDependencies, run: LifecycleRun): Pro
       event = {
         type: "retry",
         commentId: comment.id,
-        nextAttempt: attemptStage
+        nextAttempt: attemptStage && attemptStage !== "research"
           ? deps.store.nextAttempt(run.ticketId, attemptStage)
           : undefined,
+        nextAttempts: followUpAttempts(deps.store, run.ticketId),
       };
     }
     else if (parsed.kind === "replan" || parsed.kind === "restart") event = {
@@ -965,10 +1068,12 @@ async function processCommands(deps: PollerDependencies, run: LifecycleRun): Pro
         );
         event.inputHash = snapshot.effectiveInputHash;
         event.commentContext = snapshot.context || undefined;
-        event.nextAttempt = deps.store.nextAttempt(run.ticketId, "plan");
+        // Pytania zadaje etap, na którym run czeka (plan | triage | synthesis).
+        const clarifyStage = run.stage === "triage" || run.stage === "synthesis" ? run.stage : "plan";
+        event.nextAttempt = deps.store.nextAttempt(run.ticketId, clarifyStage);
       }
       if (event.type === "replan") {
-        event.nextAttempt = deps.store.nextAttempt(run.ticketId, "plan");
+        event.nextAttempts = followUpAttempts(deps.store, run.ticketId);
         await cancelActiveJobs(deps, run.ticketId);
       }
       applyDecision(deps, run.ticketId, reduceLifecycle(run, event));
@@ -1016,7 +1121,7 @@ async function detectInputChange(
     title: ticket.title,
     description: ticket.description,
     labels: ticket.labels,
-    nextAttempt: deps.store.nextAttempt(run.ticketId, "plan"),
+    nextAttempts: followUpAttempts(deps.store, run.ticketId),
   }));
 }
 
@@ -1080,7 +1185,7 @@ export async function reconcileRun(deps: PollerDependencies, run: LifecycleRun):
   // anulowaną przed dispatchem i INSERT OR IGNORE zjadł joba po cichu).
   if (
     current.status === "running" &&
-    ["plan", "build", "review"].includes(current.stage) &&
+    ["plan", "triage", "research", "synthesis", "critique", "build", "review"].includes(current.stage) &&
     !deps.store.hasOutstandingJob(current.ticketId)
   ) {
     applyDecision(deps, current.ticketId, {
@@ -1168,10 +1273,36 @@ async function claimReady(deps: PollerDependencies): Promise<void> {
         commentContext: snapshot.context || undefined,
       });
       await source.claim(ticket.id);
+      // v3 deep-plan: wejściem jest triage, chyba że label plan:solo wymusza
+      // klasyczną ścieżkę. Projekty bez planPipeline zostają na v2.
+      const soloForced = ticket.labels.includes("plan:solo");
+      const entry = project.planPipeline === "v3" && !soloForced ? "triage" : "plan";
       applyDecision(deps, ticket.id, reduceLifecycle(run, {
         type: "start",
-        nextAttempt: deps.store.nextAttempt(ticket.id, "plan"),
+        entry,
+        forcedVariant: project.planPipeline === "v3" && soloForced ? "solo" : undefined,
+        nextAttempt: deps.store.nextAttempt(ticket.id, entry),
       }));
+    }
+  }
+}
+
+/**
+ * Sweep ocen: ukończone tickety nie przechodzą przez reconcileRun, więc /score
+ * po Done czytamy osobno (okno 14 dni; po zapisaniu oceny run znika z listy).
+ */
+export async function sweepScores(deps: PollerDependencies): Promise<void> {
+  const since = new Date(Date.now() - 14 * 24 * 60 * 60_000).toISOString();
+  for (const run of deps.store.listScoreCandidates(since)) {
+    const source = deps.sources.get(run.project);
+    if (!source) continue;
+    const comments = await source.listComments(run.ticketId).catch(() => []);
+    for (const comment of comments) {
+      if (deps.store.isCommentProcessed(comment.id) || comment.body.includes(marker(run.ticketId))) continue;
+      const parsed = parseCommand(comment.body);
+      if (parsed?.kind !== "score") continue;
+      await recordScore(deps, run, source, comment.id, parsed.payload);
+      break;
     }
   }
 }
@@ -1183,6 +1314,9 @@ export async function pollOnce(deps: PollerDependencies): Promise<void> {
       console.error(`[${run.ticketId}] reconcile:`, error instanceof Error ? error.message : error)
     );
   }
+  await sweepScores(deps).catch((error) =>
+    console.error("Sweep ocen nieudany:", error instanceof Error ? error.message : error)
+  );
   await claimReady(deps);
   await dispatchOutbox(deps);
 }

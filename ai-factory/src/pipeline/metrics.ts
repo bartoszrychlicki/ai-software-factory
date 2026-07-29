@@ -11,7 +11,12 @@ export interface MetricRow {
   ts: string;
   ticket: string;
   runId: string;
-  stage: "plan" | "build" | "verify" | "verify-checks" | "verify-e2e" | "merge-queue" | "github-ci" | "review" | "fix";
+  stage:
+    | "plan" | "build" | "verify" | "verify-checks" | "verify-e2e"
+    | "merge-queue" | "github-ci" | "review" | "fix"
+    // v3 deep-plan:
+    | "triage" | "research-recon" | "research-solution-a" | "research-solution-b"
+    | "synthesis" | "critique";
   engine?: string; // spec z routingu, np. codex albo claude-code/sonnet
   attempt?: number; // próba build→verify
   round?: number; // runda review→fix

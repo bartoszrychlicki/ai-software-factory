@@ -1,8 +1,12 @@
-import type {
-  LifecycleCommand,
-  LifecycleRun,
-  LifecycleStage,
-  TransitionInput,
+import {
+  RESEARCH_ROLES,
+  researchAttemptStage,
+  type AttemptStage,
+  type LifecycleCommand,
+  type LifecycleRun,
+  type LifecycleStage,
+  type ResearchRole,
+  type TransitionInput,
 } from "./lifecycle-store";
 import type { FactoryJobOutput } from "./factory-job";
 
@@ -11,16 +15,23 @@ type NewCommand = Omit<
   "state" | "attempts" | "createdAt" | "updatedAt" | "availableAt"
 > & { availableAt?: string };
 
+/**
+ * Numery kolejnych prób per stage (liczone przez poller z rejestru) — reducer
+ * jest czysty i nie może ich sam odczytać, a reużycie numeru z INSERT OR
+ * IGNORE po cichu zjada joba (incydent BAR-177).
+ */
+export type NextAttempts = Partial<Record<AttemptStage, number>>;
+
 export type CoordinatorEvent =
-  | { type: "start"; nextAttempt?: number }
-  | { type: "job-finished"; attempt: number; output: FactoryJobOutput }
+  | { type: "start"; entry?: "plan" | "triage"; forcedVariant?: "solo" | "deep"; nextAttempt?: number }
+  | { type: "job-finished"; attempt: number; output: FactoryJobOutput; nextAttempts?: NextAttempts; usage?: { usd: number; minutes: number } }
   | { type: "approve"; commentId: string; nextAttempt?: number }
   | { type: "answer"; commentId: string; answer: string; inputHash?: string; commentContext?: string; nextAttempt?: number }
   | { type: "ops-done"; commentId: string }
   | { type: "reject"; commentId: string; reason: string }
-  | { type: "retry"; commentId: string; nextAttempt?: number }
-  | { type: "replan"; commentId: string; reason: string; nextAttempt?: number }
-  | { type: "input-changed"; inputHash: string; commentContext?: string; title?: string; description?: string; labels?: string[]; nextAttempt?: number }
+  | { type: "retry"; commentId: string; nextAttempt?: number; nextAttempts?: NextAttempts }
+  | { type: "replan"; commentId: string; reason: string; nextAttempt?: number; nextAttempts?: NextAttempts }
+  | { type: "input-changed"; inputHash: string; commentContext?: string; title?: string; description?: string; labels?: string[]; nextAttempt?: number; nextAttempts?: NextAttempts }
   | { type: "test-result"; ok: boolean; sha: string; report: string }
   | { type: "branch-synchronized"; previousSha: string; sha: string }
   | { type: "published"; prUrl: string; branch: string; sha: string }
@@ -50,8 +61,8 @@ function plannedBranch(run: LifecycleRun): string {
 
 function jobCommand(
   run: LifecycleRun,
-  kind: "plan" | "build" | "review",
-  stage: LifecycleStage,
+  kind: "plan" | "build" | "review" | "triage" | "research" | "synthesis" | "critique",
+  stage: AttemptStage,
   attempt: number,
   extra: Record<string, unknown> = {},
   /**
@@ -85,10 +96,48 @@ function jobCommand(
       planDomain: run.planDomain,
       headSha: run.headSha,
       feedback: run.feedback,
+      briefs: run.briefs,
+      triageSummary: run.triageSummary,
+      critique: run.critiqueReport,
       ...extra,
     },
   };
 }
+
+/** Komenda joba research dla konkretnej roli (osobny stage prób per rola). */
+function researchCommand(
+  run: LifecycleRun,
+  role: ResearchRole,
+  attempt: number,
+  keySuffix = ""
+): NewCommand {
+  return jobCommand(run, "research", researchAttemptStage(role), attempt, { researchRole: role }, keySuffix);
+}
+
+/** Wejście pipeline'u planowania po replan/edycji: triage, chyba że label wymusza solo. */
+function planEntryOf(run: LifecycleRun, labels?: string[]): "plan" | "triage" {
+  const effective = labels ?? run.manifest.labels;
+  if (effective.includes("plan:solo")) return "plan";
+  return run.planEntry ?? "plan";
+}
+
+/** Reset pól planowania v3 przy nowej generacji (replan / zmiana inputu). */
+const PLAN_RESET_PATCH = {
+  plan: undefined,
+  planFiles: [] as string[],
+  planDomain: undefined,
+  approvedAt: undefined,
+  clarifyRound: 0,
+  feedback: undefined,
+  planVariant: undefined,
+  triageSummary: undefined,
+  briefs: undefined,
+  researchFailures: undefined,
+  critiqueRound: 0,
+  critiqueVerdict: undefined,
+  critiqueReport: undefined,
+  degradations: undefined,
+};
 
 function linearComment(
   run: LifecycleRun,
@@ -107,6 +156,47 @@ function linearComment(
       ...(signature ? { signature } : {}),
     },
   };
+}
+
+const clipText = (text: string, max: number): string =>
+  text.length <= max ? text : `${text.slice(0, max)}\n\n[…] (obcięte do ${max} znaków)`;
+
+/**
+ * Komentarz bramki aprobat: plan + werdykt krytyki + jawne degradacje + koszt.
+ * Człowiek decyduje z pełnym obrazem; mechanika /approve i /reject bez zmian.
+ */
+function approvalGateComment(
+  run: LifecycleRun,
+  suffix: string,
+  opts: { signature?: string; usage?: { usd: number; minutes: number } } = {}
+): NewCommand {
+  const header = run.planVariant === "deep"
+    ? "🧠 **Plan gotowy (deep: research ×3 → synteza → krytyka)**"
+    : "🧠 **Plan gotowy**";
+  const critiqueSection = run.critiqueVerdict === "ok"
+    ? "✅ **Krytyka planu** (niezależny silnik): bez zastrzeżeń."
+    : run.critiqueVerdict === "issues"
+      ? `⚠️ **Krytyka planu — uwagi (advisory, po ${run.critiqueRound ? "1 rewizji" : "0 rewizjach"}):**\n\n${run.critiqueReport ?? ""}`
+      : run.critiqueVerdict === "unavailable"
+        ? "⚠️ **Krytyka planu niedostępna** — plan idzie na bramkę bez adwersaryjnego sprawdzenia."
+        : "";
+  const degradations = run.degradations?.length
+    ? `⚠️ **Degradacje:**\n${run.degradations.map((note) => `- ${note}`).join("\n")}`
+    : "";
+  const cost = opts.usage
+    ? `Koszt planowania dotychczas: $${opts.usage.usd.toFixed(2)} (${opts.usage.minutes.toFixed(1)} min sumy jobów).`
+    : "";
+  const body = [
+    header,
+    run.triageSummary ? `> Triage: ${run.triageSummary}` : "",
+    run.plan ?? "",
+    "---",
+    critiqueSection,
+    degradations,
+    cost,
+    "Zatwierdź wyłącznie komendą `/approve` albo odrzuć: `/reject <powód>`.",
+  ].filter(Boolean).join("\n\n");
+  return linearComment(run, suffix, body, "approval", opts.signature);
 }
 
 function blocked(
@@ -158,12 +248,26 @@ export function reduceLifecycle(run: LifecycleRun, event: CoordinatorEvent): Coo
 
   if (event.type === "start") {
     assertStage(run, "plan", event.type);
+    const entry = event.entry ?? "plan";
+    if (entry === "triage") {
+      return {
+        transition: {
+          stage: "triage",
+          status: "running",
+          actor: "coordinator",
+          reason: "triage-dispatched",
+          patch: { planEntry: "triage", planVariant: event.forcedVariant },
+        },
+        commands: [jobCommand(run, "triage", "triage", event.nextAttempt ?? 1)],
+      };
+    }
     return {
       transition: {
         stage: "plan",
         status: "running",
         actor: "coordinator",
         reason: "plan-dispatched",
+        patch: { planEntry: "plan", planVariant: event.forcedVariant },
       },
       commands: [jobCommand(run, "plan", "plan", event.nextAttempt ?? 1)],
     };
@@ -173,47 +277,43 @@ export function reduceLifecycle(run: LifecycleRun, event: CoordinatorEvent): Coo
     if (event.inputHash === run.manifest.inputHash) {
       throw new Error("input-changed bez zmiany input hash.");
     }
-    if (run.stage === "plan" || run.stage === "approval") {
+    const PRE_BUILD_STAGES: LifecycleStage[] = [
+      "plan", "triage", "research", "synthesis", "critique", "approval",
+    ];
+    if (PRE_BUILD_STAGES.includes(run.stage)) {
+      const manifest = {
+        ...run.manifest,
+        title: event.title ?? run.manifest.title,
+        description: event.description ?? run.manifest.description,
+        labels: event.labels ?? run.manifest.labels,
+        inputHash: event.inputHash,
+        commentContext: event.commentContext,
+      };
+      const entry = planEntryOf(run, manifest.labels);
+      const nextRun: LifecycleRun = {
+        ...run,
+        generation: run.generation + 1,
+        manifest,
+        ...PLAN_RESET_PATCH,
+        critiqueRound: 0,
+      };
       return {
         transition: {
-          stage: "plan",
+          stage: entry,
           status: "pending",
           actor: "linear",
           reason: "input-changed-before-build",
           incrementGeneration: true,
           cancelOutstandingRunJobs: true,
-          patch: {
-            manifest: {
-              ...run.manifest,
-              title: event.title ?? run.manifest.title,
-              description: event.description ?? run.manifest.description,
-              labels: event.labels ?? run.manifest.labels,
-              inputHash: event.inputHash,
-              commentContext: event.commentContext,
-            },
-            plan: undefined,
-            planFiles: [],
-            planDomain: undefined,
-            approvedAt: undefined,
-            clarifyRound: 0,
-            feedback: undefined,
-          },
+          patch: { manifest, ...PLAN_RESET_PATCH },
         },
-        commands: [jobCommand({
-          ...run,
-          generation: run.generation + 1,
-          manifest: {
-            ...run.manifest,
-            title: event.title ?? run.manifest.title,
-            description: event.description ?? run.manifest.description,
-            labels: event.labels ?? run.manifest.labels,
-            inputHash: event.inputHash,
-            commentContext: event.commentContext,
-          },
-          plan: undefined,
-          planFiles: [],
-          planDomain: undefined,
-        }, "plan", "plan", event.nextAttempt ?? 1)],
+        commands: [jobCommand(
+          nextRun,
+          entry,
+          entry,
+          (entry === "triage" ? event.nextAttempts?.triage : event.nextAttempts?.plan)
+            ?? event.nextAttempt ?? 1
+        )],
       };
     }
     const decision = blocked(
@@ -297,41 +397,41 @@ export function reduceLifecycle(run: LifecycleRun, event: CoordinatorEvent): Coo
   }
 
   if (event.type === "answer") {
-    assertStage(run, "plan", event.type);
+    // Pytania zadaje triage (runda 1), planner solo albo synteza (runda 2).
+    const CLARIFY_STAGES: LifecycleStage[] = ["plan", "triage", "synthesis"];
+    if (!CLARIFY_STAGES.includes(run.stage)) {
+      throw new Error(`answer jest niedozwolone w etapie ${run.stage}; oczekiwano plan/triage/synthesis.`);
+    }
     if (run.status !== "waiting_human" || run.clarifyRound < 1 || run.clarifyRound > 2) {
       throw new Error("/answer wymaga aktywnej rundy pytań planera.");
     }
+    const kind = run.stage as "plan" | "triage" | "synthesis";
+    const patchedRun: LifecycleRun = {
+      ...run,
+      feedback: event.answer,
+      manifest: event.inputHash
+        ? {
+          ...run.manifest,
+          inputHash: event.inputHash,
+          commentContext: event.commentContext,
+        }
+        : run.manifest,
+    };
     return {
       transition: {
-        stage: "plan",
+        stage: run.stage,
         status: "running",
         actor: "human",
         reason: `/answer ${event.commentId}`,
         patch: {
           feedback: event.answer,
-          manifest: event.inputHash
-            ? {
-              ...run.manifest,
-              inputHash: event.inputHash,
-              commentContext: event.commentContext,
-            }
-            : run.manifest,
+          manifest: patchedRun.manifest,
         },
       },
       commands: [jobCommand(
-        {
-          ...run,
-          feedback: event.answer,
-          manifest: event.inputHash
-            ? {
-              ...run.manifest,
-              inputHash: event.inputHash,
-              commentContext: event.commentContext,
-            }
-            : run.manifest,
-        },
-        "plan",
-        "plan",
+        patchedRun,
+        kind,
+        run.stage,
         event.nextAttempt ?? run.clarifyRound + 1,
         { feedback: event.answer }
       )],
@@ -344,20 +444,23 @@ export function reduceLifecycle(run: LifecycleRun, event: CoordinatorEvent): Coo
   }
 
   if (event.type === "replan") {
+    const entry = planEntryOf(run);
+    const nextRun: LifecycleRun = {
+      ...run,
+      generation: run.generation + 1,
+      ...PLAN_RESET_PATCH,
+      feedback: event.reason,
+    };
     return {
       transition: {
-        stage: "plan",
+        stage: entry,
         status: "running",
         actor: "human",
         reason: `/replan ${event.commentId}`,
         incrementGeneration: true,
         cancelOutstandingRunJobs: true,
         patch: {
-          plan: undefined,
-          planFiles: [],
-          planDomain: undefined,
-          approvedAt: undefined,
-          clarifyRound: 0,
+          ...PLAN_RESET_PATCH,
           feedback: event.reason,
           blockedStage: undefined,
           errorCode: undefined,
@@ -369,14 +472,14 @@ export function reduceLifecycle(run: LifecycleRun, event: CoordinatorEvent): Coo
           smokeStatus: undefined,
         },
       },
-      commands: [jobCommand({
-        ...run,
-        generation: run.generation + 1,
-        plan: undefined,
-        planFiles: [],
-        planDomain: undefined,
-        feedback: event.reason,
-      }, "plan", "plan", event.nextAttempt ?? 1, { feedback: event.reason })],
+      commands: [jobCommand(
+        nextRun,
+        entry,
+        entry,
+        (entry === "triage" ? event.nextAttempts?.triage : event.nextAttempts?.plan)
+          ?? event.nextAttempt ?? 1,
+        { feedback: event.reason }
+      )],
     };
   }
 
@@ -437,7 +540,13 @@ export function reduceLifecycle(run: LifecycleRun, event: CoordinatorEvent): Coo
         commands: [jobCommand(run, "review", "review", event.nextAttempt ?? 1, {}, `:retry:${event.commentId}`)],
       };
     }
-    if (run.blockedStage === "build" || run.blockedStage === "plan") {
+    if (
+      run.blockedStage === "build" ||
+      run.blockedStage === "plan" ||
+      run.blockedStage === "triage" ||
+      run.blockedStage === "synthesis" ||
+      run.blockedStage === "critique"
+    ) {
       const kind = run.blockedStage;
       return {
         transition: {
@@ -448,6 +557,32 @@ export function reduceLifecycle(run: LifecycleRun, event: CoordinatorEvent): Coo
           patch: { blockedStage: undefined, errorCode: undefined, errorMessage: undefined },
         },
         commands: [jobCommand(run, kind, run.blockedStage, event.nextAttempt ?? 2, {}, `:retry:${event.commentId}`)],
+      };
+    }
+    if (run.blockedStage === "research") {
+      // Ponawiamy wyłącznie role bez briefu; reset liczników porażek daje im
+      // ponownie jeden auto-retry. Human /retry jest świadomy.
+      const missing = RESEARCH_ROLES.filter((role) => !run.briefs?.[role]);
+      if (!missing.length) throw new Error("Research ma komplet briefów — nie ma czego ponawiać.");
+      return {
+        transition: {
+          stage: "research",
+          status: "running",
+          actor: "human",
+          reason: `/retry ${event.commentId}: research-roles`,
+          patch: {
+            blockedStage: undefined,
+            errorCode: undefined,
+            errorMessage: undefined,
+            researchFailures: undefined,
+          },
+        },
+        commands: missing.map((role) => researchCommand(
+          run,
+          role,
+          event.nextAttempts?.[researchAttemptStage(role)] ?? 2,
+          `:retry:${event.commentId}`
+        )),
       };
     }
     if (run.blockedStage === "approval") {
@@ -527,25 +662,292 @@ export function reduceLifecycle(run: LifecycleRun, event: CoordinatorEvent): Coo
           event.output.signature
         );
       }
+      const planPatch = {
+        plan: event.output.plan,
+        planFiles: event.output.files,
+        planDomain: event.output.domain,
+        feedback: undefined,
+      };
       return {
         transition: {
           stage: "approval",
           status: "waiting_human",
           actor: "planner",
           reason: "plan-ready",
-          patch: {
-            plan: event.output.plan,
-            planFiles: event.output.files,
-            planDomain: event.output.domain,
-            feedback: undefined,
-          },
+          patch: planPatch,
         },
-        commands: [linearComment(
-          run,
+        commands: [approvalGateComment(
+          { ...run, ...planPatch },
           `plan:${event.attempt}`,
-          `🧠 **Plan gotowy**\n\n${event.output.plan}\n\nZatwierdź wyłącznie komendą \`/approve\` albo odrzuć: \`/reject <powód>\`.`,
-          "approval",
+          { signature: event.output.signature, usage: event.usage }
+        )],
+      };
+    }
+
+    if (event.output.kind === "triage") {
+      assertStage(run, "triage", event.type);
+      const forcedDeep = run.manifest.labels.includes("plan:deep");
+      if (event.output.outcome === "questions" && run.clarifyRound === 0) {
+        return {
+          transition: {
+            stage: "triage",
+            status: "waiting_human",
+            actor: "planner",
+            reason: "triage-questions",
+            patch: { clarifyRound: 1 },
+          },
+          commands: [linearComment(
+            run,
+            "questions:1",
+            `❓ **Pytania do ticketu (triage) — runda 1/2**\n\n${event.output.questions}\n\nOdpowiedz: \`/answer <odpowiedź>\`.`,
+            "triage",
+            event.output.signature
+          )],
+        };
+      }
+      // Budżet to jedyna twarda blokada triage — reszta degraduje do ścieżki solo.
+      if (event.output.errorCode === "BUDGET_EXHAUSTED") {
+        return blocked(run, "triage", "BUDGET_EXHAUSTED", event.output.report.slice(0, 6000), event.output.signature);
+      }
+      const degraded = event.output.outcome !== "success" || !event.output.triagePath;
+      const path: "solo" | "deep" = forcedDeep
+        ? "deep"
+        : degraded
+          ? "solo"
+          : event.output.triagePath!;
+      const degradations = degraded
+        ? [
+          ...(run.degradations ?? []),
+          event.output.outcome === "questions"
+            ? `triage nie rozstrzygnął po odpowiedzi autora — ścieżka ${path}`
+            : `triage niedostępny (${event.output.errorCode ?? "brak werdyktu"}) — ścieżka ${path}`,
+        ]
+        : run.degradations;
+      const triagePatch = {
+        planVariant: path,
+        triageSummary: event.output.triageSummary ?? run.triageSummary,
+        degradations,
+      };
+      const nextRun: LifecycleRun = { ...run, ...triagePatch };
+      if (path === "deep") {
+        return {
+          transition: {
+            stage: "research",
+            status: "running",
+            actor: "planner",
+            reason: degraded ? "triage-degraded-deep" : "triage-deep",
+            patch: triagePatch,
+          },
+          commands: RESEARCH_ROLES.map((role) => researchCommand(
+            nextRun,
+            role,
+            event.nextAttempts?.[researchAttemptStage(role)] ?? 1
+          )),
+        };
+      }
+      return {
+        transition: {
+          stage: "plan",
+          status: "running",
+          actor: "planner",
+          reason: degraded ? "triage-degraded-solo" : "triage-solo",
+          patch: triagePatch,
+        },
+        commands: [jobCommand(nextRun, "plan", "plan", event.nextAttempts?.plan ?? 1)],
+      };
+    }
+
+    if (event.output.kind === "research") {
+      assertStage(run, "research", event.type);
+      const role = event.output.researchRole;
+      if (!role) throw new Error("Wynik research bez researchRole.");
+      const briefs = { ...(run.briefs ?? {}) };
+      const failures = { ...(run.researchFailures ?? {}) };
+      let degradations = run.degradations ?? [];
+      const commands: NewCommand[] = [];
+      const briefText = (event.output.brief ?? event.output.report).trim();
+      if (event.output.outcome === "success" && briefText) {
+        briefs[role] = clipText(briefText, 24_000);
+      } else {
+        const attemptsSoFar = (failures[role] ?? 0) + 1;
+        const retryable = attemptsSoFar === 1 && event.output.errorCode !== "BUDGET_EXHAUSTED";
+        if (retryable) {
+          failures[role] = 1;
+          commands.push(researchCommand(
+            run,
+            role,
+            event.nextAttempts?.[researchAttemptStage(role)] ?? 2,
+            ":auto2"
+          ));
+        } else {
+          // Sentinel 2 = wyczerpane ponowienia; rola rozstrzygnięta jako porażka.
+          failures[role] = 2;
+          degradations = [
+            ...degradations,
+            `research ${role}: niedostępny (${event.output.errorCode ?? "porażka"}) — synteza bez tego briefu`,
+          ];
+        }
+      }
+      const researchPatch = {
+        briefs,
+        researchFailures: failures,
+        degradations: degradations.length ? degradations : undefined,
+      };
+      const resolved = RESEARCH_ROLES.every(
+        (candidate) => briefs[candidate] !== undefined || (failures[candidate] ?? 0) >= 2
+      );
+      if (!resolved) {
+        return {
+          transition: {
+            stage: "research",
+            status: "running",
+            actor: "researcher",
+            reason: `research-${role}-${event.output.outcome}`,
+            patch: researchPatch,
+          },
+          commands,
+        };
+      }
+      const briefCount = RESEARCH_ROLES.filter((candidate) => briefs[candidate]).length;
+      if (!briefCount) {
+        const decision = blocked(
+          run,
+          "research",
+          "RESEARCH_FAILED",
+          "Wszystkie joby researchu zakończyły się porażką (po jednym auto-retry na rolę).",
           event.output.signature
+        );
+        decision.transition.patch = { ...decision.transition.patch, ...researchPatch };
+        return decision;
+      }
+      const nextRun: LifecycleRun = { ...run, ...researchPatch };
+      return {
+        transition: {
+          stage: "synthesis",
+          status: "running",
+          actor: "researcher",
+          reason: `research-complete-${briefCount}/3`,
+          patch: researchPatch,
+        },
+        commands: [jobCommand(nextRun, "synthesis", "synthesis", event.nextAttempts?.synthesis ?? 1)],
+      };
+    }
+
+    if (event.output.kind === "synthesis") {
+      assertStage(run, "synthesis", event.type);
+      if (event.output.outcome === "questions") {
+        if (run.clarifyRound >= 2) {
+          return blocked(
+            run,
+            "synthesis",
+            "PLAN_MAX_QUESTIONS",
+            "Planner wyczerpał dwie rundy pytań.",
+            event.output.signature
+          );
+        }
+        return {
+          transition: {
+            stage: "synthesis",
+            status: "waiting_human",
+            actor: "planner",
+            reason: "questions",
+            patch: { clarifyRound: run.clarifyRound + 1 },
+          },
+          commands: [linearComment(
+            run,
+            `questions:${run.clarifyRound + 1}`,
+            `❓ **Pytania do planu (synteza) — runda ${run.clarifyRound + 1}/2**\n\n${event.output.questions}\n\nOdpowiedz: \`/answer <odpowiedź>\`.`,
+            "synthesis",
+            event.output.signature
+          )],
+        };
+      }
+      if (event.output.outcome === "failed" || !event.output.plan) {
+        return blocked(
+          run,
+          "synthesis",
+          event.output.errorCode ?? "SYNTHESIS_FAILED",
+          event.output.report.slice(0, 6000),
+          event.output.signature
+        );
+      }
+      const synthesisPatch = {
+        plan: event.output.plan,
+        planFiles: event.output.files,
+        planDomain: event.output.domain,
+        feedback: undefined,
+      };
+      const nextRun: LifecycleRun = { ...run, ...synthesisPatch };
+      return {
+        transition: {
+          stage: "critique",
+          status: "running",
+          actor: "planner",
+          reason: run.critiqueRound ? "synthesis-revised" : "synthesis-ready",
+          patch: synthesisPatch,
+        },
+        commands: [jobCommand(
+          nextRun,
+          "critique",
+          "critique",
+          event.nextAttempts?.critique ?? run.critiqueRound + 1,
+          {},
+          run.critiqueRound ? ":r2" : ""
+        )],
+      };
+    }
+
+    if (event.output.kind === "critique") {
+      assertStage(run, "critique", event.type);
+      const verdict = event.output.critiqueVerdict ?? "unavailable";
+      const issues = event.output.critiqueIssues
+        ?? (verdict === "issues" ? clipText(event.output.report, 6_000) : undefined);
+      if (verdict === "issues" && run.critiqueRound === 0) {
+        const revisionPatch = {
+          critiqueRound: 1,
+          critiqueVerdict: verdict,
+          critiqueReport: issues,
+          feedback: issues,
+        };
+        const nextRun: LifecycleRun = { ...run, ...revisionPatch };
+        return {
+          transition: {
+            stage: "synthesis",
+            status: "running",
+            actor: "critic",
+            reason: "critique-issues-revision",
+            patch: revisionPatch,
+          },
+          commands: [jobCommand(
+            nextRun,
+            "synthesis",
+            "synthesis",
+            event.nextAttempts?.synthesis ?? 2,
+            { feedback: issues },
+            ":rev1"
+          )],
+        };
+      }
+      const degradations = verdict === "unavailable"
+        ? [...(run.degradations ?? []), `krytyka planu niedostępna (${event.output.errorCode ?? "brak werdyktu"})`]
+        : run.degradations;
+      const gatePatch = {
+        critiqueVerdict: verdict,
+        critiqueReport: issues ?? run.critiqueReport,
+        degradations,
+      };
+      return {
+        transition: {
+          stage: "approval",
+          status: "waiting_human",
+          actor: verdict === "unavailable" ? "coordinator" : "critic",
+          reason: `critique-${verdict}`,
+          patch: gatePatch,
+        },
+        commands: [approvalGateComment(
+          { ...run, ...gatePatch },
+          `plan:critique:${event.attempt}`,
+          { signature: event.output.signature, usage: event.usage }
         )],
       };
     }

@@ -4,7 +4,17 @@ import { engines } from "../engines";
 import type { EngineAdapter } from "../engines/types";
 import { findUpFile } from "./projects";
 
-export type Stage = "plan" | "build" | "verify" | "review";
+export type Stage =
+  | "plan"
+  | "build"
+  | "verify"
+  | "review"
+  // v3 deep-plan; research rozstrzyga się per rola przez slot domeny:
+  // research.recon / research.solution-a / research.solution-b.
+  | "triage"
+  | "research"
+  | "synthesis"
+  | "critique";
 
 interface RoutingFile {
   defaults?: Record<string, string>;

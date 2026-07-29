@@ -5,6 +5,10 @@ import { findUpFile } from "./projects";
 
 export type LifecycleStage =
   | "plan"
+  | "triage"
+  | "research"
+  | "synthesis"
+  | "critique"
   | "approval"
   | "build"
   | "test"
@@ -14,6 +18,18 @@ export type LifecycleStage =
   | "merge"
   | "smoke";
 
+/**
+ * Klucz prób i komend. Research prowadzi trzy równoległe joby w jednym etapie
+ * runu ("research"), ale próby są śledzone per rola — PK (ticket, stage,
+ * attempt) wymusza osobne stage stringi, inaczej role nadpisywałyby sobie
+ * próby.
+ */
+export type AttemptStage =
+  | LifecycleStage
+  | "research-recon"
+  | "research-solution-a"
+  | "research-solution-b";
+
 export type LifecycleStatus =
   | "pending"
   | "running"
@@ -22,7 +38,27 @@ export type LifecycleStatus =
   | "blocked"
   | "done";
 
-export type JobKind = "plan" | "build" | "review";
+export type JobKind =
+  | "plan"
+  | "build"
+  | "review"
+  | "triage"
+  | "research"
+  | "synthesis"
+  | "critique";
+
+export type ResearchRole = "recon" | "solution-a" | "solution-b";
+
+export const RESEARCH_ROLES: ResearchRole[] = ["recon", "solution-a", "solution-b"];
+
+export function researchAttemptStage(role: ResearchRole): AttemptStage {
+  return `research-${role}` as AttemptStage;
+}
+
+/** Etap runu odpowiadający stage'owi próby/komendy (role researchu → "research"). */
+export function runStageOf(stage: AttemptStage): LifecycleStage {
+  return stage.startsWith("research-") ? "research" : (stage as LifecycleStage);
+}
 
 export interface TicketManifestV2 {
   title: string;
@@ -57,6 +93,27 @@ export interface LifecycleRun {
   errorCode?: string;
   errorMessage?: string;
   feedback?: string;
+  /** Wejście pipeline'u planowania: "triage" (v3 deep-plan) albo klasyczne "plan". */
+  planEntry?: "plan" | "triage";
+  /** Wariant procesu do eksperymentu kosztowego: solo (1 job planu) vs deep (research→synteza→krytyka). */
+  planVariant?: "solo" | "deep";
+  /** Krótka klasyfikacja triage (typ/rozmiar/ryzyko) — do komentarza bramki i eksperymentu. */
+  triageSummary?: string;
+  /** Briefy researchu (clipowane przy zapisie) — wejście syntezy, krytyki, buildera i reviewera. */
+  briefs?: Partial<Record<ResearchRole, string>>;
+  /** Liczba nieudanych prób per rola researchu (1 auto-retry, potem degradacja). */
+  researchFailures?: Partial<Record<ResearchRole, number>>;
+  /** Ile rewizji syntezy po krytyce już było (limit: 1). */
+  critiqueRound: number;
+  critiqueVerdict?: "ok" | "issues" | "unavailable";
+  /** Treść uwag krytyka (clipowana) — sekcja komentarza bramki i kontekst reviewera. */
+  critiqueReport?: string;
+  /** Jawne noty degradacji (⚠️) pokazywane człowiekowi na bramce aprobat. */
+  degradations?: string[];
+  /** Ocena jakości od człowieka (/score 1-5) — cel badawczy eksperymentu. */
+  score?: number;
+  scoreComment?: string;
+  scoredAt?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -75,7 +132,7 @@ export interface LifecycleCommand {
   key: string;
   ticketId: string;
   kind: CommandKind;
-  stage: LifecycleStage;
+  stage: AttemptStage;
   payload: Record<string, unknown>;
   state: "pending" | "dispatched" | "done" | "failed";
   attempts: number;
@@ -88,7 +145,7 @@ export interface LifecycleCommand {
 
 export interface StageAttempt {
   ticketId: string;
-  stage: LifecycleStage;
+  stage: AttemptStage;
   attempt: number;
   jobRunId?: string;
   inputHash?: string;
@@ -281,6 +338,29 @@ export class LifecycleStore {
         this.db.exec(`ALTER TABLE lifecycle_stage_attempts ADD COLUMN ${column} ${type}`);
       }
     }
+    // Deep-plan v3 + eksperyment kosztowy: kolumny addytywne na żywej bazie.
+    const runColumns = this.db.prepare("PRAGMA table_info(lifecycle_runs)").all() as {
+      name: string;
+    }[];
+    const runMigrations: Record<string, string> = {
+      plan_entry: "TEXT",
+      plan_variant: "TEXT",
+      triage_summary: "TEXT",
+      briefs_json: "TEXT",
+      research_failures_json: "TEXT",
+      critique_round: "INTEGER",
+      critique_verdict: "TEXT",
+      critique_report: "TEXT",
+      degradations_json: "TEXT",
+      score: "INTEGER",
+      score_comment: "TEXT",
+      scored_at: "TEXT",
+    };
+    for (const [column, type] of Object.entries(runMigrations)) {
+      if (!runColumns.some((existing) => existing.name === column)) {
+        this.db.exec(`ALTER TABLE lifecycle_runs ADD COLUMN ${column} ${type}`);
+      }
+    }
   }
 
   close(): void {
@@ -313,6 +393,7 @@ export class LifecycleStore {
         manifest,
         planFiles: [],
         clarifyRound: 0,
+        critiqueRound: 0,
         createdAt: timestamp,
         updatedAt: timestamp,
       };
@@ -344,6 +425,18 @@ export class LifecycleStore {
           error_code=NULL,
           error_message=NULL,
           feedback=NULL,
+          plan_entry=NULL,
+          plan_variant=NULL,
+          triage_summary=NULL,
+          briefs_json=NULL,
+          research_failures_json=NULL,
+          critique_round=0,
+          critique_verdict=NULL,
+          critique_report=NULL,
+          degradations_json=NULL,
+          score=NULL,
+          score_comment=NULL,
+          scored_at=NULL,
           created_at=excluded.created_at,
           updated_at=excluded.updated_at
       `).run(ticketId, project, generation, "plan", "pending", json(manifest), timestamp, timestamp);
@@ -516,7 +609,7 @@ export class LifecycleStore {
 
   startAttempt(
     ticketId: string,
-    stage: LifecycleStage,
+    stage: AttemptStage,
     attempt: number,
     jobRunId: string,
     details: Pick<
@@ -573,7 +666,7 @@ export class LifecycleStore {
 
   finishAttempt(
     ticketId: string,
-    stage: LifecycleStage,
+    stage: AttemptStage,
     attempt: number,
     result: Pick<
       StageAttempt,
@@ -612,7 +705,7 @@ export class LifecycleStore {
     );
   }
 
-  latestAttempt(ticketId: string, stage: LifecycleStage): StageAttempt | undefined {
+  latestAttempt(ticketId: string, stage: AttemptStage): StageAttempt | undefined {
     const row = this.db.prepare(`
       SELECT * FROM lifecycle_stage_attempts
       WHERE ticket_id=? AND stage=?
@@ -621,7 +714,7 @@ export class LifecycleStore {
     return row ? this.hydrateAttempt(row) : undefined;
   }
 
-  nextAttempt(ticketId: string, stage: LifecycleStage): number {
+  nextAttempt(ticketId: string, stage: AttemptStage): number {
     const row = this.db.prepare(`
       SELECT COALESCE(MAX(attempt), 0) AS value
       FROM lifecycle_stage_attempts WHERE ticket_id=? AND stage=?
@@ -682,6 +775,45 @@ export class LifecycleStore {
       FROM lifecycle_stage_attempts WHERE ticket_id=?
     `).get(ticketId) as { usd: number; duration_ms: number };
     return { usd: Number(row.usd), minutes: Number(row.duration_ms) / 60_000 };
+  }
+
+  /** Wszystkie próby ticketu (chronologicznie) — wejście wiersza eksperymentu. */
+  listAttempts(ticketId: string): StageAttempt[] {
+    return (this.db.prepare(`
+      SELECT * FROM lifecycle_stage_attempts
+      WHERE ticket_id=? ORDER BY started_at, stage, attempt
+    `).all(ticketId) as Record<string, unknown>[]).map((row) => this.hydrateAttempt(row));
+  }
+
+  /** Ocena jakości od człowieka (/score) — zapis przy runie, bez przejścia lifecycle. */
+  setScore(ticketId: string, score: number, comment?: string): void {
+    this.db.prepare(`
+      UPDATE lifecycle_runs SET score=?, score_comment=?, scored_at=?, updated_at=?
+      WHERE ticket_id=?
+    `).run(score, comment ?? null, now(), now(), ticketId);
+  }
+
+  /** Ukończone (nie Canceled) runy bez oceny — cel sweepa komendy /score. */
+  listScoreCandidates(sinceIso: string): LifecycleRun[] {
+    return (this.db.prepare(`
+      SELECT * FROM lifecycle_runs
+      WHERE status='done'
+        AND (error_code IS NULL OR error_code <> 'CANCELED')
+        AND scored_at IS NULL
+        AND updated_at >= ?
+      ORDER BY updated_at
+    `).all(sinceIso) as Record<string, unknown>[]).map((row) => this.hydrateRun(row));
+  }
+
+  /** Ile przetworzonych komend danego rodzaju ma ticket (np. retry/replan do eksperymentu). */
+  countProcessedCommands(ticketId: string, kinds: string[]): number {
+    if (!kinds.length) return 0;
+    const placeholders = kinds.map(() => "?").join(",");
+    const row = this.db.prepare(`
+      SELECT COUNT(*) AS value FROM lifecycle_processed_comments
+      WHERE ticket_id=? AND command IN (${placeholders})
+    `).get(ticketId, ...kinds) as { value: number };
+    return Number(row.value);
   }
 
   isCommentProcessed(commentId: string): boolean {
@@ -759,7 +891,11 @@ export class LifecycleStore {
         plan_files_json=?, plan_domain=?, clarify_round=?, approved_at=?,
         branch=?, workspace_dir=?, head_sha=?, tested_sha=?, pr_url=?,
         merged_sha=?, review_status=?, smoke_status=?, blocked_stage=?,
-        error_code=?, error_message=?, feedback=?, updated_at=?
+        error_code=?, error_message=?, feedback=?,
+        plan_entry=?, plan_variant=?, triage_summary=?, briefs_json=?,
+        research_failures_json=?, critique_round=?, critique_verdict=?,
+        critique_report=?, degradations_json=?, score=?, score_comment=?,
+        scored_at=?, updated_at=?
       WHERE ticket_id=?
     `).run(
       run.project,
@@ -784,6 +920,18 @@ export class LifecycleStore {
       run.errorCode ?? null,
       run.errorMessage ?? null,
       run.feedback ?? null,
+      run.planEntry ?? null,
+      run.planVariant ?? null,
+      run.triageSummary ?? null,
+      run.briefs ? json(run.briefs) : null,
+      run.researchFailures ? json(run.researchFailures) : null,
+      run.critiqueRound,
+      run.critiqueVerdict ?? null,
+      run.critiqueReport ?? null,
+      run.degradations?.length ? json(run.degradations) : null,
+      run.score ?? null,
+      run.scoreComment ?? null,
+      run.scoredAt ?? null,
       run.updatedAt,
       run.ticketId
     );
@@ -819,6 +967,26 @@ export class LifecycleStore {
       errorCode: row.error_code == null ? undefined : String(row.error_code),
       errorMessage: row.error_message == null ? undefined : String(row.error_message),
       feedback: row.feedback == null ? undefined : String(row.feedback),
+      planEntry: row.plan_entry == null ? undefined : String(row.plan_entry) as LifecycleRun["planEntry"],
+      planVariant: row.plan_variant == null ? undefined : String(row.plan_variant) as LifecycleRun["planVariant"],
+      triageSummary: row.triage_summary == null ? undefined : String(row.triage_summary),
+      briefs: row.briefs_json == null
+        ? undefined
+        : parseJson<Partial<Record<ResearchRole, string>>>(row.briefs_json, {}),
+      researchFailures: row.research_failures_json == null
+        ? undefined
+        : parseJson<Partial<Record<ResearchRole, number>>>(row.research_failures_json, {}),
+      critiqueRound: Number(row.critique_round ?? 0),
+      critiqueVerdict: row.critique_verdict == null
+        ? undefined
+        : String(row.critique_verdict) as LifecycleRun["critiqueVerdict"],
+      critiqueReport: row.critique_report == null ? undefined : String(row.critique_report),
+      degradations: row.degradations_json == null
+        ? undefined
+        : parseJson<string[]>(row.degradations_json, []),
+      score: row.score == null ? undefined : Number(row.score),
+      scoreComment: row.score_comment == null ? undefined : String(row.score_comment),
+      scoredAt: row.scored_at == null ? undefined : String(row.scored_at),
       createdAt: String(row.created_at),
       updatedAt: String(row.updated_at),
     };
@@ -829,7 +997,7 @@ export class LifecycleStore {
       key: String(row.idempotency_key),
       ticketId: String(row.ticket_id),
       kind: String(row.kind) as CommandKind,
-      stage: String(row.stage) as LifecycleStage,
+      stage: String(row.stage) as AttemptStage,
       payload: parseJson<Record<string, unknown>>(row.payload_json, {}),
       state: String(row.state) as LifecycleCommand["state"],
       attempts: Number(row.attempts),
@@ -844,7 +1012,7 @@ export class LifecycleStore {
   private hydrateAttempt(row: Record<string, unknown>): StageAttempt {
     return {
       ticketId: String(row.ticket_id),
-      stage: String(row.stage) as LifecycleStage,
+      stage: String(row.stage) as AttemptStage,
       attempt: Number(row.attempt),
       jobRunId: row.job_run_id == null ? undefined : String(row.job_run_id),
       inputHash: row.input_hash == null ? undefined : String(row.input_hash),

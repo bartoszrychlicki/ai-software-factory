@@ -34,9 +34,12 @@ br-budget:
     timeoutMinutes: 30
   # bez screenshot: next dev/start wymaga env i bazy — do włączenia świadomie później
   # premium modele (fable/opus/sol@xhigh): pełny cykl kosztuje ~$5-6 ekwiwalentu — default $3 ubił BAR-92 po zielonym buildzie
+  # deep-plan v3 (triage + research ×3 + synteza + krytyka): plan ~$4-7, cykl ~$8-11
+  # → budżet $12/90min zaakceptowany przez Bartosza 2026-07-29
+  planPipeline: v3
   budget:
-    maxUsd: 8
-    maxMinutes: 60
+    maxUsd: 12
+    maxMinutes: 90
   qa:
     # runda 1: pełna suita e2e na świeżym checkoutcie w verify (50 testów ~2 min, plikowa SQLite, zero sekretów)
     e2e: E2E_BROWSER_CHANNEL=bundled npm run e2e:local

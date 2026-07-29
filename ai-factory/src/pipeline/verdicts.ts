@@ -54,6 +54,34 @@ const planContractSchema = z.discriminatedUnion("verdict", [
 const verifyContractSchema = z.object({ verdict: z.enum(["pass", "fail"]) }).strict();
 const reviewContractSchema = z.object({ verdict: z.enum(["lgtm", "fix"]) }).strict();
 
+/**
+ * Triage (v3 deep-plan): tani klasyfikator przed drogim researchem.
+ * `solo`/`deep` = rekomendowana ścieżka planowania; `questions` = braki w
+ * tickecie (w tym podejrzenie duplikatu / "już zaimplementowane" — z dowodem).
+ */
+const triageContractSchema = z.discriminatedUnion("verdict", [
+  z.object({
+    verdict: z.enum(["solo", "deep"]),
+    type: z.enum(["feature", "bug", "refactor", "analytical", "ops"]).optional(),
+    size: z.enum(["S", "M", "L"]).optional(),
+    risk: z.array(z.string().trim().min(1)).max(10).default([]),
+    domain: domainSchema.optional(),
+  }).strict(),
+  z.object({
+    verdict: z.literal("questions"),
+    questions: z.string().trim().min(1),
+  }).strict(),
+]);
+
+/** Krytyka planu: advisory, fail-open do ⚠️ na bramce (nigdy nie blokuje). */
+const critiqueContractSchema = z.discriminatedUnion("verdict", [
+  z.object({ verdict: z.literal("ok") }).strict(),
+  z.object({
+    verdict: z.literal("issues"),
+    issues: z.string().trim().min(1),
+  }).strict(),
+]);
+
 export interface PlanVerdict {
   kind: "plan";
   ok: boolean;
@@ -95,6 +123,25 @@ export interface ReviewVerdict {
   kind: "review";
   /** true = są uwagi do poprawy. FAIL-CLOSED: brak werdyktu ⇒ true. */
   needsFix: boolean;
+  source: VerdictSource;
+}
+
+export interface TriageVerdict {
+  kind: "triage";
+  /** Rekomendowana ścieżka planowania (brak przy questions/missing). */
+  path?: "solo" | "deep";
+  questions?: string;
+  /** Krótka klasyfikacja do komentarza bramki i wiersza eksperymentu. */
+  summary?: string;
+  domain?: string;
+  source: VerdictSource;
+}
+
+export interface CritiqueVerdict {
+  kind: "critique";
+  /** unavailable = brak kontraktu; advisory — bramka dostaje ⚠️, nie blokadę. */
+  verdict: "ok" | "issues" | "unavailable";
+  issues?: string;
   source: VerdictSource;
 }
 
@@ -186,7 +233,7 @@ export const MISSING_VERDICT =
   "Traktuję to fail-closed jako wynik negatywny — sprawdź pełny raport w artefaktach runu.";
 
 /** Instrukcja doklejana do promptu roli — kontrakt wyjścia agenta. */
-export function verdictInstruction(kind: "plan" | "verify" | "review"): string {
+export function verdictInstruction(kind: "plan" | "verify" | "review" | "triage" | "critique"): string {
   const shapes =
     kind === "plan"
       ? [
@@ -194,7 +241,17 @@ export function verdictInstruction(kind: "plan" | "verify" | "review"): string {
           `Gdy potrzebujesz odpowiedzi człowieka: {"verdict":"blocked","questions":"<pytania A/B/C>","screenshots":[],"files":[],"domain":"frontend|backend|fullstack|ops"}`,
           "Przy verdict=ok pomiń pole questions.",
         ]
-      : [kind === "verify" ? `{"verdict":"pass"|"fail"}` : `{"verdict":"lgtm"|"fix"}`];
+      : kind === "triage"
+        ? [
+            `Rekomendacja ścieżki planowania: {"verdict":"solo"|"deep","type":"feature|bug|refactor|analytical|ops","size":"S|M|L","risk":["<flagi ryzyka>"],"domain":"frontend|backend|fullstack|ops"}`,
+            `Braki w tickecie / podejrzenie duplikatu lub "już zaimplementowane" (z dowodem): {"verdict":"questions","questions":"<ponumerowane pytania A/B/C z rekomendacją>"}`,
+          ]
+        : kind === "critique"
+          ? [
+              `Plan bez zastrzeżeń: {"verdict":"ok"}`,
+              `Plan wymaga poprawy: {"verdict":"issues","issues":"<konkretne, ponumerowane uwagi z priorytetem>"}`,
+            ]
+          : [kind === "verify" ? `{"verdict":"pass"|"fail"}` : `{"verdict":"lgtm"|"fix"}`];
   return [
     "ZAKOŃCZ odpowiedź blokiem kodu (dokładnie taki nagłówek) z werdyktem maszynowym:",
     "```factory",
@@ -235,4 +292,39 @@ export function parseReviewVerdict(report: string): ReviewVerdict {
   const parsed = reviewContractSchema.safeParse(b);
   if (!parsed.success) return { kind: "review", needsFix: true, source: "missing" };
   return { kind: "review", needsFix: parsed.data.verdict === "fix", source: "structured" };
+}
+
+export function parseTriageVerdict(report: string): TriageVerdict {
+  const b = structuredBlock(report);
+  const parsed = triageContractSchema.safeParse(b);
+  if (!parsed.success) return { kind: "triage", source: "missing" };
+  const contract = parsed.data;
+  if (contract.verdict === "questions") {
+    return { kind: "triage", questions: contract.questions, source: "structured" };
+  }
+  const summary = [
+    contract.type ? `typ: ${contract.type}` : undefined,
+    contract.size ? `rozmiar: ${contract.size}` : undefined,
+    contract.domain ? `domena: ${contract.domain}` : undefined,
+    contract.risk.length ? `ryzyko: ${contract.risk.join(", ")}` : undefined,
+  ].filter(Boolean).join(" · ");
+  return {
+    kind: "triage",
+    path: contract.verdict,
+    summary: summary || undefined,
+    domain: contract.domain,
+    source: "structured",
+  };
+}
+
+export function parseCritiqueVerdict(report: string): CritiqueVerdict {
+  const b = structuredBlock(report);
+  const parsed = critiqueContractSchema.safeParse(b);
+  if (!parsed.success) return { kind: "critique", verdict: "unavailable", source: "missing" };
+  return {
+    kind: "critique",
+    verdict: parsed.data.verdict,
+    issues: parsed.data.verdict === "issues" ? parsed.data.issues : undefined,
+    source: "structured",
+  };
 }

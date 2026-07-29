@@ -21,6 +21,11 @@ export interface ProjectConfig {
   statuses?: "extended";
   /** Budżet per ticket-run (nadpisuje globalne defaulty FACTORY_BUDGET_*). */
   budget?: { maxMinutes?: number; maxUsd?: number };
+  /**
+   * Pipeline planowania: "v3" = triage → (solo | research ×3 → synteza →
+   * krytyka); brak/inna wartość = klasyczny pojedynczy job planu (v2).
+   */
+  planPipeline?: "v2" | "v3";
   /** QA: runda 1 = e2e w verify (komenda na świeżym checkoutcie); runda 2 = prod smoke po merge'u. */
   qa?: {
     e2e?: string;
