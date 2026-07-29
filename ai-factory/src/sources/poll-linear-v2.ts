@@ -57,7 +57,7 @@ import {
 } from "../pipeline/retry-policy";
 import { runPreflight } from "../pipeline/preflight";
 import { breakerOpen, checkHourlySpend, recordRunOutcome } from "../pipeline/breaker";
-import { findUpFile, getProject } from "../pipeline/projects";
+import { findUpFile, getProject, progressLevel, type ProjectConfig } from "../pipeline/projects";
 import { planFileCollisions } from "../pipeline/serialization";
 import type { TestRunnerInput, TestRunnerResult } from "../pipeline/test-runner";
 import { execFileControlled } from "../pipeline/process-control";
@@ -65,6 +65,8 @@ import { evaluateGithubChecks, inspectPullRequestChecks } from "../pipeline/gith
 import { runProdChecks } from "../pipeline/prod-smoke";
 import { notify } from "../pipeline/notify";
 import { parseSignatureLine, POLLER_SIGNATURE } from "../pipeline/signature";
+import { progressComment, type ProgressCommentContext } from "../pipeline/progress";
+import { resolveRoute } from "../pipeline/routing";
 
 const POLL_INTERVAL_MS = Number(process.env.FACTORY_POLL_INTERVAL_MS ?? 60_000);
 const marker = (ticketId: string) => `[linear:${ticketId}:v2]`;
@@ -140,11 +142,50 @@ export function applyDecision(
     status: decision.transition.status,
     updatedAt: current.updatedAt,
   };
+  const researchAttempts = RESEARCH_ROLES
+    .map((role) => deps.store.latestAttempt(ticketId, researchAttemptStage(role)))
+    .filter((attempt) => attempt?.signature)
+    .sort((left, right) =>
+      (right?.finishedAt ?? right?.startedAt ?? "")
+        .localeCompare(left?.finishedAt ?? left?.startedAt ?? "")
+    );
+  const progressContext: ProgressCommentContext = {
+    buildSignature: deps.store.latestAttempt(ticketId, "build")?.signature,
+    reviewSignature: deps.store.latestAttempt(ticketId, "review")?.signature,
+    triageSignature: deps.store.latestAttempt(ticketId, "triage")?.signature,
+    synthesisSignature: deps.store.latestAttempt(ticketId, "synthesis")?.signature,
+    critiqueSignature: deps.store.latestAttempt(ticketId, "critique")?.signature,
+    researchSignature: researchAttempts[0]?.signature,
+    researchSignatures: Object.fromEntries(
+      RESEARCH_ROLES.map((role) => [
+        role,
+        deps.store.latestAttempt(ticketId, researchAttemptStage(role))?.signature,
+      ])
+    ),
+  };
+  const progress = progressComment(
+    current,
+    projected,
+    decision.transition.reason,
+    progressContext
+  );
   const updated = deps.store.transition(ticketId, {
     ...decision.transition,
     commands: [
       ...decision.commands,
       statusCommand(projected, decision.transition.reason),
+      ...(progress ? [{
+        key: progress.key,
+        ticketId,
+        kind: "linear-comment" as const,
+        stage: progress.stage,
+        payload: {
+          body: progress.body,
+          progress: progress.level,
+          ...(progress.signature ? { signature: progress.signature } : {}),
+          ...(progress.enrich ? { enrich: progress.enrich } : {}),
+        },
+      }] : []),
     ],
     acknowledgeCommandKey,
   });
@@ -624,6 +665,17 @@ async function dispatchExternal(
   if (command.kind === "linear-status") {
     await source.setStateByName(run.ticketId, String(command.payload.state));
   } else if (command.kind === "linear-comment") {
+    const requestedProgress = command.payload.progress;
+    if (requestedProgress === "milestones" || requestedProgress === "verbose") {
+      const configuredProgress = progressLevel(project);
+      if (
+        configuredProgress === "off" ||
+        (configuredProgress === "milestones" && requestedProgress === "verbose")
+      ) {
+        deps.store.markCommand(command.key, "done");
+        return;
+      }
+    }
     const tag = `[factory-outbox:${command.key}]`;
     const exists = (await source.listComments(run.ticketId)).some((comment) => comment.body.includes(tag));
     if (!exists) {
@@ -632,7 +684,7 @@ async function dispatchExternal(
         : undefined;
       await source.comment(
         run.ticketId,
-        `${String(command.payload.body)}\n\n${marker(run.ticketId)} ${tag}`,
+        `${await enrichProgressBody(deps, command, run, project)}\n\n${marker(run.ticketId)} ${tag}`,
         signature ?? POLLER_SIGNATURE
       );
     }
@@ -689,6 +741,51 @@ async function dispatchExternal(
     }
   }
   if (command.kind !== "publish-pr") deps.store.markCommand(command.key, "done");
+}
+
+async function enrichProgressBody(
+  deps: PollerDependencies,
+  command: LifecycleCommand,
+  run: LifecycleRun,
+  project: ProjectConfig
+): Promise<string> {
+  const body = String(command.payload.body);
+  if (command.payload.enrich !== "approve-route" && command.payload.enrich !== "review-route") {
+    return body;
+  }
+  try {
+    const ticket = { project: run.project, labels: run.manifest.labels };
+    if (command.payload.enrich === "approve-route") {
+      const route = await resolveRoute("build", ticket, run.planDomain);
+      const maxMinutes = project.budget?.maxMinutes
+        ?? Number(process.env.FACTORY_BUDGET_MAX_MIN ?? 45);
+      const maxUsd = project.budget?.maxUsd
+        ?? Number(process.env.FACTORY_BUDGET_MAX_USD ?? 3);
+      return [
+        body,
+        `Wykonawca: \`${route.spec}\` · budżet roli: ${JOB_BUDGET_MINUTES.build} min · ` +
+          `budżet ticketu: ${maxMinutes} min / $${maxUsd}.`,
+      ].join("\n\n");
+    }
+
+    const signature = deps.store.latestAttempt(run.ticketId, "build")?.signature;
+    const buildHarness = signature?.split(" · ")[1]?.split("@")[0]?.trim();
+    const route = await resolveRoute(
+      "review",
+      ticket,
+      run.planDomain,
+      buildHarness && buildHarness !== "unavailable"
+        ? { excludeEngine: buildHarness }
+        : {}
+    );
+    return [
+      body,
+      `Wykonawca review: \`${route.spec}\` · budżet roli: ${JOB_BUDGET_MINUTES.review} min.`,
+    ].join("\n\n");
+  } catch {
+    // Komentarz postępu jest informacyjny: błąd wzbogacenia nie steruje lifecycle.
+    return body;
+  }
 }
 
 export async function dispatchOutbox(deps: PollerDependencies): Promise<void> {

@@ -1,6 +1,7 @@
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { localConfigPath, mergeSection, readLocalOverride, readYamlMapping } from "./local-config";
+import type { ProgressLevel } from "./progress";
 
 export interface ProjectConfig {
   repo: string;
@@ -18,6 +19,8 @@ export interface ProjectConfig {
   max_concurrent_tickets?: number;
   /** "extended" = fabryka pisze stany procesu w Linear (🧠❓🚦🔨🧪👀✅) zamiast prostego In Progress/In Review. */
   statuses?: "extended";
+  /** Kanał krótkich komentarzy przejść lifecycle w Linear. Domyślnie milestones. */
+  progress?: ProgressLevel;
   /** Budżet per ticket-run (nadpisuje globalne defaulty FACTORY_BUDGET_*). */
   budget?: { maxMinutes?: number; maxUsd?: number };
   /**
@@ -37,6 +40,16 @@ export interface ProjectConfig {
 }
 
 export const DEFAULT_VERIFY_BUDGET_MINUTES = 5;
+
+export function progressLevel(project: ProjectConfig): ProgressLevel {
+  const level = project.progress ?? "milestones";
+  if (!["off", "milestones", "verbose"].includes(level)) {
+    throw new Error(
+      `Nieznany poziom progress "${String(level)}" — dozwolone: off, milestones, verbose.`
+    );
+  }
+  return level;
+}
 
 export function verifyBudgetMinutes(project: ProjectConfig): number {
   return project.verify?.budgetMinutes ?? DEFAULT_VERIFY_BUDGET_MINUTES;
@@ -81,5 +94,6 @@ export async function getProject(key: string): Promise<ProjectConfig> {
   }
   project.checks = checks;
   if (project.ci) project.ci.requiredChecks = requiredChecks;
+  progressLevel(project);
   return project;
 }
