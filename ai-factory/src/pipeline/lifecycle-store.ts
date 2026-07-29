@@ -458,6 +458,19 @@ export class LifecycleStore {
   }
 
   /**
+   * Czy ticket ma jakikolwiek niedokończony job (run-job/run-tests)?
+   * CELOWO bez filtra available_at — build odsunięty serializacją planFiles
+   * to nadal żywy job, nie zombie.
+   */
+  hasOutstandingJob(ticketId: string): boolean {
+    return !!this.db.prepare(`
+      SELECT 1 FROM lifecycle_commands
+      WHERE ticket_id=? AND kind IN ('run-job', 'run-tests') AND state IN ('pending', 'dispatched')
+      LIMIT 1
+    `).get(ticketId);
+  }
+
+  /**
    * Odsuwa dostępność komendy bez zużywania budżetu prób (markCommand
    * inkrementuje attempts) — używane przy serializacji kolizji plikowych.
    */
