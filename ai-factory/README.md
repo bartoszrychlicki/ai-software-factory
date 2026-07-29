@@ -2,7 +2,8 @@
 
 Lokalna fabryka software z trwałym koordynatorem SQLite. Linear jest kolejką
 i interfejsem człowieka, GitHub źródłem prawdy o PR/CI/merge, a Mastra wykonuje
-wyłącznie krótkie joby AI: `plan`, `build`, `review`.
+wyłącznie krótkie joby AI: `plan`, `build`, `review`, a w projektach z
+deep-planem v3 dodatkowo `triage`, `research`, `synthesis`, `critique`.
 
 ```text
 Preflight → Plan → /approve → Build → Test/E2E → Draft PR

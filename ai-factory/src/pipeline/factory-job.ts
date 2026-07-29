@@ -563,6 +563,16 @@ async function runCritique(
     // Advisory: brak trasy/dywersyfikacji nie blokuje bramki — koordynator
     // pokaże ⚠️ "krytyka niedostępna" człowiekowi przy aprobacie.
     const message = error instanceof Error ? error.message : String(error);
+    const durationMs = Date.now() - startedAt;
+    await recordMetric({
+      ticket: input.ticket.id,
+      runId,
+      stage: "critique",
+      attempt: input.attempt,
+      ok: false,
+      outcome: "unavailable",
+      durationMs,
+    });
     return {
       kind: "critique",
       outcome: "failed",
@@ -574,7 +584,7 @@ async function runCritique(
         model: "unavailable",
         profile: "critic",
       }),
-      durationMs: Date.now() - startedAt,
+      durationMs,
       critiqueVerdict: "unavailable",
       files: [],
       changedFiles: [],

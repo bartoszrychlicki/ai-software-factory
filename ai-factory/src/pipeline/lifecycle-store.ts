@@ -348,7 +348,7 @@ export class LifecycleStore {
       triage_summary: "TEXT",
       briefs_json: "TEXT",
       research_failures_json: "TEXT",
-      critique_round: "INTEGER",
+      critique_round: "INTEGER NOT NULL DEFAULT 0",
       critique_verdict: "TEXT",
       critique_report: "TEXT",
       degradations_json: "TEXT",
@@ -782,6 +782,19 @@ export class LifecycleStore {
     return (this.db.prepare(`
       SELECT * FROM lifecycle_stage_attempts
       WHERE ticket_id=? ORDER BY started_at, stage, attempt
+    `).all(ticketId) as Record<string, unknown>[]).map((row) => this.hydrateAttempt(row));
+  }
+
+  /**
+   * Próby w toku (status running) — rezerwacja budżetu przed dispatchem
+   * kolejnego joba: totalUsage widzi tylko koszty ZAKOŃCZONYCH prób, więc
+   * równoległy fan-out (research ×3) mógłby przekroczyć limit wielokrotnie.
+   */
+  listRunningAttempts(ticketId: string): StageAttempt[] {
+    return (this.db.prepare(`
+      SELECT * FROM lifecycle_stage_attempts
+      WHERE ticket_id=? AND status='running'
+      ORDER BY started_at
     `).all(ticketId) as Record<string, unknown>[]).map((row) => this.hydrateAttempt(row));
   }
 

@@ -5,18 +5,18 @@ flowchart TD
   A["Linear Todo"] --> B["Read-only preflight"]
   B -- "FAIL" --> A
   B -- "PASS" --> C["SQLite: manifest + outbox"]
-  C -- "planPipeline: v3" --> T["factoryJob: triage (tani klasyfikator)"]
+  C -- "planPipeline: v3" --> TR["factoryJob: triage (tani klasyfikator)"]
   C -- "v2 / label plan:solo" --> D
-  T -- "pytania runda 1" --> E
-  T -- "S / solo" --> D["Mastra factoryJob: plan"]
-  T -- "M/L, ryzyko / deep" --> R["factoryJob: research ×3 równolegle
+  TR -- "pytania runda 1" --> E
+  TR -- "S / solo" --> D["Mastra factoryJob: plan"]
+  TR -- "M/L, ryzyko / deep" --> RS["factoryJob: research ×3 równolegle
 recon + solution-a + solution-b (różne silniki)"]
-  T -- "awaria triage" --> D
-  R -- "≥1 brief (pad roli = ⚠️ na bramce)" --> S["factoryJob: synthesis
+  TR -- "awaria triage" --> D
+  RS -- "≥1 brief (pad roli = ⚠️ na bramce)" --> SY["factoryJob: synthesis
 jeden plan + Rozstrzygnięcia"]
-  S -- "pytania runda 2" --> E
-  S --> CR["factoryJob: critique (silnik ≠ synteza)"]
-  CR -- "issues → max 1 rewizja" --> S
+  SY -- "pytania runda 2" --> E
+  SY --> CR["factoryJob: critique (silnik ≠ synteza)"]
+  CR -- "issues → max 1 rewizja" --> SY
   CR -- "ok / issues / ⚠️ unavailable" --> F
   D -- "pytania max 2" --> E["Linear /answer"]
   E --> D

@@ -20,6 +20,21 @@ const manifest: TicketManifestV2 = {
   inputHash: "hash-1",
 };
 
+/** Zapisy eksperymentu są fire-and-forget — polluj plik zamiast stałego sleepa. */
+async function readWhenReady(path: string, timeoutMs = 2_000): Promise<string> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      const raw = await readFile(path, "utf8");
+      if (raw.trim()) return raw;
+    } catch {
+      // plik jeszcze nie istnieje
+    }
+    if (Date.now() > deadline) throw new Error(`Brak pliku ${path} w limicie ${timeoutMs} ms`);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+}
+
 test("buildExperimentSummary agreguje próby, koszty, first-pass i wariant procesu", async () => {
   const dir = await mkdtemp(join(tmpdir(), "factory-exp-summary-"));
   const store = new LifecycleStore(join(dir, "registry.db"));
@@ -108,9 +123,7 @@ test("ukończenie ticketu przez applyDecision zapisuje wiersz summary do experim
       outcome: "skipped-not-configured",
       report: "brak checków",
     }));
-    // appendFile jest async fire-and-forget — daj mu chwilę
-    await new Promise((resolve) => setTimeout(resolve, 150));
-    const raw = await readFile(join(root, "runs", "experiments.jsonl"), "utf8");
+    const raw = await readWhenReady(join(root, "runs", "experiments.jsonl"));
     const rows = raw.trim().split("\n").map((line) => JSON.parse(line) as ExperimentRow);
     const summary = rows.find((row) => row.kind === "summary") as ExperimentSummaryRow;
     assert.equal(summary.ticket, "BAR-E2");
@@ -160,9 +173,7 @@ test("sweepScores: /score na ukończonym tickecie zapisuje ocenę, potwierdza i 
     await sweepScores(deps);
     assert.equal(confirmations.length, 1);
 
-    // appendExperimentRow jest fire-and-forget — daj zapisowi chwilę.
-    await new Promise((resolve) => setTimeout(resolve, 150));
-    const raw = await readFile(join(root, "runs", "experiments.jsonl"), "utf8");
+    const raw = await readWhenReady(join(root, "runs", "experiments.jsonl"));
     const scoreRows = raw.trim().split("\n")
       .map((line) => JSON.parse(line) as ExperimentRow)
       .filter((row) => row.kind === "score");
@@ -172,6 +183,40 @@ test("sweepScores: /score na ukończonym tickecie zapisuje ocenę, potwierdza i 
     if (previousRoot === undefined) delete process.env.FACTORY_ROOT;
     else process.env.FACTORY_ROOT = previousRoot;
     await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  }
+});
+
+test("/replan kasuje ocenę /score poprzedniej generacji (rating jest per generacja)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "factory-exp-score-gen-"));
+  const store = new LifecycleStore(join(dir, "registry.db"));
+  try {
+    store.createRun("BAR-E4", "harness", manifest);
+    store.transition("BAR-E4", {
+      stage: "approval",
+      status: "waiting_human",
+      actor: "test",
+      reason: "plan-ready",
+      patch: { plan: "plan", planFiles: ["src/a.ts"] },
+    });
+    store.setScore("BAR-E4", 5, "przedwczesna ocena");
+    assert.equal(store.getRun("BAR-E4")?.score, 5);
+    const decision = reduceLifecycle(store.getRun("BAR-E4")!, {
+      type: "replan",
+      commentId: "c-replan",
+      reason: "zmiana koncepcji",
+    });
+    const run = store.transition("BAR-E4", {
+      ...decision.transition,
+      commands: decision.commands,
+    });
+    assert.deepEqual(
+      [run.generation, run.score, run.scoreComment, run.scoredAt],
+      [2, undefined, undefined, undefined]
+    );
+    // Wyczyszczony scoredAt przywraca ticket do sweepa po ukończeniu nowej generacji.
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
   }
 });
 

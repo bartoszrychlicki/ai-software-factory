@@ -14,7 +14,7 @@ defaults:
   research.solution-b: codex
   synthesis: claude-code/sonnet
   critique: codex                      # wymóg: silnik ≠ synteza
-  critique.diverse: codex              # fallback dywersyfikacji krytyki
+  critique.diverse: claude-code/sonnet # fallback MUSI być innym silnikiem niż critique
 
 # spec: silnik[/model[@effort]]; effort: low/medium/high/xhigh (claude --effort, codex -c model_reasoning_effort)
 projects:
@@ -35,4 +35,5 @@ projects:
     research.solution-b: codex/gpt-5.6-sol@xhigh
     synthesis: claude-code/claude-opus-5@xhigh
     critique: codex/gpt-5.6-sol@xhigh
-    critique.diverse: codex/gpt-5.6-sol@xhigh
+    # fallback, gdy codex byłby wykluczony (np. synteza przeniesiona na codex):
+    critique.diverse: claude-code/claude-fable-5@medium

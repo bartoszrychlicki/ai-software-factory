@@ -378,6 +378,35 @@ async function handleStalledJob(
   return true;
 }
 
+/**
+ * Rezerwacja budżetu za próby W TOKU: totalUsage widzi wyłącznie koszty
+ * zakończonych prób, więc równoległy fan-out (research ×3) przy prawie
+ * wyczerpanym budżecie przepuściłby wszystkie joby na tym samym odczycie.
+ * Rezerwujemy budżet czasowy roli (górna granica lease) + estymatę USD dla
+ * jobów AI; deterministyczny runner testów rezerwuje tylko minuty.
+ */
+function reservedUsage(
+  store: LifecycleStore,
+  ticketId: string
+): { usd: number; minutes: number } {
+  const perMinute = Number(process.env.FACTORY_SYNTH_USD_PER_MIN ?? 0.15);
+  let minutes = 0;
+  let usd = 0;
+  for (const attempt of store.listRunningAttempts(ticketId)) {
+    if (attempt.stage === "test") {
+      minutes += 20; // bazowy lease detached runnera
+      continue;
+    }
+    const kind = attempt.stage.startsWith("research-") ? "research" : attempt.stage;
+    const budget = kind in JOB_BUDGET_MINUTES
+      ? JOB_BUDGET_MINUTES[kind as keyof typeof JOB_BUDGET_MINUTES]
+      : 20;
+    minutes += budget;
+    usd += budget * perMinute;
+  }
+  return { minutes, usd };
+}
+
 async function dispatchJob(
   deps: PollerDependencies,
   command: LifecycleCommand,
@@ -386,6 +415,7 @@ async function dispatchJob(
   const attempt = Number(command.payload.attempt ?? 1);
   const project = await getProject(run.project);
   const usage = deps.store.totalUsage(run.ticketId);
+  const reserved = reservedUsage(deps.store, run.ticketId);
   const maxMinutes = project.budget?.maxMinutes ?? Number(process.env.FACTORY_BUDGET_MAX_MIN ?? 45);
   const maxUsd = project.budget?.maxUsd ?? Number(process.env.FACTORY_BUDGET_MAX_USD ?? 3);
   const attemptDetails = {
@@ -396,11 +426,22 @@ async function dispatchJob(
     budgetUsedMinutes: usage.minutes,
     budgetUsedUsd: usage.usd,
   };
-  if (usage.minutes >= maxMinutes || usage.usd >= maxUsd) {
+  // Bramka budżetu dotyczy wyłącznie STARTU nowego joba: komenda z externalId
+  // ma już próbę w toku i sama figuruje w rezerwacji — nie może się nią
+  // samoblokować podczas pollingu statusu.
+  if (
+    !command.externalId &&
+    (usage.minutes + reserved.minutes >= maxMinutes ||
+      usage.usd + reserved.usd >= maxUsd)
+  ) {
+    const reservedNote = reserved.minutes
+      ? ` (w tym rezerwacja za joby w toku: ${reserved.minutes.toFixed(0)} min / $${reserved.usd.toFixed(2)})`
+      : "";
     const output = {
       ...failedJobOutput(
         command,
-        `Budżet ticketu wyczerpany: ${usage.minutes.toFixed(1)}/${maxMinutes} min, $${usage.usd.toFixed(2)}/$${maxUsd}.`
+        `Budżet ticketu wyczerpany: ${(usage.minutes + reserved.minutes).toFixed(1)}/${maxMinutes} min, ` +
+        `$${(usage.usd + reserved.usd).toFixed(2)}/$${maxUsd}${reservedNote}.`
       ),
       errorCode: "BUDGET_EXHAUSTED",
     };
@@ -703,7 +744,24 @@ export async function dispatchOutbox(deps: PollerDependencies): Promise<void> {
           run.manifest.url
         ).catch(() => {});
       }
-      const lifecycleCritical = ["run-job", "publish-pr", "mark-pr-ready"].includes(command.kind);
+      // Dead-letter joba domyka jego próbę — wisząca próba 'running' na zawsze
+      // rezerwowałaby budżet i fałszowała wiersz eksperymentu.
+      if (deadLettered && (command.kind === "run-job" || command.kind === "run-tests")) {
+        deps.store.finishAttempt(
+          run.ticketId,
+          command.stage,
+          Number(command.payload.attempt ?? 1),
+          {
+            status: "failed",
+            outcome: "OUTBOX_FAILED",
+            errorCode: "OUTBOX_FAILED",
+            errorMessage: message,
+          }
+        );
+      }
+      // run-tests też jest lifecycle-critical: dead-letter spawnu (np. PATH)
+      // zostawiałby run w test/pending bez żadnej komendy — cichy stuck.
+      const lifecycleCritical = ["run-job", "run-tests", "publish-pr", "mark-pr-ready"].includes(command.kind);
       if (deadLettered && lifecycleCritical) {
         const stage = runStageOf(command.stage);
         applyDecision(deps, run.ticketId, {
@@ -1307,6 +1365,10 @@ export async function sweepScores(deps: PollerDependencies): Promise<void> {
   }
 }
 
+/** Throttle sweepa ocen: fan-out do API Lineara nie musi biec co cykl pollera. */
+const SCORE_SWEEP_INTERVAL_MS = Number(process.env.FACTORY_SCORE_SWEEP_MS ?? 10 * 60_000);
+let lastScoreSweepAt = 0;
+
 export async function pollOnce(deps: PollerDependencies): Promise<void> {
   await dispatchOutbox(deps);
   for (const run of deps.store.listActive()) {
@@ -1314,9 +1376,12 @@ export async function pollOnce(deps: PollerDependencies): Promise<void> {
       console.error(`[${run.ticketId}] reconcile:`, error instanceof Error ? error.message : error)
     );
   }
-  await sweepScores(deps).catch((error) =>
-    console.error("Sweep ocen nieudany:", error instanceof Error ? error.message : error)
-  );
+  if (Date.now() - lastScoreSweepAt >= SCORE_SWEEP_INTERVAL_MS) {
+    lastScoreSweepAt = Date.now();
+    await sweepScores(deps).catch((error) =>
+      console.error("Sweep ocen nieudany:", error instanceof Error ? error.message : error)
+    );
+  }
   await claimReady(deps);
   await dispatchOutbox(deps);
 }

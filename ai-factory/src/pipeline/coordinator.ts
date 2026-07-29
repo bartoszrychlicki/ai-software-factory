@@ -8,7 +8,12 @@ import {
   type ResearchRole,
   type TransitionInput,
 } from "./lifecycle-store";
-import type { FactoryJobOutput } from "./factory-job";
+import {
+  BRIEF_CLIP_CHARS,
+  clip,
+  CRITIQUE_CLIP_CHARS,
+  type FactoryJobOutput,
+} from "./factory-job";
 
 type NewCommand = Omit<
   LifecycleCommand,
@@ -137,6 +142,11 @@ const PLAN_RESET_PATCH = {
   critiqueVerdict: undefined,
   critiqueReport: undefined,
   degradations: undefined,
+  // Ocena /score dotyczy generacji, którą oceniano — nowa generacja startuje
+  // bez niej (inaczej summary N+1 dziedziczyłoby rating generacji N).
+  score: undefined,
+  scoreComment: undefined,
+  scoredAt: undefined,
 };
 
 function linearComment(
@@ -157,9 +167,6 @@ function linearComment(
     },
   };
 }
-
-const clipText = (text: string, max: number): string =>
-  text.length <= max ? text : `${text.slice(0, max)}\n\n[…] (obcięte do ${max} znaków)`;
 
 /**
  * Komentarz bramki aprobat: plan + werdykt krytyki + jawne degradacje + koszt.
@@ -767,7 +774,7 @@ export function reduceLifecycle(run: LifecycleRun, event: CoordinatorEvent): Coo
       const commands: NewCommand[] = [];
       const briefText = (event.output.brief ?? event.output.report).trim();
       if (event.output.outcome === "success" && briefText) {
-        briefs[role] = clipText(briefText, 24_000);
+        briefs[role] = clip(briefText, BRIEF_CLIP_CHARS);
       } else {
         const attemptsSoFar = (failures[role] ?? 0) + 1;
         const retryable = attemptsSoFar === 1 && event.output.errorCode !== "BUDGET_EXHAUSTED";
@@ -901,7 +908,7 @@ export function reduceLifecycle(run: LifecycleRun, event: CoordinatorEvent): Coo
       assertStage(run, "critique", event.type);
       const verdict = event.output.critiqueVerdict ?? "unavailable";
       const issues = event.output.critiqueIssues
-        ?? (verdict === "issues" ? clipText(event.output.report, 6_000) : undefined);
+        ?? (verdict === "issues" ? clip(event.output.report, CRITIQUE_CLIP_CHARS) : undefined);
       if (verdict === "issues" && run.critiqueRound === 0) {
         const revisionPatch = {
           critiqueRound: 1,

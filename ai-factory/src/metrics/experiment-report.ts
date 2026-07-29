@@ -138,7 +138,7 @@ export function renderReport(summaries: ExperimentSummaryRow[]): string {
   lines.push("");
   lines.push("## Konfiguracje modeli per ticket (podpisy faktycznych prób)");
   lines.push("");
-  for (const row of summaries.sort((a, b) => a.ticket.localeCompare(b.ticket))) {
+  for (const row of [...summaries].sort((a, b) => a.ticket.localeCompare(b.ticket))) {
     const models = Object.entries(row.stages)
       .filter(([, stage]) => stage.signature)
       .map(([stage, data]) => `${stage}: ${data.signature?.split(" · ").slice(1, 3).join("/")}`)

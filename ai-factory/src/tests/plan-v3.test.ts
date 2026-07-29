@@ -19,6 +19,7 @@ import {
 } from "../pipeline/factory-job";
 import { parseCritiqueVerdict, parseTriageVerdict } from "../pipeline/verdicts";
 import { parseCommand, parseScorePayload } from "../sources/commands";
+import { dispatchOutbox, type PollerDependencies } from "../sources/poll-linear-v2";
 import type { EngineAdapter } from "../engines/types";
 
 const manifest: TicketManifestV2 = {
@@ -443,6 +444,64 @@ test("attempt stages ról researchu nie kolidują w rejestrze prób", async () =
   } finally {
     store.close();
     await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("rezerwacja budżetu: job w toku blokuje start kolejnego przy limicie (fan-out nie przekracza budżetu)", async () => {
+  const root = await mkdtemp(join(tmpdir(), "factory-v3-reserve-"));
+  const previousRoot = process.env.FACTORY_ROOT;
+  const store = new LifecycleStore(join(root, "registry.db"));
+  try {
+    await writeFile(join(root, "package.json"), "{}");
+    await writeFile(join(root, "projects.yaml"), [
+      "harness:",
+      `  repo: ${JSON.stringify(root)}`,
+      "  checks:",
+      "    - \"true\"",
+      "  budget:",
+      "    maxUsd: 3",
+      "    maxMinutes: 90",
+    ].join("\n"));
+    process.env.FACTORY_ROOT = root;
+    const deps: PollerDependencies = {
+      store,
+      mastra: {
+        async getRun() { throw new Error("rezerwacja powinna zablokować dispatch przed Mastrą"); },
+      } as unknown as PollerDependencies["mastra"],
+      sources: new Map([["harness", {
+        async setStateByName() {},
+        async listComments() { return []; },
+        async comment() {},
+      } as never]]),
+      notifier: async () => {},
+    };
+    store.createRun("BAR-RES", "harness", manifest);
+    store.transition("BAR-RES", {
+      stage: "research",
+      status: "running",
+      actor: "test",
+      reason: "fan-out",
+      patch: { planEntry: "triage", planVariant: "deep" },
+    });
+    // Build w toku (bez wyniku) rezerwuje 25 min × $0.15/min = $3.75 ≥ limitu $3.
+    store.startAttempt("BAR-RES", "build", 1, "job-live");
+    store.enqueue({
+      key: "BAR-RES:g1:job:research:research-recon:a1",
+      ticketId: "BAR-RES",
+      kind: "run-job",
+      stage: "research-recon",
+      payload: { kind: "research", researchRole: "recon", attempt: 1 },
+    });
+    await dispatchOutbox(deps);
+    const attempt = store.latestAttempt("BAR-RES", "research-recon");
+    assert.equal(attempt?.errorCode, "BUDGET_EXHAUSTED");
+    assert.equal(store.getRun("BAR-RES")?.researchFailures?.recon, 2, "budżet nie dostaje auto-retry");
+    assert.match(attempt?.report ?? "", /rezerwacja za joby w toku/);
+  } finally {
+    store.close();
+    if (previousRoot === undefined) delete process.env.FACTORY_ROOT;
+    else process.env.FACTORY_ROOT = previousRoot;
+    await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
