@@ -501,15 +501,11 @@ export class LifecycleStore {
         input.reason,
         timestamp
       );
-      if (input.command) this.insertCommand(input.command, timestamp);
-      for (const command of input.commands ?? []) this.insertCommand(command, timestamp);
-      if (input.acknowledgeCommandKey) {
-        this.db.prepare(`
-          UPDATE lifecycle_commands
-          SET state='done', last_error=NULL, updated_at=?
-          WHERE idempotency_key=?
-        `).run(timestamp, input.acknowledgeCommandKey);
-      }
+      // Cancel MUSI iść PRZED insertem nowych komend: replan/input-changed
+      // anuluje joby POPRZEDNIEJ generacji i w tej samej decyzji enqueue'uje
+      // joba nowej. W odwrotnej kolejności UPDATE 'canceled-by-replan' zjadał
+      // świeżo dodaną komendę i run rodził się jako zombie
+      // (incydent BAR-180 g2, JOB_MISSING sekundę po /replan).
       if (input.cancelOutstandingRunJobs) {
         this.db.prepare(`
           UPDATE lifecycle_commands
@@ -521,6 +517,15 @@ export class LifecycleStore {
           SET status='canceled', outcome='canceled-by-replan', finished_at=?
           WHERE ticket_id=? AND status IN ('pending', 'running')
         `).run(timestamp, ticketId);
+      }
+      if (input.command) this.insertCommand(input.command, timestamp);
+      for (const command of input.commands ?? []) this.insertCommand(command, timestamp);
+      if (input.acknowledgeCommandKey) {
+        this.db.prepare(`
+          UPDATE lifecycle_commands
+          SET state='done', last_error=NULL, updated_at=?
+          WHERE idempotency_key=?
+        `).run(timestamp, input.acknowledgeCommandKey);
       }
       return next;
     });
