@@ -1,5 +1,5 @@
 import type { FactoryStatus, Ticket, TicketSource } from "./types";
-import { LINEAR_STATE_MAP } from "./state-map";
+import { isTerminalState, LINEAR_STATE_MAP } from "./state-map";
 import {
   POLLER_SIGNATURE,
   signatureFooter,
@@ -123,9 +123,12 @@ export class LinearSource implements TicketSource {
    * zobaczył. Labeli NIE rusza — są wyłącznie informacyjne (BAR-142/147).
    * Fazę właściwą ustawia poller przez setPhase.
    */
-  async claim(id: string): Promise<void> {
+  async claim(id: string, preferredStateName?: string): Promise<void> {
     const issue = await this.fetchIssue(id);
-    const started = pickState(issue.team.states.nodes, "started", "In Progress");
+    const started = preferredStateName
+      ? issue.team.states.nodes.find((state) => state.name === preferredStateName)
+      : pickState(issue.team.states.nodes, "started", "In Progress");
+    if (!started) throw new Error(`Brak stanu "${preferredStateName}" w teamie`);
     await this.gql(
       `mutation($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }`,
       { id: issue.id, input: { stateId: started.id } }
@@ -184,7 +187,7 @@ export class LinearSource implements TicketSource {
       { filter: { project: { name: { eq: this.project } } } }
     );
     return data.issues.nodes
-      .filter((issue) => !LINEAR_STATE_MAP.terminal.includes(issue.state.name))
+      .filter((issue) => !isTerminalState(LINEAR_STATE_MAP, issue.state.name))
       .map((issue) => ({
         id: issue.identifier,
         stateName: issue.state.name,

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -13,14 +13,16 @@ import {
 import { reduceLifecycle, type CoordinatorDecision } from "../pipeline/coordinator";
 import { runPreflight } from "../pipeline/preflight";
 import { buildCommentContextSnapshot } from "../sources/comment-context";
-import type { LinearSource } from "../sources/linear";
+import { LinearSource } from "../sources/linear";
 import {
   extendedRequiredStateNames,
   extendedStatusName,
 } from "../sources/state-map";
 import {
   applyDecision,
+  dispatchOutbox,
   reconcileRun,
+  writeLinearState,
   type PollerDependencies,
 } from "../sources/poll-linear-v2";
 
@@ -223,6 +225,148 @@ test("projekt bez statuses: extended zachowuje prostą projekcję bez zmian", ()
     }
   } finally {
     store.close();
+  }
+});
+
+test("nieterminalny stan przyjmuje prostą i rozszerzoną projekcję", async () => {
+  for (const extended of [false, true]) {
+    const store = new LifecycleStore(":memory:");
+    const ticketId = extended ? "BAR-WRITE-EXTENDED" : "BAR-WRITE-SIMPLE";
+    const writes: string[] = [];
+    let linearState = "Todo";
+    const source = {
+      async getStateName() { return linearState; },
+      async setStateByName(_id: string, state: string) {
+        writes.push(state);
+        linearState = state;
+      },
+    } as unknown as LinearSource;
+    try {
+      const deps = depsFor(store, { extended, source });
+      store.createRun(ticketId, "demo", manifest);
+      store.transition(ticketId, {
+        stage: "build",
+        status: "running",
+        actor: "test",
+        reason: "prepare-build",
+      });
+      applyDecision(deps, ticketId, {
+        transition: {
+          stage: "build",
+          status: "running",
+          actor: "test",
+          reason: "project-build-state",
+        },
+        commands: [],
+      });
+      for (const command of store.outstandingCommands(200)) {
+        if (command.kind === "linear-comment") store.markCommand(command.key, "done");
+      }
+
+      await dispatchOutbox(deps);
+
+      assert.deepEqual(writes, [extended ? "🔨 Build" : "In Progress"]);
+    } finally {
+      store.close();
+    }
+  }
+});
+
+test("claim używa projekcji projektu, a poller ma jeden korytarz zapisu", async () => {
+  for (const extended of [false, true]) {
+    const store = new LifecycleStore(":memory:");
+    const claims: (string | undefined)[] = [];
+    const writes: string[] = [];
+    let linearState = "Todo";
+    const source = {
+      async getStateName() { return linearState; },
+      async claim(_id: string, preferredStateName?: string) {
+        claims.push(preferredStateName);
+        linearState = preferredStateName ?? "In Progress";
+      },
+      async setStateByName(_id: string, state: string) {
+        writes.push(state);
+        linearState = state;
+      },
+    } as unknown as LinearSource;
+    try {
+      const deps = depsFor(store, { extended, source });
+      const run = store.createRun(
+        extended ? "BAR-CLAIM-EXTENDED" : "BAR-CLAIM-SIMPLE",
+        "demo",
+        manifest
+      );
+      const target = extended ? "🧠 Planowanie" : "In Progress";
+
+      assert.equal(await writeLinearState(deps, run, target, undefined, true), "written");
+      assert.deepEqual(claims, [extended ? "🧠 Planowanie" : undefined]);
+
+      if (extended) {
+        linearState = "Todo";
+        assert.equal(await writeLinearState(deps, run, "🔨 Build"), "written");
+        assert.deepEqual(writes, ["🔨 Build"]);
+      }
+    } finally {
+      store.close();
+    }
+  }
+
+  const sourceCode = await readFile(
+    new URL("../sources/poll-linear-v2.ts", import.meta.url),
+    "utf8"
+  );
+  const writerStart = sourceCode.indexOf("export async function writeLinearState(");
+  const writerEnd = sourceCode.indexOf("\nasync function dispatchExternal", writerStart);
+  assert.ok(writerStart >= 0 && writerEnd > writerStart);
+  const outsideWriter = sourceCode.slice(0, writerStart) + sourceCode.slice(writerEnd);
+  assert.doesNotMatch(outsideWriter, /\.setStateByName\(|\.claim\(/);
+});
+
+test("LinearSource.claim wybiera dokładny stan extended i zachowuje fallback prosty", async () => {
+  const originalFetch = globalThis.fetch;
+  const stateIds: string[] = [];
+  globalThis.fetch = (async (_input, init) => {
+    const request = JSON.parse(String(init?.body)) as {
+      query: string;
+      variables?: { input?: { stateId?: string } };
+    };
+    if (request.query.includes("issueUpdate")) {
+      stateIds.push(String(request.variables?.input?.stateId));
+      return new Response(JSON.stringify({ data: { issueUpdate: { success: true } } }));
+    }
+    return new Response(JSON.stringify({
+      data: {
+        issue: {
+          id: "issue-id",
+          identifier: "BAR-CLAIM",
+          title: "Claim",
+          description: "",
+          url: "https://linear.test/BAR-CLAIM",
+          priorityLabel: null,
+          labels: { nodes: [] },
+          state: { id: "todo", name: "Todo", type: "unstarted" },
+          team: {
+            states: {
+              nodes: [
+                { id: "started-first", name: "Started", type: "started" },
+                { id: "in-progress", name: "In Progress", type: "started" },
+                { id: "planning", name: "🧠 Planowanie", type: "started" },
+              ],
+            },
+          },
+        },
+      },
+    }));
+  }) as typeof fetch;
+
+  try {
+    const source = new LinearSource("test-key", "demo");
+    await source.claim("BAR-CLAIM", "🧠 Planowanie");
+    await source.claim("BAR-CLAIM");
+    assert.deepEqual(stateIds, ["planning", "in-progress"]);
+    await assert.rejects(source.claim("BAR-CLAIM", "Brakujący"), /Brak stanu "Brakujący"/);
+  } finally {
+    globalThis.fetch = originalFetch;
   }
 });
 

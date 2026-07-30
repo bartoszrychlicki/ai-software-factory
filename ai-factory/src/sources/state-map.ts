@@ -14,7 +14,10 @@ export interface StateMap {
   /** Stan, w którym człowiek oddaje ticket fabryce (trigger claimu). */
   ready: string;
   phases: Record<FactoryPhase, string>;
-  /** Stany końcowe — fabryka ich NIE nadpisuje i nie czyta jako decyzji. */
+  /**
+   * Stany końcowe — fabryka ich NIGDY nie nadpisuje. Wyjątkiem jest własne
+   * przejście fabryki ze stanu nieterminalnego do terminalnego.
+   */
   terminal: string[];
   /** Przejście do jednego z tych stanów = decyzja człowieka na danej bramce. */
   decisions: Partial<Record<Gate, Partial<Record<DecisionKind, string[]>>>>;
@@ -50,6 +53,11 @@ export const LINEAR_STATE_MAP: StateMap = {
   },
   labelParams: { engine: "engine:", domain: "domain:", planMode: "plan:" },
 };
+
+/** Czy stan jest końcową decyzją człowieka, której fabryka nie może nadpisać. */
+export function isTerminalState(map: StateMap, stateName: string): boolean {
+  return map.terminal.includes(stateName);
+}
 
 export interface ExtendedStatusRun {
   stage: LifecycleStage;

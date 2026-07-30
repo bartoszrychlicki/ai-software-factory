@@ -72,7 +72,11 @@ import { notify } from "../pipeline/notify";
 import { parseSignatureLine, POLLER_SIGNATURE } from "../pipeline/signature";
 import { progressComment, type ProgressCommentContext } from "../pipeline/progress";
 import { resolveRoute } from "../pipeline/routing";
-import { extendedStatusName } from "./state-map";
+import {
+  extendedStatusName,
+  isTerminalState,
+  LINEAR_STATE_MAP,
+} from "./state-map";
 
 const POLL_INTERVAL_MS = Number(process.env.FACTORY_POLL_INTERVAL_MS ?? 60_000);
 const marker = (ticketId: string) => `[linear:${ticketId}:v2]`;
@@ -117,7 +121,12 @@ function statusName(run: LifecycleRun, extended: boolean): string {
   return "In Progress";
 }
 
-function statusCommand(run: LifecycleRun, reason: string, extended: boolean): Omit<
+function statusCommand(
+  run: LifecycleRun,
+  reason: string,
+  extended: boolean,
+  transitionSeq: number
+): Omit<
   LifecycleCommand,
   "state" | "attempts" | "createdAt" | "updatedAt" | "availableAt"
 > {
@@ -127,7 +136,7 @@ function statusCommand(run: LifecycleRun, reason: string, extended: boolean): Om
     .digest("hex")
     .slice(0, 12);
   return {
-    key: `${run.ticketId}:g${run.generation}:linear-status:${transitionId}`,
+    key: `${run.ticketId}:g${run.generation}:linear-status:t${transitionSeq}:${transitionId}`,
     ticketId: run.ticketId,
     kind: "linear-status",
     stage: run.stage,
@@ -185,7 +194,8 @@ export function applyDecision(
       statusCommand(
         projected,
         decision.transition.reason,
-        deps.extendedStatuses?.has(projected.project) ?? false
+        deps.extendedStatuses?.has(projected.project) ?? false,
+        deps.store.transitionCount(ticketId) + 1
       ),
       ...(progress ? [{
         key: progress.key,
@@ -668,16 +678,104 @@ export async function publishDraftPullRequest(
   return { prUrl, branch, sha };
 }
 
+export type LinearStateWriteResult =
+  | "written"
+  | "skipped-terminal"
+  | "skipped-noop"
+  | "skipped-superseded";
+
+function linearStatusTransitionSeq(key: string): number | undefined {
+  const matched = key.match(/:linear-status:t(\d+):/);
+  return matched ? Number(matched[1]) : undefined;
+}
+
+/**
+ * Jedyny korytarz zapisu stanu Linear w pollerze v2. Odczyt stanu jest
+ * wykonywany bezpośrednio przed mutacją, aby ludzka decyzja terminalna z
+ * poprzedniego cyklu wygrała także z już zakolejkowaną komendą outboxa.
+ *
+ * `claim=true` zachowuje prosty fallback claimu po typie stanu, a dla projektu
+ * extended wymusza dokładną nazwę fazy.
+ */
+export async function writeLinearState(
+  deps: PollerDependencies,
+  run: LifecycleRun,
+  state: string,
+  commandKey?: string,
+  claim = false
+): Promise<LinearStateWriteResult> {
+  const source = sourceFor(deps, run);
+  const currentState = await source.getStateName(run.ticketId);
+  const skipped = (result: Exclude<LinearStateWriteResult, "written">): LinearStateWriteResult => {
+    console.warn(
+      `[${run.ticketId}] linear-status ${result}: "${currentState}" → "${state}"`
+    );
+    return result;
+  };
+
+  if (isTerminalState(LINEAR_STATE_MAP, currentState)) {
+    return skipped("skipped-terminal");
+  }
+  if (currentState === state) return skipped("skipped-noop");
+
+  if (commandKey) {
+    const currentCommand = deps.store.getCommand(commandKey);
+    const currentSeq = linearStatusTransitionSeq(commandKey);
+    const newerPending = deps.store.outstandingCommands(10_000).some((candidate) => {
+      if (
+        candidate.key === commandKey ||
+        candidate.ticketId !== run.ticketId ||
+        candidate.kind !== "linear-status" ||
+        candidate.state !== "pending"
+      ) {
+        return false;
+      }
+      const candidateSeq = linearStatusTransitionSeq(candidate.key);
+      if (currentSeq !== undefined && candidateSeq !== undefined) {
+        return candidateSeq > currentSeq;
+      }
+      return !!currentCommand && (
+        candidate.createdAt > currentCommand.createdAt ||
+        (candidate.createdAt === currentCommand.createdAt && candidateSeq !== undefined)
+      );
+    });
+    if (newerPending) return skipped("skipped-superseded");
+  }
+
+  if (claim) {
+    await source.claim(
+      run.ticketId,
+      deps.extendedStatuses?.has(run.project) ? state : undefined
+    );
+  } else {
+    await source.setStateByName(run.ticketId, state);
+  }
+  return "written";
+}
+
 async function dispatchExternal(
   deps: PollerDependencies,
   command: LifecycleCommand,
   run: LifecycleRun
 ): Promise<void> {
   const source = sourceFor(deps, run);
-  const project = await getProject(run.project);
   if (command.kind === "linear-status") {
-    await source.setStateByName(run.ticketId, String(command.payload.state));
-  } else if (command.kind === "linear-comment") {
+    const result = await writeLinearState(
+      deps,
+      run,
+      String(command.payload.state),
+      command.key
+    );
+    deps.store.markCommand(
+      command.key,
+      "done",
+      result === "written" ? {} : { error: result }
+    );
+    return;
+  }
+
+  const project = await getProject(run.project);
+  if (command.kind === "linear-comment") {
     const requestedProgress = command.payload.progress;
     if (requestedProgress === "milestones" || requestedProgress === "verbose") {
       const configuredProgress = progressLevel(project);
@@ -1287,9 +1385,13 @@ async function processCommands(deps: PollerDependencies, run: LifecycleRun): Pro
 
 async function cancelActiveJobs(deps: PollerDependencies, ticketId: string): Promise<void> {
   for (const command of deps.store.outstandingCommands().filter(
-    (item) => item.ticketId === ticketId && item.kind === "run-job" && item.externalId
+    (item) =>
+      item.ticketId === ticketId &&
+      (item.kind === "run-job" || item.kind === "run-tests") &&
+      item.externalId
   )) {
-    await deps.mastra.cancelRun(command.externalId!).catch(() => {});
+    if (command.kind === "run-tests") killPidGroup(Number(command.externalId));
+    else await deps.mastra.cancelRun(command.externalId!).catch(() => {});
   }
 }
 
@@ -1322,22 +1424,21 @@ async function detectInputChange(
 }
 
 export async function reconcileRun(deps: PollerDependencies, run: LifecycleRun): Promise<void> {
-  await processCommands(deps, run);
   let current = deps.store.getRun(run.ticketId);
-  if (!current || current.status === "done") return;
-  current = await detectInputChange(deps, current);
+  if (!current) return;
   const source = sourceFor(deps, current);
   const linearState = await source.getStateName(current.ticketId).catch(() => undefined);
   if (linearState === "Canceled") {
-    const ticketId = current.ticketId;
-    for (const command of deps.store.outstandingCommands().filter((item) => item.ticketId === ticketId)) {
-      if (!command.externalId) continue;
-      if (command.kind === "run-tests") killPidGroup(Number(command.externalId));
-      else if (command.kind === "run-job") await deps.mastra.cancelRun(command.externalId).catch(() => {});
-    }
+    await cancelActiveJobs(deps, current.ticketId);
     applyDecision(deps, current.ticketId, reduceLifecycle(current, { type: "cancel" }));
     return;
   }
+  if (current.status === "done") return;
+
+  await processCommands(deps, current);
+  current = deps.store.getRun(run.ticketId);
+  if (!current || current.status === "done") return;
+  current = await detectInputChange(deps, current);
   if (linearState === "Done" && !current.mergedSha && current.planDomain !== "ops") {
     if (current.prUrl) {
       await reconcilePullRequest(deps, current);
@@ -1453,9 +1554,10 @@ async function claimReady(deps: PollerDependencies): Promise<void> {
     if (free <= 0) continue;
     const tickets = (await source.listReady()).slice(0, free);
     for (const ticket of tickets) {
+      const extended = deps.extendedStatuses?.has(projectKey) ?? false;
       const existing = deps.store.getRun(ticket.id);
       if (existing && existing.status !== "done") {
-        await source.claim(ticket.id);
+        await writeLinearState(deps, existing, statusName(existing, extended));
         continue;
       }
       const comments = await source.listComments(ticket.id);
@@ -1468,7 +1570,13 @@ async function claimReady(deps: PollerDependencies): Promise<void> {
         inputHash: snapshot.effectiveInputHash,
         commentContext: snapshot.context || undefined,
       });
-      await source.claim(ticket.id);
+      await writeLinearState(
+        deps,
+        run,
+        extended ? LINEAR_STATE_MAP.phases.planning : "In Progress",
+        undefined,
+        true
+      );
       // v3 deep-plan: wejściem jest triage, chyba że label plan:solo wymusza
       // klasyczną ścieżkę. Projekty bez planPipeline zostają na v2.
       const soloForced = ticket.labels.includes("plan:solo");
