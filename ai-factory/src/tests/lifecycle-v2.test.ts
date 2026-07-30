@@ -473,8 +473,11 @@ async function exerciseScopeCommand(
         approvedAt: "2026-07-30T09:55:00.000Z",
         blockedStage: "build",
         errorCode: "SCOPE_BLOCKED",
+        // Format 1:1 jak w factory-job.ts — marker audytu jest jedynym źródłem
+        // autoryzowalnych ścieżek (raport agenta powyżej nie jest zaufany).
         errorMessage:
-          "e2e/scripts/run-e2e.ts: chroniona ścieżka nie została zatwierdzona w planie",
+          "Raport buildera\n\nPublikacja zablokowana:\n" +
+          "- e2e/scripts/run-e2e.ts: chroniona ścieżka nie została zatwierdzona w planie",
       },
     });
     const source = {

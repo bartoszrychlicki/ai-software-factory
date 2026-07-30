@@ -77,7 +77,7 @@ import {
 } from "../pipeline/signature";
 import { progressComment, type ProgressCommentContext } from "../pipeline/progress";
 import { resolveRoute } from "../pipeline/routing";
-import { authorizeScopePaths, scopeBlockedPaths } from "../pipeline/scope";
+import { authorizeScopePaths, parseScopePaths, scopeBlockedPaths } from "../pipeline/scope";
 import { extendedStatusName, LINEAR_STATE_MAP } from "./state-map";
 
 const POLL_INTERVAL_MS = Number(process.env.FACTORY_POLL_INTERVAL_MS ?? 60_000);
@@ -1448,10 +1448,11 @@ async function applyScopeGrant(
   commentId: string,
   payload: string | undefined
 ): Promise<boolean> {
+  const blockedPaths = scopeBlockedPaths(run.errorMessage);
   const authorization = authorizeScopePaths(
-    payload?.split(/\s+/) ?? [],
+    parseScopePaths(payload, blockedPaths),
     run.planFiles,
-    scopeBlockedPaths(run.errorMessage)
+    blockedPaths
   );
   const rejected = authorization.rejected.map(({ path, reason }) =>
     `- \`${path || "(pusta ścieżka)"}\`: ${reason}`

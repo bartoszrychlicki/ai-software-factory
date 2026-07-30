@@ -253,12 +253,25 @@ function blocked(
       linearComment(
         run,
         `${stage}:${code}`,
-        `❌ **Proces zatrzymany (${stage})**\n\n${message}\n\nWznowienie tylko przez \`/retry\` albo \`/replan <powód>\`.`,
+        `❌ **Proces zatrzymany (${stage})**\n\n${message}\n\n${resumeHint(code)}`,
         stage,
         signature
       ),
     ],
   };
+}
+
+/**
+ * Blokada audytu zakresu ma własną, tańszą drogę wyjścia — bez tej wzmianki
+ * człowiek trafiający dokładnie na ten przypadek nie dowie się, że `/scope`
+ * istnieje, i zapłaci za pełne przeplanowanie.
+ */
+function resumeHint(code: string): string {
+  if (code === "SCOPE_BLOCKED") {
+    return "Wznowienie: `/scope <ścieżka>` (dopisujesz chronioną ścieżkę do zatwierdzonego planu " +
+      "i budowa rusza dalej), albo `/replan <powód>`.";
+  }
+  return "Wznowienie tylko przez `/retry` albo `/replan <powód>`.";
 }
 
 function blockedErrorMessage(report: string, errorCode: string | undefined): string {
@@ -271,9 +284,11 @@ function blockedErrorMessage(report: string, errorCode: string | undefined): str
   if (auditStart < 0) return report.slice(0, max);
 
   const auditReport = report.slice(auditStart);
-  if (auditReport.length >= max) return auditReport.slice(0, max);
   const separator = "\n\n[…] (środek raportu obcięty)\n\n";
   const prefixLength = max - auditReport.length - separator.length;
+  // Sam audyt wypełnia limit (albo zostaje na prefiks < 1 znak) → tylko audyt.
+  // Bez tego ujemny prefixLength liczyłby slice od końca i zwracał cały raport.
+  if (prefixLength <= 0) return auditReport.slice(0, max);
   return `${report.slice(0, prefixLength)}${separator}${auditReport}`;
 }
 
@@ -637,6 +652,9 @@ export function reduceLifecycle(run: LifecycleRun, event: CoordinatorEvent): Coo
       throw new Error(
         "/scope rozszerza zakres wyłącznie dla runu zatrzymanego przez audyt zakresu (SCOPE_BLOCKED)."
       );
+    }
+    if (!event.paths.length) {
+      throw new Error("/scope wymaga co najmniej jednej dokładnej ścieżki.");
     }
     const authorization = authorizeScopePaths(
       event.paths,

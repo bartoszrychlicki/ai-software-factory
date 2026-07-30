@@ -11,13 +11,18 @@ export interface ScopeAuthorization {
   rejected: { path: string; reason: string }[];
 }
 
+/**
+ * Autoryzowalne są WYŁĄCZNIE ścieżki z deterministycznej sekcji audytu.
+ * Brak markera = nic nie jest autoryzowalne (fail-closed): raport pisze agent,
+ * więc skanowanie całej jego treści pozwoliłoby mu samemu wskazać ścieżkę do
+ * odblokowania. Człowiekowi zostaje wtedy `/replan`.
+ */
 export function scopeBlockedPaths(report: string | undefined): string[] {
   if (!report) return [];
   const auditMarker = "Publikacja zablokowana:";
   const auditStart = report.lastIndexOf(auditMarker);
-  const auditReport = auditStart >= 0
-    ? report.slice(auditStart + auditMarker.length)
-    : report;
+  if (auditStart < 0) return [];
+  const auditReport = report.slice(auditStart + auditMarker.length);
   const paths = auditReport
     .split(/\r?\n/)
     .map((line) =>
@@ -29,6 +34,33 @@ export function scopeBlockedPaths(report: string | undefined): string[] {
     .map(normalize)
     .filter(Boolean);
   return [...new Set(paths)];
+}
+
+/**
+ * Rozbija payload komendy na kandydatów na ścieżki.
+ *
+ * Sam podział po białych znakach gubi pliki ze spacjami (`scripts/release
+ * candidate.sh`) — a takie ścieżki audyt potrafi zablokować, więc bez tego
+ * człowiek nie mógłby ich autoryzować w ogóle. Całą linię bierzemy WYŁĄCZNIE
+ * wtedy, gdy pasuje 1:1 do ścieżki zgłoszonej przez audyt; w pozostałych
+ * przypadkach zostaje stary, zachowawczy podział po spacjach.
+ */
+export function parseScopePaths(payload: string | undefined, blockedPaths: string[] = []): string[] {
+  if (!payload) return [];
+  const blocked = new Set(blockedPaths.map(normalize).filter(Boolean));
+  const paths: string[] = [];
+  for (const chunk of payload.split(/[\n,]+/)) {
+    const line = chunk.trim();
+    if (!line) continue;
+    if (blocked.has(normalize(line))) {
+      paths.push(line);
+      continue;
+    }
+    for (const token of line.split(/\s+/)) {
+      if (token) paths.push(token);
+    }
+  }
+  return paths;
 }
 
 /**

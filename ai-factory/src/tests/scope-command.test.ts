@@ -30,8 +30,11 @@ function scopeBlockedRun(patch: Partial<LifecycleRun> = {}): LifecycleRun {
     branch: "agent/BAR-190",
     blockedStage: "build",
     errorCode: "SCOPE_BLOCKED",
+    // Format 1:1 jak w factory-job.ts: raport agenta + deterministyczna sekcja
+    // audytu. Autoryzowalne są wyłącznie ścieżki spod markera.
     errorMessage:
-      "e2e/scripts/run-e2e.ts: chroniona ścieżka nie została zatwierdzona w planie",
+      "Raport buildera\n\nPublikacja zablokowana:\n" +
+      "- e2e/scripts/run-e2e.ts: chroniona ścieżka nie została zatwierdzona w planie",
     createdAt: "2026-07-30T10:00:00.000Z",
     updatedAt: "2026-07-30T10:01:00.000Z",
     ...patch,
@@ -229,4 +232,45 @@ test("parser i hint obsługują ścisłą komendę /scope", () => {
     }),
     /`\/retry`.*`\/replan <powód>`.*`\/scope <ścieżka>`/
   );
+});
+
+test("reduktor odrzuca /scope bez ścieżek zamiast restartować build po cichu", () => {
+  assert.throws(
+    () => reduceLifecycle(scopeBlockedRun(), { type: "scope", commentId: "c-1", paths: [] }),
+    /co najmniej jednej dokładnej ścieżki/
+  );
+});
+
+test("komunikat blokady audytu reklamuje /scope zamiast tylko /retry", () => {
+  const running = scopeBlockedRun({
+    status: "running",
+    stage: "build",
+    blockedStage: undefined,
+    errorCode: undefined,
+    errorMessage: undefined,
+  });
+  const decision = reduceLifecycle(running, {
+    type: "job-finished",
+    attempt: 1,
+    output: {
+      kind: "build",
+      outcome: "failed",
+      report:
+        "Raport buildera\n\nPublikacja zablokowana:\n" +
+        "- e2e/scripts/run-e2e.ts: chroniona ścieżka nie została zatwierdzona w planie",
+      errorCode: "SCOPE_BLOCKED",
+      signature: "builder",
+      durationMs: 1,
+      files: running.planFiles,
+      branch: running.branch,
+      workspaceDir: "/tmp/BAR-190",
+      headSha: "a".repeat(40),
+      changedFiles: ["e2e/scripts/run-e2e.ts"],
+      scopeWarnings: [],
+    },
+  });
+
+  const body = JSON.stringify(decision.commands);
+  assert.ok(body.includes("/scope <ścieżka>"), "komunikat musi wskazać /scope");
+  assert.ok(!body.includes("Wznowienie tylko przez"), "nie wolno mówić, że /scope nie istnieje");
 });
