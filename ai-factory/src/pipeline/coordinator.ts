@@ -12,6 +12,8 @@ import {
   BRIEF_CLIP_CHARS,
   clip,
   CRITIQUE_CLIP_CHARS,
+  FIX_HINTS_CLIP_CHARS,
+  REVIEW_CLIP_CHARS,
   type FactoryJobOutput,
 } from "./factory-job";
 
@@ -35,6 +37,7 @@ export type CoordinatorEvent =
   | { type: "ops-done"; commentId: string }
   | { type: "reject"; commentId: string; reason: string }
   | { type: "retry"; commentId: string; nextAttempt?: number; nextAttempts?: NextAttempts }
+  | { type: "fix"; commentId: string; hints?: string; nextAttempt?: number }
   | { type: "replan"; commentId: string; reason: string; nextAttempt?: number; nextAttempts?: NextAttempts }
   | { type: "input-changed"; inputHash: string; commentContext?: string; title?: string; description?: string; labels?: string[]; nextAttempt?: number; nextAttempts?: NextAttempts }
   | { type: "test-result"; ok: boolean; sha: string; report: string }
@@ -139,6 +142,8 @@ const PLAN_RESET_PATCH = {
   briefs: undefined,
   researchFailures: undefined,
   critiqueRound: 0,
+  reviewReport: undefined,
+  fixRound: 0,
   critiqueVerdict: undefined,
   critiqueReport: undefined,
   degradations: undefined,
@@ -521,6 +526,86 @@ export function reduceLifecycle(run: LifecycleRun, event: CoordinatorEvent): Coo
             ?? event.nextAttempt ?? 1,
           { feedback: event.reason }
         ),
+      ],
+    };
+  }
+
+  if (event.type === "fix") {
+    if (run.mergedSha) {
+      throw new Error("PR jest już zmergowany — praca jest w main; /fix nic nie poprawi.");
+    }
+    if (run.stage !== "merge" || run.status !== "waiting_human") {
+      throw new Error(
+        `/fix działa wyłącznie na bramce merge (etap ${run.stage}, status ${run.status}).`
+      );
+    }
+    if (run.reviewStatus !== "advisory-fix") {
+      throw new Error(
+        `Review dało \`${run.reviewStatus ?? "brak werdyktu"}\` — nie ma uwag do poprawki.`
+      );
+    }
+    if (run.fixRound >= 2) {
+      throw new Error(
+        "Wyczerpano 2/2 poprawki w tej generacji; dalsza korekta wymaga /replan <powód>."
+      );
+    }
+    if (
+      !run.reviewReport?.trim() ||
+      !run.prUrl ||
+      !run.headSha ||
+      !run.branch ||
+      !run.plan
+    ) {
+      throw new Error("Brak raportu review dla bieżącego head SHA — /fix nie ma wejścia.");
+    }
+
+    const round = run.fixRound + 1;
+    const feedback = [
+      [
+        "# Instrukcja",
+        "Poprawiaj wyłącznie w granicach zatwierdzonego planu; nie rozszerzaj zakresu.",
+        "Nie zmieniaj plików spoza planu, nie refaktoruj przy okazji.",
+        "Uwagi review są advisory — oceń każdą i odrzuć w raporcie tę, która jest błędna.",
+      ].join("\n"),
+      `# Uwagi review do naprawy (runda ${round}/2)`,
+      clip(run.reviewReport, REVIEW_CLIP_CHARS),
+      event.hints?.trim()
+        ? `# Dodatkowe wskazówki człowieka\n${clip(event.hints.trim(), FIX_HINTS_CLIP_CHARS)}`
+        : "",
+    ].filter(Boolean).join("\n\n");
+    const prBody =
+      `🔧 Poprawka po review (runda ${round}/2) — inicjowana przez człowieka`;
+
+    return {
+      transition: {
+        stage: "build",
+        status: "running",
+        actor: "human",
+        reason: `/fix ${event.commentId}: fix-after-review`,
+        patch: {
+          fixRound: round,
+          feedback,
+          blockedStage: undefined,
+          errorCode: undefined,
+          errorMessage: undefined,
+        },
+      },
+      commands: [
+        jobCommand(
+          run,
+          "build",
+          "build",
+          event.nextAttempt ?? 1,
+          { feedback, headSha: run.headSha },
+          `:fix:${event.commentId}`
+        ),
+        {
+          key: key(run, `pr-comment:fix:${round}`),
+          ticketId: run.ticketId,
+          kind: "comment-pr",
+          stage: "merge",
+          payload: { prUrl: run.prUrl, body: prBody, outcome: "fix-dispatched" },
+        },
       ],
     };
   }
@@ -1059,7 +1144,10 @@ export function reduceLifecycle(run: LifecycleRun, event: CoordinatorEvent): Coo
         status: "waiting_human",
         actor: "reviewer",
         reason: event.output.reviewVerdict ?? "advisory-review",
-        patch: { reviewStatus: event.output.reviewVerdict ?? "unavailable" },
+        patch: {
+          reviewStatus: event.output.reviewVerdict ?? "unavailable",
+          reviewReport: clip(event.output.report, REVIEW_CLIP_CHARS),
+        },
       },
       commands: [
         {

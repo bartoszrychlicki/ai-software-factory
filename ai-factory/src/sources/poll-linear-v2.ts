@@ -70,7 +70,11 @@ import { execFileControlled } from "../pipeline/process-control";
 import { evaluateGithubChecks, inspectPullRequestChecks } from "../pipeline/github-ci";
 import { runProdChecks } from "../pipeline/prod-smoke";
 import { notify } from "../pipeline/notify";
-import { parseSignatureLine, POLLER_SIGNATURE } from "../pipeline/signature";
+import {
+  parseSignatureLine,
+  POLLER_SIGNATURE,
+  signatureLine,
+} from "../pipeline/signature";
 import { progressComment, type ProgressCommentContext } from "../pipeline/progress";
 import { resolveRoute } from "../pipeline/routing";
 import { extendedStatusName, LINEAR_STATE_MAP } from "./state-map";
@@ -803,13 +807,17 @@ async function dispatchExternal(
       deps.store.markCommand(command.key, "done");
       return;
     }
+    const signature = command.payload.signature
+      ?? deps.store.latestAttempt(run.ticketId, "build")?.signature
+      ?? signatureLine(POLLER_SIGNATURE);
+    const outcome = command.payload.outcome ?? run.reviewStatus ?? "advisory";
     const body = [
       String(command.payload.body),
       "",
-      `Signature: ${String(command.payload.signature)}`,
+      `Signature: ${String(signature)}`,
       `Ticket: ${run.ticketId}`,
       `SHA: ${run.headSha}`,
-      `Outcome: ${run.reviewStatus ?? "advisory"}`,
+      `Outcome: ${String(outcome)}`,
       tag,
     ].join("\n");
     await execFileControlled(
@@ -1376,7 +1384,13 @@ async function reconcilePullRequest(deps: PollerDependencies, run: LifecycleRun)
       state: "closed",
       sha: pr.headRefOid ?? run.headSha ?? "",
     }));
-  } else if (pr.headRefOid && pr.headRefOid !== run.headSha) {
+  } else if (
+    pr.headRefOid &&
+    pr.headRefOid !== run.headSha &&
+    ["ci", "review", "merge"].includes(run.stage)
+  ) {
+    // W build/test/publish lokalny pipeline jest z przodu: świeży checkpoint
+    // nie został jeszcze wypchnięty, więc źródłem prawdy nie jest stary PR head.
     await cancelActiveJobs(deps, run.ticketId);
     applyDecision(deps, run.ticketId, reduceLifecycle(run, {
       type: "pr-head-changed",
@@ -1445,6 +1459,9 @@ function enqueueUnknownCommandHint(
         blockedStage: run.blockedStage,
         planDomain: run.planDomain,
         approvedAt: run.approvedAt,
+        reviewStatus: run.reviewStatus,
+        fixRound: run.fixRound,
+        mergedSha: run.mergedSha,
       }),
     },
   });
@@ -1487,6 +1504,14 @@ async function processCommands(deps: PollerDependencies, run: LifecycleRun): Pro
           ? deps.store.nextAttempt(run.ticketId, attemptStage)
           : undefined,
         nextAttempts: followUpAttempts(deps.store, run.ticketId),
+      };
+    }
+    else if (parsed.kind === "fix") {
+      event = {
+        type: "fix",
+        commentId: comment.id,
+        hints: parsed.payload,
+        nextAttempt: deps.store.nextAttempt(run.ticketId, "build"),
       };
     }
     else if (parsed.kind === "replan" || parsed.kind === "restart") event = {

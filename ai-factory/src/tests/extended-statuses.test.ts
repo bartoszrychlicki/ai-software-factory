@@ -46,6 +46,7 @@ function runAt(
     planFiles: [],
     clarifyRound: 0,
     critiqueRound: 0,
+    fixRound: 0,
     createdAt: "2026-07-29T10:00:00.000Z",
     updatedAt: "2026-07-29T10:00:00.000Z",
     ...patch,

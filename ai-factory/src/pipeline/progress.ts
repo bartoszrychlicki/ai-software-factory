@@ -68,6 +68,15 @@ function milestoneComment(
     };
   }
 
+  if (reason.startsWith("/fix")) {
+    return {
+      body:
+        `🔧 **Poprawka po review (runda ${after.fixRound}/2) — inicjowana przez człowieka.** ` +
+        "Ten sam plan i branch; po buildzie testy exact-SHA i ponowne review.",
+      level: "milestones",
+    };
+  }
+
   if (
     reason.startsWith("/approve") &&
     before.stage === "approval" &&

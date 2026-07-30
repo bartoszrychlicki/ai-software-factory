@@ -114,6 +114,8 @@ export const JOB_BUDGET_MINUTES = {
 /** Twarde clipy tekstów przekazywanych między jobami (lekcja E2BIG, BAR-91). */
 export const BRIEF_CLIP_CHARS = 24_000;
 export const CRITIQUE_CLIP_CHARS = 6_000;
+export const REVIEW_CLIP_CHARS = 8_000;
+export const FIX_HINTS_CLIP_CHARS = 2_000;
 
 export function clip(text: string | undefined, max: number): string | undefined {
   if (!text) return undefined;

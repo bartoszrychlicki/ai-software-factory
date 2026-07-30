@@ -88,6 +88,8 @@ export interface LifecycleRun {
   prUrl?: string;
   mergedSha?: string;
   reviewStatus?: "pending" | "running" | "lgtm" | "advisory-fix" | "unavailable";
+  /** Raport review dla bieżącego head SHA (clipowany) — wejście świadomego `/fix`. */
+  reviewReport?: string;
   smokeStatus?: "pending" | "pass" | "fail" | "skipped-not-configured";
   blockedStage?: LifecycleStage;
   errorCode?: string;
@@ -105,6 +107,8 @@ export interface LifecycleRun {
   researchFailures?: Partial<Record<ResearchRole, number>>;
   /** Ile rewizji syntezy po krytyce już było (limit: 1). */
   critiqueRound: number;
+  /** Ile poprawek `/fix` po review było w tej generacji (limit: 2). */
+  fixRound: number;
   critiqueVerdict?: "ok" | "issues" | "unavailable";
   /** Treść uwag krytyka (clipowana) — sekcja komentarza bramki i kontekst reviewera. */
   critiqueReport?: string;
@@ -350,6 +354,8 @@ export class LifecycleStore {
       briefs_json: "TEXT",
       research_failures_json: "TEXT",
       critique_round: "INTEGER NOT NULL DEFAULT 0",
+      review_report: "TEXT",
+      fix_round: "INTEGER NOT NULL DEFAULT 0",
       critique_verdict: "TEXT",
       critique_report: "TEXT",
       degradations_json: "TEXT",
@@ -395,6 +401,7 @@ export class LifecycleStore {
         planFiles: [],
         clarifyRound: 0,
         critiqueRound: 0,
+        fixRound: 0,
         createdAt: timestamp,
         updatedAt: timestamp,
       };
@@ -421,6 +428,7 @@ export class LifecycleStore {
           pr_url=NULL,
           merged_sha=NULL,
           review_status=NULL,
+          review_report=NULL,
           smoke_status=NULL,
           blocked_stage=NULL,
           error_code=NULL,
@@ -432,6 +440,7 @@ export class LifecycleStore {
           briefs_json=NULL,
           research_failures_json=NULL,
           critique_round=0,
+          fix_round=0,
           critique_verdict=NULL,
           critique_report=NULL,
           degradations_json=NULL,
@@ -909,10 +918,10 @@ export class LifecycleStore {
         project=?, generation=?, stage=?, status=?, manifest_json=?, plan=?,
         plan_files_json=?, plan_domain=?, clarify_round=?, approved_at=?,
         branch=?, workspace_dir=?, head_sha=?, tested_sha=?, pr_url=?,
-        merged_sha=?, review_status=?, smoke_status=?, blocked_stage=?,
+        merged_sha=?, review_status=?, review_report=?, smoke_status=?, blocked_stage=?,
         error_code=?, error_message=?, feedback=?,
         plan_entry=?, plan_variant=?, triage_summary=?, briefs_json=?,
-        research_failures_json=?, critique_round=?, critique_verdict=?,
+        research_failures_json=?, critique_round=?, fix_round=?, critique_verdict=?,
         critique_report=?, degradations_json=?, score=?, score_comment=?,
         scored_at=?, updated_at=?
       WHERE ticket_id=?
@@ -934,6 +943,7 @@ export class LifecycleStore {
       run.prUrl ?? null,
       run.mergedSha ?? null,
       run.reviewStatus ?? null,
+      run.reviewReport ?? null,
       run.smokeStatus ?? null,
       run.blockedStage ?? null,
       run.errorCode ?? null,
@@ -945,6 +955,7 @@ export class LifecycleStore {
       run.briefs ? json(run.briefs) : null,
       run.researchFailures ? json(run.researchFailures) : null,
       run.critiqueRound,
+      run.fixRound,
       run.critiqueVerdict ?? null,
       run.critiqueReport ?? null,
       run.degradations?.length ? json(run.degradations) : null,
@@ -981,6 +992,7 @@ export class LifecycleStore {
       prUrl: row.pr_url == null ? undefined : String(row.pr_url),
       mergedSha: row.merged_sha == null ? undefined : String(row.merged_sha),
       reviewStatus: row.review_status == null ? undefined : String(row.review_status) as LifecycleRun["reviewStatus"],
+      reviewReport: row.review_report == null ? undefined : String(row.review_report),
       smokeStatus: row.smoke_status == null ? undefined : String(row.smoke_status) as LifecycleRun["smokeStatus"],
       blockedStage: row.blocked_stage == null ? undefined : String(row.blocked_stage) as LifecycleStage,
       errorCode: row.error_code == null ? undefined : String(row.error_code),
@@ -996,6 +1008,7 @@ export class LifecycleStore {
         ? undefined
         : parseJson<Partial<Record<ResearchRole, number>>>(row.research_failures_json, {}),
       critiqueRound: Number(row.critique_round ?? 0),
+      fixRound: Number(row.fix_round ?? 0),
       critiqueVerdict: row.critique_verdict == null
         ? undefined
         : String(row.critique_verdict) as LifecycleRun["critiqueVerdict"],

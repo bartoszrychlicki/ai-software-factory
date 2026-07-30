@@ -129,6 +129,49 @@ test("hint obejmuje checklistę ops, score po Done i stan bez otwartej bramki", 
   );
 });
 
+test("hint bramki merge rozróżnia aktywny /fix, limit, lgtm i stan po merge", () => {
+  const available = unknownCommandHint({
+    firstToken: "/fiz",
+    stage: "merge",
+    status: "waiting_human",
+    reviewStatus: "advisory-fix",
+    fixRound: 1,
+  });
+  assert.match(available, /`\/fix \[wskazówki\]` \(poprawka 2\/2\)/);
+  assert.match(available, /`\/replan <powód>`.*`\/score 1-5`/);
+
+  const exhausted = unknownCommandHint({
+    firstToken: "/fiz",
+    stage: "merge",
+    status: "waiting_human",
+    reviewStatus: "advisory-fix",
+    fixRound: 2,
+  });
+  assert.match(exhausted, /Limit `\/fix` wyczerpany \(2\/2\)/);
+  assert.doesNotMatch(exhausted, /`\/fix \[wskazówki\]`/);
+
+  const lgtm = unknownCommandHint({
+    firstToken: "/fiz",
+    stage: "merge",
+    status: "waiting_human",
+    reviewStatus: "lgtm",
+    fixRound: 0,
+  });
+  assert.match(lgtm, /Review: lgtm — `\/fix` niedostępny/);
+  assert.match(lgtm, /Merge robisz w GitHubie/);
+
+  const merged = unknownCommandHint({
+    firstToken: "/fiz",
+    stage: "merge",
+    status: "waiting_human",
+    reviewStatus: "advisory-fix",
+    fixRound: 0,
+    mergedSha: "a".repeat(40),
+  });
+  assert.match(merged, /PR zmergowany.*`\/score 1-5`/);
+  assert.doesNotMatch(merged, /`\/fix \[wskazówki\]`/);
+});
+
 test("isCommandAttempt odróżnia ścisły token komendy od treści i ścieżek", () => {
   assert.equal(isCommandAttempt("/anwser cokolwiek"), true);
   assert.equal(isCommandAttempt("  /approve tak"), true);

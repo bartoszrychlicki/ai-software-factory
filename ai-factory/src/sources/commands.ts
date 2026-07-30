@@ -1,6 +1,6 @@
 import type { DecisionKind } from "../pipeline/run-registry";
 
-export type OperatorCommandKind = "retry" | "replan" | "restart" | "score";
+export type OperatorCommandKind = "retry" | "replan" | "restart" | "fix" | "score";
 export type CommandKind = DecisionKind | OperatorCommandKind;
 
 /**
@@ -20,6 +20,7 @@ export const COMMANDS: Record<string, CommandKind> = {
   "/retry": "retry",
   "/replan": "replan",
   "/restart": "restart",
+  "/fix": "fix",
   "/score": "score",
 };
 
@@ -36,6 +37,9 @@ export interface UnknownCommandContext {
   blockedStage?: string;
   planDomain?: string;
   approvedAt?: string;
+  reviewStatus?: string;
+  fixRound?: number;
+  mergedSha?: string;
 }
 
 const DECISION_COMMANDS = new Set<DecisionKind>(["start", "approve", "reject", "answer", "done"]);
@@ -111,6 +115,27 @@ export function unknownCommandHint(input: UnknownCommandContext): string {
     input.status === "waiting_human"
   ) {
     return `${prefix} Dostępne teraz: \`/answer <odpowiedzi>\`.`;
+  }
+  if (input.stage === "merge" && input.status === "waiting_human") {
+    if (input.mergedSha) {
+      return `${prefix} PR zmergowany; dostępne: \`/score 1-5\`.`;
+    }
+    if (input.reviewStatus === "advisory-fix" && (input.fixRound ?? 0) < 2) {
+      return (
+        `${prefix} Dostępne teraz: \`/fix [wskazówki]\` ` +
+        `(poprawka ${(input.fixRound ?? 0) + 1}/2), \`/replan <powód>\`, \`/score 1-5\`.`
+      );
+    }
+    if (input.reviewStatus === "advisory-fix") {
+      return (
+        `${prefix} Limit \`/fix\` wyczerpany (2/2); dostępne: ` +
+        "`/replan <powód>`, `/score 1-5`."
+      );
+    }
+    return (
+      `${prefix} Review: ${input.reviewStatus ?? "brak werdyktu"} — \`/fix\` niedostępny. ` +
+      "Dostępne: `/replan <powód>`, `/score 1-5`. Merge robisz w GitHubie."
+    );
   }
   return (
     `${prefix} Żadna komenda decyzyjna nie jest teraz otwarta; ` +
