@@ -28,6 +28,15 @@ export interface ParsedCommand {
   payload?: string;
 }
 
+export interface UnknownCommandContext {
+  firstToken: string;
+  stage: string;
+  status: string;
+  blockedStage?: string;
+  planDomain?: string;
+  approvedAt?: string;
+}
+
 const DECISION_COMMANDS = new Set<DecisionKind>(["start", "approve", "reject", "answer", "done"]);
 
 export function isDecisionCommand(kind: CommandKind): kind is DecisionKind {
@@ -47,6 +56,49 @@ export function parseCommand(body: string): ParsedCommand | undefined {
   // /score wymaga oceny 1-5 jako pierwszego tokenu payloadu; reszta = komentarz.
   if (kind === "score" && !/^[1-5](\s|$)/.test(payload)) return undefined;
   return { kind, payload: payload || undefined };
+}
+
+/**
+ * Wąska klasyfikacja próby komendy: pierwszy token musi wyglądać jak
+ * `/slowo` lub `/slowo-zlozone`. Ścieżki (np. `/src/x.ts`) pozostają treścią.
+ */
+export function isCommandAttempt(body: string): boolean {
+  const [firstToken = ""] = body.trim().split(/\s+/);
+  return /^\/[a-z][a-z-]*$/i.test(firstToken);
+}
+
+/** Podpowiedź dla ścisłej, ale nierozpoznanej próby komendy. */
+export function unknownCommandHint(input: UnknownCommandContext): string {
+  const [firstToken = input.firstToken.trim()] = input.firstToken.trim().split(/\s+/);
+  const prefix = `ℹ️ Nieznana komenda \`${firstToken}\`.`;
+
+  if (input.status === "done") {
+    return `${prefix} Dostępne teraz: \`/score 1-5 [komentarz]\`.`;
+  }
+  if (input.status === "blocked") {
+    return `${prefix} Dostępne teraz: \`/retry\`, \`/replan <powód>\`.`;
+  }
+  if (
+    input.stage === "approval" &&
+    input.status === "waiting_human" &&
+    input.planDomain === "ops" &&
+    input.approvedAt
+  ) {
+    return `${prefix} Dostępne teraz: \`/done\`.`;
+  }
+  if (input.stage === "approval" && input.status === "waiting_human") {
+    return `${prefix} Dostępne teraz: \`/approve\`, \`/reject <powód>\`.`;
+  }
+  if (
+    (input.stage === "plan" || input.stage === "triage" || input.stage === "synthesis") &&
+    input.status === "waiting_human"
+  ) {
+    return `${prefix} Dostępne teraz: \`/answer <odpowiedzi>\`.`;
+  }
+  return (
+    `${prefix} Żadna komenda decyzyjna nie jest teraz otwarta; ` +
+    "komentarz nie został potraktowany jako komenda."
+  );
 }
 
 export interface ParsedScore {

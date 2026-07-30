@@ -50,6 +50,24 @@ function milestoneComment(
   reason: string,
   context: ProgressCommentContext
 ): ProgressDraft | undefined {
+  if (reason === "input-changed-before-build") {
+    return {
+      body:
+        `🔁 **Wykryto edycję treści/nowy komentarz — planuję od nowa ` +
+        `(generacja ${after.generation}).** Twój komentarz jest w kontekście plannera.`,
+      level: "milestones",
+    };
+  }
+
+  if (reason.startsWith("/replan")) {
+    return {
+      body:
+        `🔁 **\`/replan\` przyjęty → planowanie startuje od nowa ` +
+        `(generacja ${after.generation}).**`,
+      level: "milestones",
+    };
+  }
+
   if (
     reason.startsWith("/approve") &&
     before.stage === "approval" &&
@@ -159,13 +177,6 @@ function verboseComment(
   if (reason.startsWith("/retry")) {
     return {
       body: `🔁 **\`/retry\` przyjęty → ponawiam etap ${after.stage}.**`,
-      level: "verbose",
-    };
-  }
-
-  if (reason.startsWith("/replan")) {
-    return {
-      body: `🧭 **\`/replan\` przyjęty → planowanie startuje od nowa (generacja ${after.generation}).**`,
       level: "verbose",
     };
   }

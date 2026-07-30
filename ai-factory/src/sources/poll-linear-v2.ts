@@ -21,7 +21,12 @@ import { hostname } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { buildCommentContextSnapshot } from "./comment-context";
-import { parseCommand, parseScorePayload } from "./commands";
+import {
+  isCommandAttempt,
+  parseCommand,
+  parseScorePayload,
+  unknownCommandHint,
+} from "./commands";
 import { LinearSource } from "./linear";
 import {
   isWorkflowRunMissing,
@@ -1180,13 +1185,41 @@ async function recordScore(
   ).catch(() => {});
 }
 
+function enqueueUnknownCommandHint(
+  deps: PollerDependencies,
+  run: LifecycleRun,
+  comment: { id: string; body: string }
+): void {
+  const [firstToken = comment.body.trim()] = comment.body.trim().split(/\s+/);
+  deps.store.enqueue({
+    key: `${run.ticketId}:g${run.generation}:unknown-command:${comment.id}`,
+    ticketId: run.ticketId,
+    kind: "linear-comment",
+    stage: run.stage,
+    payload: {
+      body: unknownCommandHint({
+        firstToken,
+        stage: run.stage,
+        status: run.status,
+        blockedStage: run.blockedStage,
+        planDomain: run.planDomain,
+        approvedAt: run.approvedAt,
+      }),
+    },
+  });
+  deps.store.markCommentProcessed(run.ticketId, comment.id, "unknown-command");
+}
+
 async function processCommands(deps: PollerDependencies, run: LifecycleRun): Promise<void> {
   const source = sourceFor(deps, run);
   const comments = await source.listComments(run.ticketId);
   for (const comment of comments) {
     if (deps.store.isCommentProcessed(comment.id) || comment.body.includes(marker(run.ticketId))) continue;
     const parsed = parseCommand(comment.body);
-    if (!parsed) continue;
+    if (!parsed) {
+      if (isCommandAttempt(comment.body)) enqueueUnknownCommandHint(deps, run, comment);
+      continue;
+    }
     if (parsed.kind === "score") {
       await recordScore(deps, run, source, comment.id, parsed.payload);
       continue;
@@ -1463,6 +1496,10 @@ export async function sweepScores(deps: PollerDependencies): Promise<void> {
     for (const comment of comments) {
       if (deps.store.isCommentProcessed(comment.id) || comment.body.includes(marker(run.ticketId))) continue;
       const parsed = parseCommand(comment.body);
+      if (!parsed && isCommandAttempt(comment.body)) {
+        enqueueUnknownCommandHint(deps, run, comment);
+        continue;
+      }
       if (parsed?.kind !== "score") continue;
       await recordScore(deps, run, source, comment.id, parsed.payload);
       break;
