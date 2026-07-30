@@ -115,6 +115,10 @@ decyzją workflow.
 - `/answer <odpowiedź>` — odpowiada na pytania plannera (maks. dwie rundy;
   rundę 1 może zadać triage, rundę 2 synteza);
 - `/retry` — ponawia wyłącznie zatrzymany etap;
+- `/fix [wskazówki]` — uruchamia poprawkę buildera według uwag review bez
+  utraty planu i brancha; wyłącznie na bramce merge przy werdykcie
+  `advisory-fix`, maks. dwa razy na generację, potem wymagane jest
+  `/replan <powód>`;
 - `/replan <powód>` — unieważnia plan i tworzy nową generację;
 - `/restart` — tymczasowy alias `/replan`;
 - `/done` — potwierdza ręczne wykonanie zatwierdzonej checklisty ops;
@@ -176,9 +180,12 @@ do odczytu/testów migracji, ale nie są podpięte do runtime.
 - Każda zmiana PR head SHA unieważnia test/CI i uruchamia scope audit + testy
   nowego SHA, nigdy pełny rebuild.
 - Review AI jest advisory i może ponowić wyłącznie review raz. Nigdy nie odpala
-  buildera. Reviewer nigdy nie jest tym samym silnikiem co builder
-  (`review.diverse` w routing.yaml), a `mark-pr-ready` wychodzi dopiero PO
-  werdykcie — komentarz recenzenta istnieje zanim PR opuści draft.
+  buildera samo z siebie. Jedyną drogą od uwag `advisory-fix` do poprawki jest
+  świadoma komenda człowieka `/fix [wskazówki]`; zachowuje ona zatwierdzony
+  plan i branch, a po dwóch rundach w generacji wymaga `/replan <powód>`.
+  Reviewer nigdy nie jest tym samym silnikiem co builder (`review.diverse`
+  w routing.yaml), a `mark-pr-ready` wychodzi dopiero PO werdykcie — komentarz
+  recenzenta istnieje zanim PR opuści draft.
 - `Done` dla ticketu kodowego wymaga merge dokładnie śledzonego PR-a. Smoke FAIL
   blokuje już zmergowany ticket bez automatycznego rollbacku.
 - Budżet jest wspólny dla wszystkich krótkich jobów ticketu; koszt liczy się

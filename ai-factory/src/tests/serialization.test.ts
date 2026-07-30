@@ -13,6 +13,7 @@ function makeRun(overrides: Partial<LifecycleRun> & { ticketId: string }): Lifec
     planFiles: [],
     clarifyRound: 0,
     critiqueRound: 0,
+    fixRound: 0,
     approvedAt: "2026-07-29T10:00:00Z",
     createdAt: "2026-07-29T09:00:00Z",
     updatedAt: "2026-07-29T09:00:00Z",

@@ -41,6 +41,7 @@ function runAt(
     planFiles: ["src/a.ts", "src/b.ts"],
     clarifyRound: 0,
     critiqueRound: 0,
+    fixRound: 0,
     createdAt: "2026-07-29T10:00:00.000Z",
     updatedAt: "2026-07-29T10:00:00.000Z",
     ...patch,
@@ -177,6 +178,19 @@ test("input-changed i /replan emitują idempotentny milestone nowej generacji", 
   assert.equal(replan?.level, "milestones");
   assert.match(replan!.body, /`\/replan` przyjęty/);
   assert.match(replan!.body, /generacja 2/);
+});
+
+test("/fix emituje milestone z rundą i zachowaniem planu oraz brancha", () => {
+  const fix = progressComment(
+    runAt("merge", "waiting_human", { fixRound: 0 }),
+    runAt("build", "running", { fixRound: 1 }),
+    "/fix comment-fix-1"
+  );
+
+  assert.equal(fix?.level, "milestones");
+  assert.match(fix!.body, /`\/fix` przyjęty/);
+  assert.match(fix!.body, /runda 1\/2/);
+  assert.match(fix!.body, /Plan i branch bez zmian/);
 });
 
 test("applyDecision zapisuje 7 idempotentnych kluczy progress i nie dubluje merge po restarcie", () => {

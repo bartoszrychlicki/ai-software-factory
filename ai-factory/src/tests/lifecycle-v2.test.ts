@@ -208,6 +208,7 @@ test("test FAIL zachowuje checkpoint, a /retry uruchamia wyłącznie buildera na
     planFiles: ["src/a.ts"],
     clarifyRound: 0,
     critiqueRound: 0,
+    fixRound: 0,
     branch: "agent/BAR-T3",
     headSha: "c".repeat(40),
     createdAt: "2026-01-01T00:00:00Z",
@@ -237,6 +238,7 @@ test("zmiana inputu przed buildem replanuje z nową generacją, po buildzie blok
     planFiles: ["a"],
     clarifyRound: 0,
     critiqueRound: 0,
+    fixRound: 0,
     createdAt: "x",
     updatedAt: "x",
   };
@@ -493,6 +495,7 @@ test("brak werdyktu review ponawia tylko review raz w generacji, niezależnie od
     planFiles: [],
     clarifyRound: 0,
     critiqueRound: 0,
+    fixRound: 0,
     headSha: "d".repeat(40),
     prUrl: "https://github.com/o/r/pull/5",
     createdAt: "x",
@@ -532,6 +535,7 @@ test("komentarze wynikające z joba zachowują podpis jego faktycznej roli", () 
     planFiles: [],
     clarifyRound: 0,
     critiqueRound: 0,
+    fixRound: 0,
     createdAt: "x",
     updatedAt: "x",
   };
@@ -659,7 +663,130 @@ test("ścisłe komendy odrzucają brak wymaganej treści i nadmiarowe argumenty"
     kind: "restart",
     payload: "stary klient",
   });
+  assert.deepEqual(parseCommand("/fix"), { kind: "fix", payload: undefined });
+  assert.deepEqual(parseCommand("/fix popraw oba race condition"), {
+    kind: "fix",
+    payload: "popraw oba race condition",
+  });
   assert.equal(parseCommand("/replan"), undefined);
+});
+
+function reviewFixRun(patch: Partial<LifecycleRun> = {}): LifecycleRun {
+  return {
+    ticketId: "BAR-FIX",
+    project: "br-factory",
+    generation: 4,
+    stage: "merge",
+    status: "waiting_human",
+    manifest,
+    plan: "zatwierdzony plan",
+    planFiles: ["src/a.ts", "src/b.ts"],
+    clarifyRound: 0,
+    critiqueRound: 0,
+    fixRound: 0,
+    branch: "agent/BAR-FIX-lifecycle-v2",
+    workspaceDir: "/tmp/BAR-FIX",
+    headSha: "a".repeat(40),
+    testedSha: "a".repeat(40),
+    prUrl: "https://github.test/o/r/pull/191",
+    reviewStatus: "advisory-fix",
+    createdAt: "x",
+    updatedAt: "x",
+    ...patch,
+  };
+}
+
+test("/fix zachowuje plan, branch i generację oraz przekazuje review z podpowiedzią do buildera", () => {
+  const run = reviewFixRun();
+  const decision = reduceLifecycle(run, {
+    type: "fix",
+    commentId: "comment-fix-1",
+    hints: "Najpierw zabezpiecz hash.",
+    reviewReport: "BUG: hash nie obejmuje executedCommandIds.",
+    reviewSha: run.headSha,
+    nextAttempt: 7,
+  });
+  const after = {
+    ...run,
+    ...decision.transition.patch,
+    stage: decision.transition.stage,
+    status: decision.transition.status,
+  };
+  const build = decision.commands.find((command) =>
+    command.kind === "run-job" && command.payload.kind === "build"
+  );
+  const prComment = decision.commands.find((command) => command.kind === "comment-pr");
+
+  assert.deepEqual([after.stage, after.status], ["build", "running"]);
+  assert.equal(after.generation, run.generation);
+  assert.equal(after.plan, run.plan);
+  assert.deepEqual(after.planFiles, run.planFiles);
+  assert.equal(after.branch, run.branch);
+  assert.equal(after.fixRound, 1);
+  assert.equal(after.reviewStatus, "pending");
+  assert.equal(decision.transition.incrementGeneration, undefined);
+  assert.equal(build?.payload.attempt, 7);
+  assert.equal(build?.payload.plan, run.plan);
+  assert.deepEqual(build?.payload.planFiles, run.planFiles);
+  assert.equal(build?.payload.headSha, run.headSha);
+  assert.match(String(build?.payload.feedback), /hash nie obejmuje executedCommandIds/);
+  assert.match(String(build?.payload.feedback), /Najpierw zabezpiecz hash/);
+  assert.match(String(build?.key), /:fix:comment-fix-1$/);
+  assert.match(String(prComment?.payload.body), /runda 1\/2/);
+  assert.match(String(prComment?.payload.body), /inicjowana przez człowieka/);
+});
+
+test("/fix odmawia bez advisory-fix i poza bramką merge", () => {
+  assert.throws(
+    () => reduceLifecycle(reviewFixRun({ reviewStatus: "lgtm" }), {
+      type: "fix",
+      commentId: "comment-lgtm",
+      reviewReport: "LGTM",
+    }),
+    /Review nie zgłosiło uwag.*\/fix jest niedostępny/
+  );
+  assert.throws(
+    () => reduceLifecycle(reviewFixRun({ stage: "review", status: "running" }), {
+      type: "fix",
+      commentId: "comment-review",
+      reviewReport: "BUG",
+    }),
+    /wyłącznie na bramce merge/
+  );
+});
+
+test("/fix ma limit dwóch rund w generacji i odsyła do /replan", () => {
+  const first = reduceLifecycle(reviewFixRun(), {
+    type: "fix",
+    commentId: "comment-fix-1",
+    reviewReport: "BUG 1",
+  });
+  assert.equal(first.transition.patch?.fixRound, 1);
+
+  const secondRun = reviewFixRun({ fixRound: 1 });
+  const second = reduceLifecycle(secondRun, {
+    type: "fix",
+    commentId: "comment-fix-2",
+    reviewReport: "BUG 2",
+  });
+  assert.equal(second.transition.patch?.fixRound, 2);
+
+  assert.throws(
+    () => reduceLifecycle(reviewFixRun({ fixRound: 2 }), {
+      type: "fix",
+      commentId: "comment-fix-3",
+      reviewReport: "BUG 3",
+    }),
+    /Limit 2 poprawek.*\/replan/
+  );
+
+  const replanned = reduceLifecycle(reviewFixRun({ fixRound: 2 }), {
+    type: "replan",
+    commentId: "comment-replan",
+    reason: "potrzebna trzecia korekta",
+  });
+  assert.equal(replanned.transition.incrementGeneration, true);
+  assert.equal(replanned.transition.patch?.fixRound, 0);
 });
 
 test("/retry odtwarza tylko zatrzymany deterministyczny etap", () => {
@@ -673,6 +800,7 @@ test("/retry odtwarza tylko zatrzymany deterministyczny etap", () => {
     planFiles: ["src/a.ts"],
     clarifyRound: 0,
     critiqueRound: 0,
+    fixRound: 0,
     branch: "agent/BAR-T6",
     headSha: "f".repeat(40),
     blockedStage: "publish",
@@ -705,6 +833,7 @@ test("mark-pr-ready dopiero po werdykcie review; komentarz przed zdjęciem draft
     planFiles: ["src/a.ts"],
     clarifyRound: 0,
     critiqueRound: 0,
+    fixRound: 0,
     branch: "agent/BAR-R1",
     headSha: "a".repeat(40),
     testedSha: "a".repeat(40),
@@ -736,6 +865,12 @@ test("mark-pr-ready dopiero po werdykcie review; komentarz przed zdjęciem draft
   });
   // Komentarz recenzenta istnieje ZANIM PR wyjdzie z draftu; advisory nadal nie blokuje.
   assert.deepEqual(verdict.commands.map((command) => command.kind), ["comment-pr", "mark-pr-ready"]);
+  assert.equal(
+    verdict.commands.some((command) =>
+      command.kind === "run-job" && command.payload.kind === "build"
+    ),
+    false
+  );
   assert.deepEqual([verdict.transition.stage, verdict.transition.status], ["merge", "waiting_human"]);
 });
 
@@ -750,6 +885,7 @@ test("/retry review: bez werdyktu ponawia joba, z werdyktem tylko mark-pr-ready"
     planFiles: [],
     clarifyRound: 0,
     critiqueRound: 0,
+    fixRound: 0,
     headSha: "b".repeat(40),
     prUrl: "https://github.test/o/r/pull/10",
     blockedStage: "review",

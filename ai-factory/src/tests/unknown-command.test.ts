@@ -129,6 +129,39 @@ test("hint obejmuje checklistę ops, score po Done i stan bez otwartej bramki", 
   );
 });
 
+test("hint na bramce merge pokazuje /fix tylko dla aktywnego advisory-fix przed limitem", () => {
+  assert.match(
+    unknownCommandHint({
+      firstToken: "/fiz",
+      stage: "merge",
+      status: "waiting_human",
+      reviewStatus: "advisory-fix",
+      fixRound: 1,
+    }),
+    /`\/fix \[wskazówki\]`.*`\/replan <powód>`/
+  );
+  assert.doesNotMatch(
+    unknownCommandHint({
+      firstToken: "/fiz",
+      stage: "merge",
+      status: "waiting_human",
+      reviewStatus: "advisory-fix",
+      fixRound: 2,
+    }),
+    /`\/fix/
+  );
+  assert.match(
+    unknownCommandHint({
+      firstToken: "/fiz",
+      stage: "merge",
+      status: "waiting_human",
+      reviewStatus: "lgtm",
+      fixRound: 0,
+    }),
+    /Review bez uwag/
+  );
+});
+
 test("isCommandAttempt odróżnia ścisły token komendy od treści i ścieżek", () => {
   assert.equal(isCommandAttempt("/anwser cokolwiek"), true);
   assert.equal(isCommandAttempt("  /approve tak"), true);
