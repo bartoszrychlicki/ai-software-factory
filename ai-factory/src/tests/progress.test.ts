@@ -188,9 +188,10 @@ test("/fix emituje milestone z rundą i zachowaniem planu oraz brancha", () => {
   );
 
   assert.equal(fix?.level, "milestones");
-  assert.match(fix!.body, /`\/fix` przyjęty/);
+  assert.match(fix!.body, /Poprawka po review/);
   assert.match(fix!.body, /runda 1\/2/);
-  assert.match(fix!.body, /Plan i branch bez zmian/);
+  assert.match(fix!.body, /Ten sam plan i branch/);
+  assert.match(fix!.body, /testy exact-SHA i ponowne review/);
 });
 
 test("applyDecision zapisuje 7 idempotentnych kluczy progress i nie dubluje merge po restarcie", () => {

@@ -39,6 +39,7 @@ export interface UnknownCommandContext {
   approvedAt?: string;
   reviewStatus?: string;
   fixRound?: number;
+  mergedSha?: string;
 }
 
 const DECISION_COMMANDS = new Set<DecisionKind>(["start", "approve", "reject", "answer", "done"]);
@@ -116,12 +117,24 @@ export function unknownCommandHint(input: UnknownCommandContext): string {
     return `${prefix} Dostępne teraz: \`/answer <odpowiedzi>\`.`;
   }
   if (input.stage === "merge" && input.status === "waiting_human") {
+    if (input.mergedSha) {
+      return `${prefix} PR zmergowany; dostępne: \`/score 1-5\`.`;
+    }
     if (input.reviewStatus === "advisory-fix" && (input.fixRound ?? 0) < 2) {
-      return `${prefix} Dostępne teraz: \`/fix [wskazówki]\`, \`/replan <powód>\`.`;
+      return (
+        `${prefix} Dostępne teraz: \`/fix [wskazówki]\` ` +
+        `(poprawka ${(input.fixRound ?? 0) + 1}/2), \`/replan <powód>\`, \`/score 1-5\`.`
+      );
+    }
+    if (input.reviewStatus === "advisory-fix") {
+      return (
+        `${prefix} Limit \`/fix\` wyczerpany (2/2); dostępne: ` +
+        "`/replan <powód>`, `/score 1-5`."
+      );
     }
     return (
-      `${prefix} Review bez uwag lub limit poprawek został wyczerpany — ` +
-      "dostępne: `/replan <powód>`."
+      `${prefix} Review: ${input.reviewStatus ?? "brak werdyktu"} — \`/fix\` niedostępny. ` +
+      "Dostępne: `/replan <powód>`, `/score 1-5`. Merge robisz w GitHubie."
     );
   }
   return (

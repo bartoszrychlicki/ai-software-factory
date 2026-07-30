@@ -12,7 +12,8 @@ import {
   BRIEF_CLIP_CHARS,
   clip,
   CRITIQUE_CLIP_CHARS,
-  FIX_FEEDBACK_CLIP_CHARS,
+  FIX_HINTS_CLIP_CHARS,
+  REVIEW_CLIP_CHARS,
   type FactoryJobOutput,
 } from "./factory-job";
 
@@ -36,7 +37,7 @@ export type CoordinatorEvent =
   | { type: "ops-done"; commentId: string }
   | { type: "reject"; commentId: string; reason: string }
   | { type: "retry"; commentId: string; nextAttempt?: number; nextAttempts?: NextAttempts }
-  | { type: "fix"; commentId: string; hints?: string; reviewReport?: string; reviewSha?: string; nextAttempt?: number }
+  | { type: "fix"; commentId: string; hints?: string; nextAttempt?: number }
   | { type: "replan"; commentId: string; reason: string; nextAttempt?: number; nextAttempts?: NextAttempts }
   | { type: "input-changed"; inputHash: string; commentContext?: string; title?: string; description?: string; labels?: string[]; nextAttempt?: number; nextAttempts?: NextAttempts }
   | { type: "test-result"; ok: boolean; sha: string; report: string }
@@ -141,6 +142,7 @@ const PLAN_RESET_PATCH = {
   briefs: undefined,
   researchFailures: undefined,
   critiqueRound: 0,
+  reviewReport: undefined,
   fixRound: 0,
   critiqueVerdict: undefined,
   critiqueReport: undefined,
@@ -529,57 +531,60 @@ export function reduceLifecycle(run: LifecycleRun, event: CoordinatorEvent): Coo
   }
 
   if (event.type === "fix") {
+    if (run.mergedSha) {
+      throw new Error("PR jest już zmergowany — praca jest w main; /fix nic nie poprawi.");
+    }
     if (run.stage !== "merge" || run.status !== "waiting_human") {
-      throw new Error("/fix działa wyłącznie na bramce merge, po zakończonym review.");
+      throw new Error(
+        `/fix działa wyłącznie na bramce merge (etap ${run.stage}, status ${run.status}).`
+      );
     }
     if (run.reviewStatus !== "advisory-fix") {
       throw new Error(
-        `Review nie zgłosiło uwag do poprawki (${run.reviewStatus ?? "brak werdyktu"}): /fix jest niedostępny.`
+        `Review dało \`${run.reviewStatus ?? "brak werdyktu"}\` — nie ma uwag do poprawki.`
       );
-    }
-    if (!run.prUrl || !run.headSha || !run.branch || !run.plan) {
-      throw new Error("Poprawka wymaga zatwierdzonego planu, brancha i checkpointu.");
-    }
-    if (event.reviewSha && event.reviewSha !== run.headSha) {
-      throw new Error("Raport review dotyczy innego SHA niż PR head.");
-    }
-    if (!event.reviewReport?.trim()) {
-      throw new Error("Brak treści raportu review — nie ma czego przekazać builderowi.");
     }
     if (run.fixRound >= 2) {
       throw new Error(
-        "Limit 2 poprawek /fix na generację wyczerpany. Dalsza korekta wymaga /replan <powód>."
+        "Wyczerpano 2/2 poprawki w tej generacji; dalsza korekta wymaga /replan <powód>."
       );
+    }
+    if (
+      !run.reviewReport?.trim() ||
+      !run.prUrl ||
+      !run.headSha ||
+      !run.branch ||
+      !run.plan
+    ) {
+      throw new Error("Brak raportu review dla bieżącego head SHA — /fix nie ma wejścia.");
     }
 
     const round = run.fixRound + 1;
     const feedback = [
-      `# Uwagi review do poprawki (advisory, runda ${round}/2)`,
-      clip(event.reviewReport, FIX_FEEDBACK_CLIP_CHARS),
-      event.hints?.trim()
-        ? `# Dodatkowe wskazówki człowieka\n${event.hints.trim()}`
-        : "",
       [
         "# Instrukcja",
-        "Poprawiaj wyłącznie w granicach zatwierdzonego planu.",
-        "Nie cofaj wcześniejszych zmian i nie rozszerzaj zakresu.",
+        "Poprawiaj wyłącznie w granicach zatwierdzonego planu; nie rozszerzaj zakresu.",
+        "Nie zmieniaj plików spoza planu, nie refaktoruj przy okazji.",
+        "Uwagi review są advisory — oceń każdą i odrzuć w raporcie tę, która jest błędna.",
       ].join("\n"),
+      `# Uwagi review do naprawy (runda ${round}/2)`,
+      clip(run.reviewReport, REVIEW_CLIP_CHARS),
+      event.hints?.trim()
+        ? `# Dodatkowe wskazówki człowieka\n${clip(event.hints.trim(), FIX_HINTS_CLIP_CHARS)}`
+        : "",
     ].filter(Boolean).join("\n\n");
-    const prBody = [
-      `🔧 **Poprawka po review (runda ${round}/2)** — inicjowana przez człowieka komendą \`/fix\`.`,
-      "Plan i branch bez zmian; nowy checkpoint przejdzie testy exact-SHA, CI i ponowne review.",
-      event.hints?.trim() ? `Dodatkowe wskazówki: ${event.hints.trim()}` : "",
-    ].filter(Boolean).join("\n\n");
+    const prBody =
+      `🔧 Poprawka po review (runda ${round}/2) — inicjowana przez człowieka`;
 
     return {
       transition: {
         stage: "build",
         status: "running",
         actor: "human",
-        reason: `/fix ${event.commentId}`,
+        reason: `/fix ${event.commentId}: fix-after-review`,
         patch: {
           fixRound: round,
-          reviewStatus: "pending",
+          feedback,
           blockedStage: undefined,
           errorCode: undefined,
           errorMessage: undefined,
@@ -599,7 +604,7 @@ export function reduceLifecycle(run: LifecycleRun, event: CoordinatorEvent): Coo
           ticketId: run.ticketId,
           kind: "comment-pr",
           stage: "merge",
-          payload: { prUrl: run.prUrl, body: prBody },
+          payload: { prUrl: run.prUrl, body: prBody, outcome: "fix-dispatched" },
         },
       ],
     };
@@ -1139,7 +1144,10 @@ export function reduceLifecycle(run: LifecycleRun, event: CoordinatorEvent): Coo
         status: "waiting_human",
         actor: "reviewer",
         reason: event.output.reviewVerdict ?? "advisory-review",
-        patch: { reviewStatus: event.output.reviewVerdict ?? "unavailable" },
+        patch: {
+          reviewStatus: event.output.reviewVerdict ?? "unavailable",
+          reviewReport: clip(event.output.report, REVIEW_CLIP_CHARS),
+        },
       },
       commands: [
         {

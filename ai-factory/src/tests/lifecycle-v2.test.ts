@@ -690,6 +690,7 @@ function reviewFixRun(patch: Partial<LifecycleRun> = {}): LifecycleRun {
     testedSha: "a".repeat(40),
     prUrl: "https://github.test/o/r/pull/191",
     reviewStatus: "advisory-fix",
+    reviewReport: "BUG: hash nie obejmuje executedCommandIds.",
     createdAt: "x",
     updatedAt: "x",
     ...patch,
@@ -702,8 +703,6 @@ test("/fix zachowuje plan, branch i generację oraz przekazuje review z podpowie
     type: "fix",
     commentId: "comment-fix-1",
     hints: "Najpierw zabezpiecz hash.",
-    reviewReport: "BUG: hash nie obejmuje executedCommandIds.",
-    reviewSha: run.headSha,
     nextAttempt: 7,
   });
   const after = {
@@ -723,7 +722,7 @@ test("/fix zachowuje plan, branch i generację oraz przekazuje review z podpowie
   assert.deepEqual(after.planFiles, run.planFiles);
   assert.equal(after.branch, run.branch);
   assert.equal(after.fixRound, 1);
-  assert.equal(after.reviewStatus, "pending");
+  assert.equal(after.reviewStatus, "advisory-fix");
   assert.equal(decision.transition.incrementGeneration, undefined);
   assert.equal(build?.payload.attempt, 7);
   assert.equal(build?.payload.plan, run.plan);
@@ -741,15 +740,13 @@ test("/fix odmawia bez advisory-fix i poza bramką merge", () => {
     () => reduceLifecycle(reviewFixRun({ reviewStatus: "lgtm" }), {
       type: "fix",
       commentId: "comment-lgtm",
-      reviewReport: "LGTM",
     }),
-    /Review nie zgłosiło uwag.*\/fix jest niedostępny/
+    /Review dało `lgtm`/
   );
   assert.throws(
     () => reduceLifecycle(reviewFixRun({ stage: "review", status: "running" }), {
       type: "fix",
       commentId: "comment-review",
-      reviewReport: "BUG",
     }),
     /wyłącznie na bramce merge/
   );
@@ -759,7 +756,6 @@ test("/fix ma limit dwóch rund w generacji i odsyła do /replan", () => {
   const first = reduceLifecycle(reviewFixRun(), {
     type: "fix",
     commentId: "comment-fix-1",
-    reviewReport: "BUG 1",
   });
   assert.equal(first.transition.patch?.fixRound, 1);
 
@@ -767,7 +763,6 @@ test("/fix ma limit dwóch rund w generacji i odsyła do /replan", () => {
   const second = reduceLifecycle(secondRun, {
     type: "fix",
     commentId: "comment-fix-2",
-    reviewReport: "BUG 2",
   });
   assert.equal(second.transition.patch?.fixRound, 2);
 
@@ -775,9 +770,8 @@ test("/fix ma limit dwóch rund w generacji i odsyła do /replan", () => {
     () => reduceLifecycle(reviewFixRun({ fixRound: 2 }), {
       type: "fix",
       commentId: "comment-fix-3",
-      reviewReport: "BUG 3",
     }),
-    /Limit 2 poprawek.*\/replan/
+    /Wyczerpano 2\/2.*\/replan/
   );
 
   const replanned = reduceLifecycle(reviewFixRun({ fixRound: 2 }), {

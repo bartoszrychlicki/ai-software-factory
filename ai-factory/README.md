@@ -118,7 +118,7 @@ decyzją workflow.
 - `/fix [wskazówki]` — uruchamia poprawkę buildera według uwag review bez
   utraty planu i brancha; wyłącznie na bramce merge przy werdykcie
   `advisory-fix`, maks. dwa razy na generację, potem wymagane jest
-  `/replan <powód>`;
+  `/replan <powód>`; niedostępna po merge;
 - `/replan <powód>` — unieważnia plan i tworzy nową generację;
 - `/restart` — tymczasowy alias `/replan`;
 - `/done` — potwierdza ręczne wykonanie zatwierdzonej checklisty ops;
@@ -179,10 +179,10 @@ do odczytu/testów migracji, ale nie są podpięte do runtime.
   ignorowane. Publish wykrywa istniejący branch/draft PR.
 - Każda zmiana PR head SHA unieważnia test/CI i uruchamia scope audit + testy
   nowego SHA, nigdy pełny rebuild.
-- Review AI jest advisory i może ponowić wyłącznie review raz. Nigdy nie odpala
-  buildera samo z siebie. Jedyną drogą od uwag `advisory-fix` do poprawki jest
-  świadoma komenda człowieka `/fix [wskazówki]`; zachowuje ona zatwierdzony
-  plan i branch, a po dwóch rundach w generacji wymaga `/replan <powód>`.
+- Review AI jest advisory i może ponowić wyłącznie review raz. Review nigdy nie
+  dispatchuje buildera samo z siebie — builder rusza po review wyłącznie na
+  świadomą komendę człowieka `/fix`, maks. dwa razy na generację; potem
+  wymagany jest `/replan`.
   Reviewer nigdy nie jest tym samym silnikiem co builder (`review.diverse`
   w routing.yaml), a `mark-pr-ready` wychodzi dopiero PO werdykcie — komentarz
   recenzenta istnieje zanim PR opuści draft.

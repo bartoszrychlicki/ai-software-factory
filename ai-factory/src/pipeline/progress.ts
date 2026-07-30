@@ -71,8 +71,8 @@ function milestoneComment(
   if (reason.startsWith("/fix")) {
     return {
       body:
-        `🔧 **\`/fix\` przyjęty → builder poprawia kod wg uwag review ` +
-        `(runda ${after.fixRound}/2).** Plan i branch bez zmian.`,
+        `🔧 **Poprawka po review (runda ${after.fixRound}/2) — inicjowana przez człowieka.** ` +
+        "Ten sam plan i branch; po buildzie testy exact-SHA i ponowne review.",
       level: "milestones",
     };
   }

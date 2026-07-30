@@ -807,17 +807,17 @@ async function dispatchExternal(
       deps.store.markCommand(command.key, "done");
       return;
     }
+    const signature = command.payload.signature
+      ?? deps.store.latestAttempt(run.ticketId, "build")?.signature
+      ?? signatureLine(POLLER_SIGNATURE);
+    const outcome = command.payload.outcome ?? run.reviewStatus ?? "advisory";
     const body = [
       String(command.payload.body),
       "",
-      `Signature: ${
-        command.payload.signature
-          ? String(command.payload.signature)
-          : signatureLine(POLLER_SIGNATURE)
-      }`,
+      `Signature: ${String(signature)}`,
       `Ticket: ${run.ticketId}`,
       `SHA: ${run.headSha}`,
-      `Outcome: ${run.reviewStatus ?? "advisory"}`,
+      `Outcome: ${String(outcome)}`,
       tag,
     ].join("\n");
     await execFileControlled(
@@ -1461,6 +1461,7 @@ function enqueueUnknownCommandHint(
         approvedAt: run.approvedAt,
         reviewStatus: run.reviewStatus,
         fixRound: run.fixRound,
+        mergedSha: run.mergedSha,
       }),
     },
   });
@@ -1506,13 +1507,10 @@ async function processCommands(deps: PollerDependencies, run: LifecycleRun): Pro
       };
     }
     else if (parsed.kind === "fix") {
-      const reviewAttempt = deps.store.latestAttempt(run.ticketId, "review");
       event = {
         type: "fix",
         commentId: comment.id,
         hints: parsed.payload,
-        reviewReport: reviewAttempt?.report,
-        reviewSha: reviewAttempt?.sha,
         nextAttempt: deps.store.nextAttempt(run.ticketId, "build"),
       };
     }
