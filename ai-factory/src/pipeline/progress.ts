@@ -68,6 +68,16 @@ function milestoneComment(
     };
   }
 
+  if (reason.startsWith("/scope")) {
+    const paths = reason.includes(": ") ? reason.split(": ").slice(1).join(": ") : "";
+    return {
+      body:
+        `🔓 **Zakres rozszerzony przez człowieka o: ${paths}.** ` +
+        "→ 🔨 build startuje ponownie.",
+      level: "milestones",
+    };
+  }
+
   if (reason.startsWith("/fix")) {
     return {
       body:

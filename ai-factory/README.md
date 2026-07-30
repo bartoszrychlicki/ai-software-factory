@@ -115,6 +115,9 @@ decyzją workflow.
 - `/answer <odpowiedź>` — odpowiada na pytania plannera (maks. dwie rundy;
   rundę 1 może zadać triage, rundę 2 synteza);
 - `/retry` — ponawia wyłącznie zatrzymany etap;
+- `/scope <ścieżka> [kolejne]` — wyłącznie po zatrzymaniu builda przez audyt
+  zakresu (`SCOPE_BLOCKED`) dopisuje dokładne, bezpieczne ścieżki do
+  `planFiles` bieżącej generacji i wznawia buildera z tym samym planem;
 - `/fix [wskazówki]` — uruchamia poprawkę buildera według uwag review bez
   utraty planu i brancha; wyłącznie na bramce merge przy werdykcie
   `advisory-fix`, maks. dwa razy na generację, potem wymagane jest
@@ -174,6 +177,12 @@ do odczytu/testów migracji, ale nie są podpięte do runtime.
   sekret, niezatwierdzony workflow/ops/migracja ORAZ pliki wykonywane przez
   etap test (package.json, lockfile'y, configi testów/buildu, `scripts/`)
   blokują publikację. Per-projekt: `scope.protected` w `projects.yaml`.
+- `planFiles` ma dokładnie dwa wejścia: plan zatwierdzony przez człowieka
+  komendą `/approve` oraz ścieżki wpisane przez człowieka w `/scope` po
+  `SCOPE_BLOCKED`. Agent nie może rozszerzać tej listy. Sekrety są odrzucane
+  także przy `/scope`, a każde rozszerzenie zapisuje w rejestrze ID komentarza
+  autoryzującego. Bramka zakresu pozostaje więc nienaruszona — nowym
+  autorytetem jest wyłącznie jawna decyzja człowieka, nie raport agenta.
 - Agent nie dostaje `SSH_AUTH_SOCK`; push/publish robi wyłącznie fabryka.
 - PR jest identyfikowany tylko przez trwałe `prUrl`; historyczne komentarze są
   ignorowane. Publish wykrywa istniejący branch/draft PR.

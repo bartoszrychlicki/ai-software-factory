@@ -5,6 +5,66 @@ const exec = promisify(execFile);
 
 const normalize = (path: string) => path.trim().replace(/^\.\//, "").replace(/\\/g, "/");
 
+export interface ScopeAuthorization {
+  accepted: string[];
+  alreadyDeclared: string[];
+  rejected: { path: string; reason: string }[];
+}
+
+/**
+ * Człowiek może rozszerzyć wyłącznie dokładną allowlistę bieżącego planu.
+ * Reguły są celowo w tym samym module i używają tej samej normalizacji co
+ * auditScope, żeby autoryzowana ścieżka była porównywana 1:1 podczas audytu.
+ */
+export function authorizeScopePaths(
+  rawPaths: string[],
+  declaredFiles: string[]
+): ScopeAuthorization {
+  const accepted: string[] = [];
+  const alreadyDeclared: string[] = [];
+  const rejected: ScopeAuthorization["rejected"] = [];
+  const declared = new Set(declaredFiles.map(normalize).filter(Boolean));
+  const acceptedSet = new Set<string>();
+  const alreadyDeclaredSet = new Set<string>();
+
+  for (const rawPath of rawPaths) {
+    const trimmed = rawPath.trim();
+    const normalized = normalize(trimmed);
+    let reason: string | undefined;
+
+    if (!trimmed || !normalized) {
+      reason = "pusta ścieżka";
+    } else if (/^[\\/]/.test(trimmed) || /^[a-z]:[\\/]/i.test(trimmed)) {
+      reason = "ścieżka musi być względna wobec repozytorium";
+    } else if (normalized.split("/").includes("..")) {
+      reason = "segment `..` jest niedozwolony";
+    } else if (/[*?\[]/.test(normalized)) {
+      reason = "wildcardy są niedozwolone — podaj dokładną ścieżkę";
+    } else if (isSecretPath(normalized)) {
+      reason =
+        "plik sekretu/klucza — commit sekretu to nieodwracalna szkoda; człowiek też nie może go autoryzować";
+    }
+
+    if (reason) {
+      rejected.push({ path: trimmed, reason });
+      continue;
+    }
+
+    if (declared.has(normalized) || acceptedSet.has(normalized)) {
+      if (!alreadyDeclaredSet.has(normalized)) {
+        alreadyDeclared.push(normalized);
+        alreadyDeclaredSet.add(normalized);
+      }
+      continue;
+    }
+
+    accepted.push(normalized);
+    acceptedSet.add(normalized);
+  }
+
+  return { accepted, alreadyDeclared, rejected };
+}
+
 /** Odczyt statusu NUL-separated nie psuje ścieżek ze spacjami ani rename'ów. */
 export async function changedFilesInWorkspace(cwd: string): Promise<string[]> {
   const { stdout } = await exec(

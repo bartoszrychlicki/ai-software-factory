@@ -100,6 +100,19 @@ test("hint pokazuje komendy adekwatne do approval, pytań i blokady", () => {
   );
 });
 
+test("hint blokady nie-SCOPE nie rozszerza listy komend o /scope", () => {
+  const hint = unknownCommandHint({
+    firstToken: "/rettry",
+    stage: "build",
+    status: "blocked",
+    blockedStage: "build",
+    errorCode: "BUILD_ENGINE_FAILED",
+  });
+
+  assert.match(hint, /`\/retry`.*`\/replan <powód>`/);
+  assert.doesNotMatch(hint, /`\/scope/);
+});
+
 test("hint obejmuje checklistę ops, score po Done i stan bez otwartej bramki", () => {
   assert.match(
     unknownCommandHint({

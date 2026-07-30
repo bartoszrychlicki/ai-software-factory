@@ -1,6 +1,6 @@
 import type { DecisionKind } from "../pipeline/run-registry";
 
-export type OperatorCommandKind = "retry" | "replan" | "restart" | "fix" | "score";
+export type OperatorCommandKind = "retry" | "replan" | "restart" | "fix" | "score" | "scope";
 export type CommandKind = DecisionKind | OperatorCommandKind;
 
 /**
@@ -22,6 +22,7 @@ export const COMMANDS: Record<string, CommandKind> = {
   "/restart": "restart",
   "/fix": "fix",
   "/score": "score",
+  "/scope": "scope",
 };
 
 export interface ParsedCommand {
@@ -35,6 +36,7 @@ export interface UnknownCommandContext {
   stage: string;
   status: string;
   blockedStage?: string;
+  errorCode?: string;
   planDomain?: string;
   approvedAt?: string;
   reviewStatus?: string;
@@ -71,7 +73,7 @@ export function parseCommand(body: string): ParsedCommand | undefined {
   const kind = COMMANDS[normalizeCommandToken(first)];
   if (!kind) return undefined;
   const payload = rest.join(" ").trim() || trimmed.slice(first.length).trim();
-  if (["reject", "answer", "replan"].includes(kind) && !payload) return undefined;
+  if (["reject", "answer", "replan", "scope"].includes(kind) && !payload) return undefined;
   if (["approve", "retry", "done"].includes(kind) && payload) return undefined;
   // /score wymaga oceny 1-5 jako pierwszego tokenu payloadu; reszta = komentarz.
   if (kind === "score" && !/^[1-5](\s|$)/.test(payload)) return undefined;
@@ -97,6 +99,12 @@ export function unknownCommandHint(input: UnknownCommandContext): string {
     return `${prefix} Dostępne teraz: \`/score 1-5 [komentarz]\`.`;
   }
   if (input.status === "blocked") {
+    if (input.errorCode === "SCOPE_BLOCKED") {
+      return (
+        `${prefix} Dostępne teraz: \`/retry\`, \`/replan <powód>\`, ` +
+        "`/scope <ścieżka>`."
+      );
+    }
     return `${prefix} Dostępne teraz: \`/retry\`, \`/replan <powód>\`.`;
   }
   if (

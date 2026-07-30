@@ -16,6 +16,7 @@ import {
   REVIEW_CLIP_CHARS,
   type FactoryJobOutput,
 } from "./factory-job";
+import { authorizeScopePaths } from "./scope";
 
 type NewCommand = Omit<
   LifecycleCommand,
@@ -37,6 +38,7 @@ export type CoordinatorEvent =
   | { type: "ops-done"; commentId: string }
   | { type: "reject"; commentId: string; reason: string }
   | { type: "retry"; commentId: string; nextAttempt?: number; nextAttempts?: NextAttempts }
+  | { type: "scope"; commentId: string; paths: string[]; nextAttempt?: number }
   | { type: "fix"; commentId: string; hints?: string; nextAttempt?: number }
   | { type: "replan"; commentId: string; reason: string; nextAttempt?: number; nextAttempts?: NextAttempts }
   | { type: "input-changed"; inputHash: string; commentContext?: string; title?: string; description?: string; labels?: string[]; nextAttempt?: number; nextAttempts?: NextAttempts }
@@ -607,6 +609,55 @@ export function reduceLifecycle(run: LifecycleRun, event: CoordinatorEvent): Coo
           payload: { prUrl: run.prUrl, body: prBody, outcome: "fix-dispatched" },
         },
       ],
+    };
+  }
+
+  if (event.type === "scope") {
+    if (
+      run.status !== "blocked" ||
+      run.blockedStage !== "build" ||
+      run.errorCode !== "SCOPE_BLOCKED"
+    ) {
+      throw new Error(
+        "/scope rozszerza zakres wyłącznie dla runu zatrzymanego przez audyt zakresu (SCOPE_BLOCKED)."
+      );
+    }
+    const authorization = authorizeScopePaths(event.paths, run.planFiles);
+    if (authorization.accepted.length !== event.paths.length) {
+      const details = [
+        ...authorization.rejected.map(({ path, reason }) => `${path || "(pusta)"}: ${reason}`),
+        ...authorization.alreadyDeclared.map((path) => `${path}: ścieżka jest już w planFiles`),
+      ].join("; ");
+      throw new Error(`/scope zawiera niedozwolone ścieżki${details ? `: ${details}` : "."}`);
+    }
+    const planFiles = [...run.planFiles, ...authorization.accepted];
+    const feedback =
+      `Zakres rozszerzony przez człowieka o: ${authorization.accepted.join(", ")}.\n\n` +
+      "Poprzednia próba została zatrzymana przez audyt zakresu:\n" +
+      clip(run.errorMessage ?? "Brak raportu poprzedniej blokady.", 4000);
+    const nextRun: LifecycleRun = { ...run, planFiles, feedback };
+    return {
+      transition: {
+        stage: "build",
+        status: "running",
+        actor: "human",
+        reason: `/scope ${event.commentId}: ${authorization.accepted.join(", ")}`,
+        patch: {
+          planFiles,
+          feedback,
+          blockedStage: undefined,
+          errorCode: undefined,
+          errorMessage: undefined,
+        },
+      },
+      commands: [jobCommand(
+        nextRun,
+        "build",
+        "build",
+        event.nextAttempt ?? 2,
+        { feedback },
+        `:scope:${event.commentId}`
+      )],
     };
   }
 
