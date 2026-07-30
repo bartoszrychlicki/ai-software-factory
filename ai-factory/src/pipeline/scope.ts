@@ -11,6 +11,26 @@ export interface ScopeAuthorization {
   rejected: { path: string; reason: string }[];
 }
 
+export function scopeBlockedPaths(report: string | undefined): string[] {
+  if (!report) return [];
+  const auditMarker = "Publikacja zablokowana:";
+  const auditStart = report.lastIndexOf(auditMarker);
+  const auditReport = auditStart >= 0
+    ? report.slice(auditStart + auditMarker.length)
+    : report;
+  const paths = auditReport
+    .split(/\r?\n/)
+    .map((line) =>
+      line.trim().match(
+        /^(?:-\s*)?(.+): chroniona ścieżka nie została zatwierdzona w planie$/
+      )?.[1]
+    )
+    .filter((path): path is string => Boolean(path))
+    .map(normalize)
+    .filter(Boolean);
+  return [...new Set(paths)];
+}
+
 /**
  * Człowiek może rozszerzyć wyłącznie dokładną allowlistę bieżącego planu.
  * Reguły są celowo w tym samym module i używają tej samej normalizacji co
@@ -18,12 +38,16 @@ export interface ScopeAuthorization {
  */
 export function authorizeScopePaths(
   rawPaths: string[],
-  declaredFiles: string[]
+  declaredFiles: string[],
+  currentlyBlockedPaths?: string[]
 ): ScopeAuthorization {
   const accepted: string[] = [];
   const alreadyDeclared: string[] = [];
   const rejected: ScopeAuthorization["rejected"] = [];
   const declared = new Set(declaredFiles.map(normalize).filter(Boolean));
+  const currentlyBlocked = currentlyBlockedPaths
+    ? new Set(currentlyBlockedPaths.map(normalize).filter(Boolean))
+    : undefined;
   const acceptedSet = new Set<string>();
   const alreadyDeclaredSet = new Set<string>();
 
@@ -40,6 +64,8 @@ export function authorizeScopePaths(
       reason = "segment `..` jest niedozwolony";
     } else if (/[*?\[]/.test(normalized)) {
       reason = "wildcardy są niedozwolone — podaj dokładną ścieżkę";
+    } else if (normalized.endsWith("/")) {
+      reason = "podaj dokładną ścieżkę pliku, nie katalog";
     } else if (isSecretPath(normalized)) {
       reason =
         "plik sekretu/klucza — commit sekretu to nieodwracalna szkoda; człowiek też nie może go autoryzować";
@@ -55,6 +81,15 @@ export function authorizeScopePaths(
         alreadyDeclared.push(normalized);
         alreadyDeclaredSet.add(normalized);
       }
+      continue;
+    }
+
+    if (currentlyBlocked && !currentlyBlocked.has(normalized)) {
+      rejected.push({
+        path: trimmed,
+        reason:
+          "ścieżka nie występuje w bieżącym raporcie SCOPE_BLOCKED — podaj dokładną zablokowaną ścieżkę pliku",
+      });
       continue;
     }
 

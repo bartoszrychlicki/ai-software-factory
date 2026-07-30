@@ -16,7 +16,7 @@ import {
   REVIEW_CLIP_CHARS,
   type FactoryJobOutput,
 } from "./factory-job";
-import { authorizeScopePaths } from "./scope";
+import { authorizeScopePaths, scopeBlockedPaths } from "./scope";
 
 type NewCommand = Omit<
   LifecycleCommand,
@@ -259,6 +259,22 @@ function blocked(
       ),
     ],
   };
+}
+
+function blockedErrorMessage(report: string, errorCode: string | undefined): string {
+  const max = 6_000;
+  if (report.length <= max) return report;
+  if (errorCode !== "SCOPE_BLOCKED") return report.slice(0, max);
+
+  const auditMarker = "Publikacja zablokowana:";
+  const auditStart = report.lastIndexOf(auditMarker);
+  if (auditStart < 0) return report.slice(0, max);
+
+  const auditReport = report.slice(auditStart);
+  if (auditReport.length >= max) return auditReport.slice(0, max);
+  const separator = "\n\n[…] (środek raportu obcięty)\n\n";
+  const prefixLength = max - auditReport.length - separator.length;
+  return `${report.slice(0, prefixLength)}${separator}${auditReport}`;
 }
 
 function assertStage(run: LifecycleRun, expected: LifecycleStage, event: string): void {
@@ -622,7 +638,11 @@ export function reduceLifecycle(run: LifecycleRun, event: CoordinatorEvent): Coo
         "/scope rozszerza zakres wyłącznie dla runu zatrzymanego przez audyt zakresu (SCOPE_BLOCKED)."
       );
     }
-    const authorization = authorizeScopePaths(event.paths, run.planFiles);
+    const authorization = authorizeScopePaths(
+      event.paths,
+      run.planFiles,
+      scopeBlockedPaths(run.errorMessage)
+    );
     if (authorization.accepted.length !== event.paths.length) {
       const details = [
         ...authorization.rejected.map(({ path, reason }) => `${path || "(pusta)"}: ${reason}`),
@@ -1137,7 +1157,7 @@ export function reduceLifecycle(run: LifecycleRun, event: CoordinatorEvent): Coo
           run,
           "build",
           event.output.errorCode ?? "BUILD_FAILED",
-          event.output.report.slice(0, 6000),
+          blockedErrorMessage(event.output.report, event.output.errorCode),
           event.output.signature
         );
         decision.transition.patch = {

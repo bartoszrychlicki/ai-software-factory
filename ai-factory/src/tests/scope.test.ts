@@ -9,6 +9,7 @@ import {
   authorizeScopePaths,
   changedFilesInWorkspace,
   isProtectedPath,
+  scopeBlockedPaths,
   undeclaredChangedFiles,
 } from "../pipeline/scope";
 
@@ -90,6 +91,40 @@ test("autoryzacja /scope odrzuca absolutne ścieżki, traversal i wildcardy", ()
     assert.match(result.rejected[index].reason, /segment `\.\.`/);
   }
   assert.match(result.rejected[7].reason, /wildcardy/);
+});
+
+test("autoryzacja /scope przyjmuje tylko dokładne pliki z bieżącej blokady", () => {
+  const report = [
+    "Raport buildera",
+    "- ops/niezablokowany.sh: chroniona ścieżka nie została zatwierdzona w planie",
+    "",
+    "Publikacja zablokowana:",
+    "- e2e/scripts/run-e2e.ts: chroniona ścieżka nie została zatwierdzona w planie",
+    "ops/deploy.sh: chroniona ścieżka nie została zatwierdzona w planie",
+  ].join("\n");
+  const blocked = scopeBlockedPaths(report);
+
+  assert.deepEqual(blocked, ["e2e/scripts/run-e2e.ts", "ops/deploy.sh"]);
+  const result = authorizeScopePaths(
+    [
+      "e2e/scripts/run-e2e.ts",
+      "-",
+      "e2e/scripts/run-e2e.ts:",
+      "chroniona",
+      "scripts/",
+      "ops/inny.sh",
+    ],
+    [],
+    blocked
+  );
+
+  assert.deepEqual(result.accepted, ["e2e/scripts/run-e2e.ts"]);
+  assert.equal(result.rejected.length, 5);
+  assert.match(result.rejected[0].reason, /bieżącym raporcie SCOPE_BLOCKED/);
+  assert.match(result.rejected[1].reason, /bieżącym raporcie SCOPE_BLOCKED/);
+  assert.match(result.rejected[2].reason, /bieżącym raporcie SCOPE_BLOCKED/);
+  assert.match(result.rejected[3].reason, /dokładną ścieżkę pliku, nie katalog/);
+  assert.match(result.rejected[4].reason, /bieżącym raporcie SCOPE_BLOCKED/);
 });
 
 test("autoryzacja /scope zawsze odrzuca sekrety, ale dopuszcza przykłady env", () => {

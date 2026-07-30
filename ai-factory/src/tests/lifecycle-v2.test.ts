@@ -430,7 +430,11 @@ test("autoformatowane /approve przechodzi przez processCommands do builda", asyn
   }
 });
 
-async function exerciseScopeCommand(body: string, ticketId: string) {
+async function exerciseScopeCommand(
+  body: string,
+  ticketId: string,
+  options: { extraBodies?: string[]; commentFailures?: number } = {}
+) {
   const root = await mkdtemp(join(tmpdir(), "factory-scope-command-"));
   const dbPath = join(root, "registry.db");
   const previousRoot = process.env.FACTORY_ROOT;
@@ -441,11 +445,12 @@ async function exerciseScopeCommand(body: string, ticketId: string) {
     description: "Opis",
     labels: [] as string[],
   };
-  const comments = [{
-    id: `comment-${ticketId}`,
-    body,
-    createdAt: "2026-07-30T10:00:00.000Z",
-  }];
+  const comments = [body, ...(options.extraBodies ?? [])].map((commentBody, index) => ({
+    id: index === 0 ? `comment-${ticketId}` : `comment-${ticketId}-${index}`,
+    body: commentBody,
+    createdAt: `2026-07-30T10:00:0${index}.000Z`,
+  }));
+  let commentFailures = options.commentFailures ?? 0;
   try {
     await writeHarnessFixture(root);
     process.env.FACTORY_ROOT = root;
@@ -484,6 +489,10 @@ async function exerciseScopeCommand(body: string, ticketId: string) {
       },
       async getStateName() { return "In Progress"; },
       async comment(_commentTicketId: string, commentBody: string) {
+        if (commentFailures > 0) {
+          commentFailures -= 1;
+          throw new Error("LINEAR_COMMENT_FAILED");
+        }
         comments.push({
           id: `factory-${comments.length}`,
           body: commentBody,
@@ -531,6 +540,9 @@ async function exerciseScopeCommand(body: string, ticketId: string) {
       milestone,
       transitionReason: lastTransition.reason,
       processed: store.isCommentProcessed(`comment-${ticketId}`),
+      processedExtra: (options.extraBodies ?? []).map((_, index) =>
+        store.isCommentProcessed(`comment-${ticketId}-${index + 1}`)
+      ),
       comments: comments.map((comment) => comment.body),
       inputHash,
       effectiveInputHash: snapshot.effectiveInputHash,
@@ -582,6 +594,53 @@ test("/scope sekretu pozostawia blokadę, odmawia z wyjaśnieniem i nie zmienia 
   ));
   assert.equal(result.processed, true);
   assert.equal(result.effectiveInputHash, result.inputHash);
+});
+
+test("/scope odrzuca skopiowaną linię raportu zamiast wykonywać pozorne przejście", async () => {
+  const result = await exerciseScopeCommand(
+    "/scope - e2e/scripts/run-e2e.ts: chroniona ścieżka nie została zatwierdzona w planie",
+    "BAR-SCOPE-NOISE"
+  );
+
+  assert.deepEqual([result.after.stage, result.after.status], ["build", "blocked"]);
+  assert.deepEqual(result.after.planFiles, ["e2e/foo.spec.ts"]);
+  assert.equal(result.build, undefined);
+  assert.equal(result.transitionReason, "SCOPE_BLOCKED");
+  assert.ok(result.comments.some((body) =>
+    body.includes("Zakres nie został rozszerzony") &&
+    body.includes("e2e/scripts/run-e2e.ts:") &&
+    body.includes("chroniona") &&
+    body.includes("bieżącym raporcie SCOPE_BLOCKED")
+  ));
+  assert.equal(result.processed, true);
+});
+
+test("/scope bez przejścia nie zatrzymuje kolejnej komendy w tym samym cyklu", async () => {
+  const result = await exerciseScopeCommand(
+    "/scope .env",
+    "BAR-SCOPE-CONTINUE",
+    { extraBodies: ["/replan popraw listę plików"] }
+  );
+
+  assert.equal(result.after.status, "running");
+  assert.equal(result.after.generation, 2);
+  assert.equal(result.transitionReason, "/replan comment-BAR-SCOPE-CONTINUE-1");
+  assert.equal(result.processed, true);
+  assert.deepEqual(result.processedExtra, [true]);
+});
+
+test("/scope ponawia odmowę po błędzie komentarza bez mylącego komunikatu", async () => {
+  const result = await exerciseScopeCommand(
+    "/scope .env",
+    "BAR-SCOPE-COMMENT-FAIL",
+    { commentFailures: 1 }
+  );
+
+  assert.deepEqual([result.after.stage, result.after.status], ["build", "blocked"]);
+  assert.deepEqual(result.after.planFiles, ["e2e/foo.spec.ts"]);
+  assert.equal(result.transitionReason, "SCOPE_BLOCKED");
+  assert.equal(result.processed, false);
+  assert.equal(result.comments.some((body) => body.includes("jest teraz niedozwolona")), false);
 });
 
 test("sweep Done odpowiada hintem /score na nierozpoznaną próbę komendy", async () => {

@@ -83,6 +83,52 @@ test("/scope rozszerza planFiles tej samej generacji i uruchamia buildera z feed
   );
 });
 
+test("długi raport SCOPE_BLOCKED zachowuje zaufaną listę ścieżek dla /scope", () => {
+  const running = scopeBlockedRun({
+    status: "running",
+    blockedStage: undefined,
+    errorCode: undefined,
+    errorMessage: undefined,
+  });
+  const blocked = reduceLifecycle(running, {
+    type: "job-finished",
+    attempt: 3,
+    output: {
+      kind: "build",
+      outcome: "failed",
+      report:
+        `${"raport buildera ".repeat(500)}\n\nPublikacja zablokowana:\n` +
+        "- e2e/scripts/run-e2e.ts: chroniona ścieżka nie została zatwierdzona w planie",
+      errorCode: "SCOPE_BLOCKED",
+      signature: "builder",
+      durationMs: 1,
+      files: running.planFiles,
+      branch: running.branch,
+      workspaceDir: "/tmp/BAR-190",
+      headSha: "a".repeat(40),
+      changedFiles: ["e2e/scripts/run-e2e.ts"],
+      scopeWarnings: [],
+    },
+  });
+  const blockedRun: LifecycleRun = {
+    ...running,
+    ...blocked.transition.patch,
+    stage: blocked.transition.stage,
+    status: blocked.transition.status,
+  };
+
+  assert.ok((blockedRun.errorMessage?.length ?? 0) <= 6_000);
+  assert.match(blockedRun.errorMessage ?? "", /Publikacja zablokowana/);
+  assert.match(blockedRun.errorMessage ?? "", /e2e\/scripts\/run-e2e\.ts/);
+  assert.doesNotThrow(() =>
+    reduceLifecycle(blockedRun, {
+      type: "scope",
+      commentId: "c-long",
+      paths: ["e2e/scripts/run-e2e.ts"],
+    })
+  );
+});
+
 test("/scope odmawia poza dokładną blokadą build/SCOPE_BLOCKED bez mutacji planFiles", () => {
   const variants: LifecycleRun[] = [
     scopeBlockedRun({ status: "running", blockedStage: undefined, errorCode: undefined }),
@@ -114,8 +160,8 @@ test("/scope odmawia poza dokładną blokadą build/SCOPE_BLOCKED bez mutacji pl
   }
 });
 
-test("/scope defensywnie odrzuca sekret, traversal i ścieżkę już zadeklarowaną", () => {
-  for (const path of [".env", "../outside.ts", "e2e/foo.spec.ts"]) {
+test("/scope defensywnie odrzuca sekret, traversal, ścieżkę spoza blokady i już zadeklarowaną", () => {
+  for (const path of [".env", "../outside.ts", "ops/inny.sh", "e2e/foo.spec.ts"]) {
     const run = scopeBlockedRun();
     assert.throws(
       () => reduceLifecycle(run, {

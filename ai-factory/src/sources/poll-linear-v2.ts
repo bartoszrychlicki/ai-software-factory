@@ -77,7 +77,7 @@ import {
 } from "../pipeline/signature";
 import { progressComment, type ProgressCommentContext } from "../pipeline/progress";
 import { resolveRoute } from "../pipeline/routing";
-import { authorizeScopePaths } from "../pipeline/scope";
+import { authorizeScopePaths, scopeBlockedPaths } from "../pipeline/scope";
 import { extendedStatusName, LINEAR_STATE_MAP } from "./state-map";
 
 const POLL_INTERVAL_MS = Number(process.env.FACTORY_POLL_INTERVAL_MS ?? 60_000);
@@ -1447,8 +1447,12 @@ async function applyScopeGrant(
   source: LinearSource,
   commentId: string,
   payload: string | undefined
-): Promise<void> {
-  const authorization = authorizeScopePaths(payload?.split(/\s+/) ?? [], run.planFiles);
+): Promise<boolean> {
+  const authorization = authorizeScopePaths(
+    payload?.split(/\s+/) ?? [],
+    run.planFiles,
+    scopeBlockedPaths(run.errorMessage)
+  );
   const rejected = authorization.rejected.map(({ path, reason }) =>
     `- \`${path || "(pusta ścieżka)"}\`: ${reason}`
   );
@@ -1458,7 +1462,7 @@ async function applyScopeGrant(
   const notes = [...rejected, ...alreadyDeclared];
 
   if (authorization.accepted.length === 0) {
-    await source.comment(
+    const delivered = await source.comment(
       run.ticketId,
       [
         "⛔ **Zakres nie został rozszerzony.**",
@@ -1466,9 +1470,11 @@ async function applyScopeGrant(
         "Sekretów nie można autoryzować; jeśli plan wymaga innej bezpiecznej ścieżki, użyj `/replan <powód>`.",
         marker(run.ticketId),
       ].join("\n\n")
-    );
-    deps.store.markCommentProcessed(run.ticketId, commentId, "scope");
-    return;
+    ).then(() => true).catch(() => false);
+    if (delivered) {
+      deps.store.markCommentProcessed(run.ticketId, commentId, "scope");
+    }
+    return false;
   }
 
   applyDecision(deps, run.ticketId, reduceLifecycle(run, {
@@ -1489,6 +1495,7 @@ async function applyScopeGrant(
       ].join("\n\n")
     ).catch(() => {});
   }
+  return true;
 }
 
 function enqueueUnknownCommandHint(
@@ -1536,7 +1543,14 @@ async function processCommands(deps: PollerDependencies, run: LifecycleRun): Pro
     }
     if (parsed.kind === "scope") {
       try {
-        await applyScopeGrant(deps, run, source, comment.id, parsed.payload);
+        const transitioned = await applyScopeGrant(
+          deps,
+          run,
+          source,
+          comment.id,
+          parsed.payload
+        );
+        if (!transitioned) continue;
       } catch (error) {
         await source.comment(
           run.ticketId,
