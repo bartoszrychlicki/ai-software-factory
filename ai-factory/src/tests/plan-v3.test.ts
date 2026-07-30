@@ -21,6 +21,7 @@ import { parseCritiqueVerdict, parseTriageVerdict } from "../pipeline/verdicts";
 import { parseCommand, parseScorePayload } from "../sources/commands";
 import { dispatchOutbox, type PollerDependencies } from "../sources/poll-linear-v2";
 import type { EngineAdapter } from "../engines/types";
+import { createTestGitRepo, useTestWorktrees } from "./git-fixture";
 
 const manifest: TicketManifestV2 = {
   title: "Deep plan",
@@ -612,13 +613,17 @@ test("kontrakty triage i krytyki parsują się fail-closed", () => {
   assert.equal(parseCritiqueVerdict('```factory\n{"verdict":"ok"}\n```').verdict, "ok");
 });
 
-function fakeRuntime(engine: EngineAdapter, routeSpec = "fake/fake-model"): FactoryJobRuntime {
+function fakeRuntime(
+  engine: EngineAdapter,
+  repo: string,
+  routeSpec = "fake/fake-model"
+): FactoryJobRuntime {
   return {
     async route() {
       return { engine, model: "fake-model", spec: routeSpec };
     },
     async project() {
-      return { repo: "/tmp", checks: ["true"] };
+      return { repo, default_branch: "main", checks: ["true"] };
     },
   };
 }
@@ -626,8 +631,10 @@ function fakeRuntime(engine: EngineAdapter, routeSpec = "fake/fake-model"): Fact
 test("factoryJob: triage, research, synteza i krytyka działają jako bezstanowe joby", async () => {
   const root = await mkdtemp(join(tmpdir(), "factory-v3-jobs-"));
   const previousRoot = process.env.FACTORY_ROOT;
+  const restoreWorktrees = useTestWorktrees(root);
   process.env.FACTORY_ROOT = root;
   await writeFile(join(root, "package.json"), "{}");
+  const repo = createTestGitRepo(root);
   const ticket = {
     id: "BAR-V9",
     title: "Jobs",
@@ -650,7 +657,7 @@ test("factoryJob: triage, research, synteza i krytyka działają jako bezstanowe
       { kind: "triage", attempt: 1, ticket, planFiles: [] },
       "job-t1",
       undefined,
-      fakeRuntime(triageEngine)
+      fakeRuntime(triageEngine, repo)
     );
     assert.deepEqual([triage.outcome, triage.triagePath], ["success", "deep"]);
 
@@ -665,7 +672,7 @@ test("factoryJob: triage, research, synteza i krytyka działają jako bezstanowe
       { kind: "research", researchRole: "recon", attempt: 1, ticket, planFiles: [] },
       "job-r1",
       undefined,
-      fakeRuntime(researchEngine)
+      fakeRuntime(researchEngine, repo)
     );
     assert.deepEqual([research.outcome, research.researchRole], ["success", "recon"]);
     assert.match(research.brief ?? "", /src\/a\.ts/);
@@ -675,7 +682,7 @@ test("factoryJob: triage, research, synteza i krytyka działają jako bezstanowe
         { kind: "research", attempt: 1, ticket, planFiles: [] },
         "job-r2",
         undefined,
-        fakeRuntime(researchEngine)
+        fakeRuntime(researchEngine, repo)
       ),
       /researchRole/
     );
@@ -706,7 +713,7 @@ test("factoryJob: triage, research, synteza i krytyka działają jako bezstanowe
       },
       "job-s1",
       undefined,
-      fakeRuntime(synthesisEngine)
+      fakeRuntime(synthesisEngine, repo)
     );
     assert.deepEqual([synthesis.outcome, synthesis.files], ["success", ["src/a.ts"]]);
 
@@ -720,7 +727,7 @@ test("factoryJob: triage, research, synteza i krytyka działają jako bezstanowe
       { kind: "critique", attempt: 1, ticket, planFiles: [], plan: "plan" },
       "job-c1",
       undefined,
-      fakeRuntime(critiqueEngine)
+      fakeRuntime(critiqueEngine, repo)
     );
     assert.deepEqual([critique.critiqueVerdict, critique.critiqueIssues], ["issues", "1. brak testów"]);
 
@@ -746,6 +753,7 @@ test("factoryJob: triage, research, synteza i krytyka działają jako bezstanowe
   } finally {
     if (previousRoot === undefined) delete process.env.FACTORY_ROOT;
     else process.env.FACTORY_ROOT = previousRoot;
+    restoreWorktrees();
     await rm(root, { recursive: true, force: true });
   }
 });

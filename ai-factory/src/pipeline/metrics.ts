@@ -24,6 +24,8 @@ export interface MetricRow {
   outcome: string; // znaczenie biznesowe: committed / pass / fail / lgtm / fix / check-fail / no-changes / engine-fail...
   costUsd?: number;
   durationMs?: number;
+  /** SHA kodu, który agent faktycznie widział w swoim checkoutcie (BAR-196). */
+  baseSha?: string;
   /** Czy wywołanie planera wznowiło sesję CLI (BAR-136). */
   resumed?: boolean;
   /**

@@ -6,6 +6,32 @@ import { rm } from "node:fs/promises";
 
 const exec = promisify(execFile);
 
+const repoLocks = new Map<string, Promise<void>>();
+
+/**
+ * Operacje administracyjne worktree muszą być sekwencyjne per repo.
+ * Sam job działa już poza blokadą, we własnym katalogu.
+ */
+async function withRepoLock<T>(repoPath: string, fn: () => Promise<T>): Promise<T> {
+  const previous = repoLocks.get(repoPath) ?? Promise.resolve();
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const tail = previous.then(() => gate);
+  repoLocks.set(repoPath, tail);
+
+  await previous;
+  try {
+    return await fn();
+  } finally {
+    release();
+    if (repoLocks.get(repoPath) === tail) {
+      repoLocks.delete(repoPath);
+    }
+  }
+}
+
 export interface Workspace {
   ticketId: string;
   branch: string;
@@ -31,9 +57,24 @@ export interface WorkspaceOptions {
 }
 
 // worktrees trzymamy POZA repo — zero śmieci w projekcie, łatwe sprzątanie
-const ROOT = process.env.FACTORY_WORKTREES ?? join(homedir(), ".ai-factory", "worktrees");
+function worktreesRoot(): string {
+  return process.env.FACTORY_WORKTREES ?? join(homedir(), ".ai-factory", "worktrees");
+}
 
 export async function createWorkspace(
+  repoPath: string,
+  ticketId: string,
+  slug: string,
+  defaultBranch = "main",
+  baseRef?: string,
+  options: WorkspaceOptions = {}
+): Promise<Workspace> {
+  return withRepoLock(repoPath, () =>
+    createWorkspaceUnlocked(repoPath, ticketId, slug, defaultBranch, baseRef, options)
+  );
+}
+
+async function createWorkspaceUnlocked(
   repoPath: string,
   ticketId: string,
   slug: string,
@@ -48,7 +89,7 @@ export async function createWorkspace(
   if (!branch) {
     throw new Error("FIX_BASE_INVALID: /fix wymaga nazwy opublikowanej gałęzi.");
   }
-  const dir = join(ROOT, basename(repoPath), ticketId);
+  const dir = join(worktreesRoot(), basename(repoPath), ticketId);
   // Rozwiąż checkpoint przed usunięciem starej gałęzi, która może być jego
   // jedyną czytelną referencją. Sam obiekt commita pozostaje dostępny po SHA.
   const checkpoint = baseRef
@@ -163,8 +204,53 @@ export async function checkpointWithinScope(
 }
 
 export async function removeWorkspace(ws: Workspace): Promise<void> {
-  await exec("git", ["-C", ws.repoPath, "worktree", "remove", "--force", ws.dir]).catch(() => {});
-  await exec("git", ["-C", ws.repoPath, "branch", "-D", ws.branch]).catch(() => {});
+  await withRepoLock(ws.repoPath, async () => {
+    await exec("git", ["-C", ws.repoPath, "worktree", "remove", "--force", ws.dir]).catch(() => {});
+    await exec("git", ["-C", ws.repoPath, "branch", "-D", ws.branch]).catch(() => {});
+  });
+}
+
+/**
+ * Świeży, oddzielny checkout aktualnego origin/<default> dla jobów read-only.
+ * Brak łączności lub refa zatrzymuje job zamiast używać potencjalnie starej bazy.
+ */
+export async function createBaseCheckout(
+  repoPath: string,
+  defaultBranch: string,
+  name: string
+): Promise<{ dir: string; sha: string }> {
+  return withRepoLock(repoPath, async () => {
+    let fetchError: unknown;
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      try {
+        await exec("git", ["-C", repoPath, "fetch", "origin", defaultBranch]);
+        fetchError = undefined;
+        break;
+      } catch (error) {
+        fetchError = error;
+      }
+    }
+    if (fetchError) {
+      throw new Error(
+        `BASE_UNAVAILABLE: nie udało się pobrać origin/${defaultBranch} po 2 próbach.`
+      );
+    }
+
+    const sha = await exec(
+      "git",
+      ["-C", repoPath, "rev-parse", "--verify", `origin/${defaultBranch}^{commit}`]
+    ).then(({ stdout }) => stdout.trim()).catch(() => {
+      throw new Error(
+        `BASE_UNAVAILABLE: brak poprawnego refa origin/${defaultBranch} po udanym fetchu.`
+      );
+    });
+    const dir = join(worktreesRoot(), basename(repoPath), name);
+    await exec("git", ["-C", repoPath, "worktree", "remove", "--force", dir]).catch(() => {});
+    await rm(dir, { recursive: true, force: true });
+    await exec("git", ["-C", repoPath, "worktree", "prune"]).catch(() => {});
+    await exec("git", ["-C", repoPath, "worktree", "add", "--detach", dir, sha]);
+    return { dir, sha };
+  });
 }
 
 /**
@@ -176,16 +262,20 @@ export async function createCheckout(
   ref: string,
   name: string
 ): Promise<{ dir: string }> {
-  const dir = join(ROOT, basename(repoPath), name);
-  await exec("git", ["-C", repoPath, "worktree", "remove", "--force", dir]).catch(() => {});
-  await rm(dir, { recursive: true, force: true });
-  // sprzątnij martwe rejestracje (katalog skasowany, wpis w .git został)
-  await exec("git", ["-C", repoPath, "worktree", "prune"]).catch(() => {});
-  await exec("git", ["-C", repoPath, "worktree", "add", "--detach", dir, ref]);
-  return { dir };
+  return withRepoLock(repoPath, async () => {
+    const dir = join(worktreesRoot(), basename(repoPath), name);
+    await exec("git", ["-C", repoPath, "worktree", "remove", "--force", dir]).catch(() => {});
+    await rm(dir, { recursive: true, force: true });
+    // sprzątnij martwe rejestracje (katalog skasowany, wpis w .git został)
+    await exec("git", ["-C", repoPath, "worktree", "prune"]).catch(() => {});
+    await exec("git", ["-C", repoPath, "worktree", "add", "--detach", dir, ref]);
+    return { dir };
+  });
 }
 
 export async function removeCheckout(repoPath: string, dir: string): Promise<void> {
-  await exec("git", ["-C", repoPath, "worktree", "remove", "--force", dir]).catch(() => {});
-  await rm(dir, { recursive: true, force: true }).catch(() => {});
+  await withRepoLock(repoPath, async () => {
+    await exec("git", ["-C", repoPath, "worktree", "remove", "--force", dir]).catch(() => {});
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+  });
 }

@@ -134,9 +134,11 @@ async function withFixture(
   const previousPath = process.env.PATH;
   const previousGhLog = process.env.FACTORY_TEST_GH_LOG;
   const previousGitLog = process.env.FACTORY_TEST_GIT_LOG;
+  const previousWorktrees = process.env.FACTORY_WORKTREES;
   const store = new LifecycleStore(join(fixture.root, "registry.db"));
   try {
     process.env.FACTORY_ROOT = fixture.root;
+    process.env.FACTORY_WORKTREES = join(fixture.root, "worktrees");
     process.env.PATH = `${join(fixture.root, "bin")}:${previousPath ?? ""}`;
     process.env.FACTORY_TEST_GH_LOG = fixture.ghLog;
     process.env.FACTORY_TEST_GIT_LOG = fixture.gitLog;
@@ -162,6 +164,8 @@ async function withFixture(
     else process.env.FACTORY_TEST_GH_LOG = previousGhLog;
     if (previousGitLog === undefined) delete process.env.FACTORY_TEST_GIT_LOG;
     else process.env.FACTORY_TEST_GIT_LOG = previousGitLog;
+    if (previousWorktrees === undefined) delete process.env.FACTORY_WORKTREES;
+    else process.env.FACTORY_WORKTREES = previousWorktrees;
     rmSync(fixture.root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 }

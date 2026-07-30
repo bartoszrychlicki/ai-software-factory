@@ -15,12 +15,14 @@ import {
   createWorkspace,
   removeWorkspace,
 } from "../pipeline/workspace";
+import { useTestWorktrees } from "./git-fixture";
 
 const git = (cwd: string, ...args: string[]) =>
   execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8" }).trim();
 
 test("checkpoint przechodzi tylko gdy cały diff mieści się w nowym factory.files", async () => {
   const root = mkdtempSync(join(tmpdir(), "factory-checkpoint-"));
+  const restoreWorktrees = useTestWorktrees(root);
   const remote = join(root, "remote.git");
   const repo = join(root, "repo");
   try {
@@ -50,12 +52,14 @@ test("checkpoint przechodzi tylko gdy cały diff mieści się w nowym factory.fi
       checkpoint
     );
   } finally {
+    restoreWorktrees();
     rmSync(root, { recursive: true, force: true });
   }
 });
 
 test("workspace nakłada checkpoint na świeży main i bezpiecznie odrzuca konflikt", async () => {
   const root = mkdtempSync(join(tmpdir(), "factory-checkpoint-main-"));
+  const restoreWorktrees = useTestWorktrees(root);
   const remote = join(root, "remote.git");
   const repo = join(root, "source-repo");
   const ticketId = `CHECKPOINT-FRESH-${process.pid}`;
@@ -102,12 +106,14 @@ test("workspace nakłada checkpoint na świeży main i bezpiecznie odrzuca konfl
     assert.equal(readFileSync(join(workspace.dir, "declared.ts"), "utf8"), "conflicting main\n");
   } finally {
     if (workspace) await removeWorkspace(workspace);
+    restoreWorktrees();
     rmSync(root, { recursive: true, force: true });
   }
 });
 
 test("continue-branch buduje na wierzchołku opublikowanej gałęzi zamiast cherry-picka na świeży main", async () => {
   const root = mkdtempSync(join(tmpdir(), "factory-continue-branch-"));
+  const restoreWorktrees = useTestWorktrees(root);
   const remote = join(root, "remote.git");
   const repo = join(root, "source-repo");
   const ticketId = `CONTINUE-BRANCH-${process.pid}`;
@@ -159,12 +165,14 @@ test("continue-branch buduje na wierzchołku opublikowanej gałęzi zamiast cher
     );
   } finally {
     if (workspace) await removeWorkspace(workspace);
+    restoreWorktrees();
     rmSync(root, { recursive: true, force: true });
   }
 });
 
 test("continue-branch odmawia, gdy zdalny wierzchołek nie jest opublikowanym SHA", async () => {
   const root = mkdtempSync(join(tmpdir(), "factory-continue-diverged-"));
+  const restoreWorktrees = useTestWorktrees(root);
   const remote = join(root, "remote.git");
   const repo = join(root, "source-repo");
   const ticketId = `CONTINUE-DIVERGED-${process.pid}`;
@@ -216,12 +224,14 @@ test("continue-branch odmawia, gdy zdalny wierzchołek nie jest opublikowanym SH
       false
     );
   } finally {
+    restoreWorktrees();
     rmSync(root, { recursive: true, force: true });
   }
 });
 
 test("continue-branch odmawia, gdy zdalna gałąź nie istnieje", async () => {
   const root = mkdtempSync(join(tmpdir(), "factory-continue-missing-"));
+  const restoreWorktrees = useTestWorktrees(root);
   const remote = join(root, "remote.git");
   const repo = join(root, "source-repo");
   const ticketId = `CONTINUE-MISSING-${process.pid}`;
@@ -250,6 +260,7 @@ test("continue-branch odmawia, gdy zdalna gałąź nie istnieje", async () => {
       /FIX_BASE_MISSING/
     );
   } finally {
+    restoreWorktrees();
     rmSync(root, { recursive: true, force: true });
   }
 });

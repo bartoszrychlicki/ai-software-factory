@@ -42,6 +42,7 @@ import {
   POLLER_SIGNATURE,
   type ActionSignature,
 } from "../pipeline/signature";
+import { createTestGitRepo, useTestWorktrees } from "./git-fixture";
 
 const manifest: TicketManifestV2 = {
   title: "Lifecycle v2",
@@ -1296,8 +1297,10 @@ test("scope: zwykły dodatkowy plik ostrzega, protected i sekrety blokują", () 
 test("factoryJob plan działa z fałszywym adapterem jako jeden bezstanowy job", async () => {
   const root = await mkdtemp(join(tmpdir(), "factory-job-"));
   const previousRoot = process.env.FACTORY_ROOT;
+  const restoreWorktrees = useTestWorktrees(root);
   process.env.FACTORY_ROOT = root;
   await writeFile(join(root, "package.json"), "{}");
+  const repo = createTestGitRepo(root);
   const fakeEngine: EngineAdapter = {
     name: "fake",
     async run(input) {
@@ -1319,7 +1322,7 @@ test("factoryJob plan działa z fałszywym adapterem jako jeden bezstanowy job",
       return { engine: fakeEngine, model: "fake-model", spec: "fake/fake-model" };
     },
     async project() {
-      return { repo: root, checks: ["true"] };
+      return { repo, default_branch: "main", checks: ["true"] };
     },
   };
   try {
@@ -1342,6 +1345,7 @@ test("factoryJob plan działa z fałszywym adapterem jako jeden bezstanowy job",
   } finally {
     if (previousRoot === undefined) delete process.env.FACTORY_ROOT;
     else process.env.FACTORY_ROOT = previousRoot;
+    restoreWorktrees();
     await rm(root, { recursive: true, force: true });
   }
 });
