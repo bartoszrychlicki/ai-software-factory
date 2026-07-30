@@ -180,6 +180,31 @@ test("input-changed i /replan emitują idempotentny milestone nowej generacji", 
   assert.match(replan!.body, /generacja 2/);
 });
 
+test("/scope emituje milestone z autoryzowanymi ścieżkami", () => {
+  const scope = progressComment(
+    runAt("build", "blocked", {
+      blockedStage: "build",
+      errorCode: "SCOPE_BLOCKED",
+    }),
+    runAt("build", "running", {
+      planFiles: [
+        "src/a.ts",
+        "src/b.ts",
+        "e2e/scripts/run-e2e.ts",
+        "scripts/check.sh",
+      ],
+    }),
+    "/scope comment-scope-1: e2e/scripts/run-e2e.ts, scripts/check.sh"
+  );
+
+  assert.equal(scope?.level, "milestones");
+  assert.match(scope!.body, /🔓/);
+  assert.match(scope!.body, /Zakres rozszerzony przez człowieka/);
+  assert.match(scope!.body, /e2e\/scripts\/run-e2e\.ts, scripts\/check\.sh/);
+  assert.match(scope!.body, /build startuje ponownie/);
+  assert.equal(scope?.enrich, undefined);
+});
+
 test("/fix emituje milestone z rundą i zachowaniem planu oraz brancha", () => {
   const fix = progressComment(
     runAt("merge", "waiting_human", { fixRound: 0 }),

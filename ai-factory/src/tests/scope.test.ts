@@ -4,7 +4,13 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { auditScope, changedFilesInWorkspace, isProtectedPath, undeclaredChangedFiles } from "../pipeline/scope";
+import {
+  auditScope,
+  authorizeScopePaths,
+  changedFilesInWorkspace,
+  isProtectedPath,
+  undeclaredChangedFiles,
+} from "../pipeline/scope";
 
 const git = (cwd: string, ...args: string[]) =>
   execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8" });
@@ -46,6 +52,60 @@ test("per-projektowe scope.protected: prefiks katalogu i basename blokują", () 
   assert.equal(auditScope([], ["app/Dockerfile"], ["Dockerfile"]).blocked.length, 1);
   assert.equal(auditScope([], ["docs/readme.md"], ["infra/"]).blocked.length, 0);
   assert.equal(auditScope(["infra/main.tf"], ["infra/main.tf"], ["infra/"]).blocked.length, 0);
+});
+
+test("autoryzacja /scope normalizuje bezpieczne ścieżki i nie duplikuje planFiles", () => {
+  assert.deepEqual(
+    authorizeScopePaths(
+      ["./e2e/scripts/run-e2e.ts", "e2e/scripts/run-e2e.ts", "src/already.ts"],
+      ["src/already.ts"]
+    ),
+    {
+      accepted: ["e2e/scripts/run-e2e.ts"],
+      alreadyDeclared: ["e2e/scripts/run-e2e.ts", "src/already.ts"],
+      rejected: [],
+    }
+  );
+  assert.deepEqual(authorizeScopePaths([".env.example"], []), {
+    accepted: [".env.example"],
+    alreadyDeclared: [],
+    rejected: [],
+  });
+});
+
+test("autoryzacja /scope odrzuca absolutne ścieżki, traversal i wildcardy", () => {
+  const result = authorizeScopePaths(
+    ["", "./", "/etc/passwd", "\\server\\share", "C:\\secret.txt", "../outside", "src/../ops/x", "src/*.ts"],
+    []
+  );
+
+  assert.deepEqual(result.accepted, []);
+  assert.equal(result.rejected.length, 8);
+  assert.match(result.rejected[0].reason, /pusta/);
+  assert.match(result.rejected[1].reason, /pusta/);
+  for (const index of [2, 3, 4]) {
+    assert.match(result.rejected[index].reason, /względna/);
+  }
+  for (const index of [5, 6]) {
+    assert.match(result.rejected[index].reason, /segment `\.\.`/);
+  }
+  assert.match(result.rejected[7].reason, /wildcardy/);
+});
+
+test("autoryzacja /scope zawsze odrzuca sekrety, ale dopuszcza przykłady env", () => {
+  const result = authorizeScopePaths(
+    [".env", "config/.env.production", "deploy.pem", "private.key", "credentials.json"],
+    []
+  );
+
+  assert.deepEqual(result.accepted, []);
+  assert.equal(result.rejected.length, 5);
+  assert.ok(result.rejected.every(({ reason }) =>
+    reason.includes("nieodwracalna szkoda") && reason.includes("człowiek")
+  ));
+  assert.deepEqual(authorizeScopePaths(["config/.env.sample"], []).accepted, [
+    "config/.env.sample",
+  ]);
 });
 
 test("odczyt zmian obsługuje spacje, pliki nieśledzone i rename", async () => {
