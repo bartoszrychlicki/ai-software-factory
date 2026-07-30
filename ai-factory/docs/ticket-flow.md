@@ -115,6 +115,13 @@ deterministyczne bez numeru generacji: wersjonowanie nazw odrzucono, ponieważ
 sprzątanie i tak jest wymagane, a jeden otwarty PR na ticket utrzymuje czytelny
 przegląd.
 
+Build uruchomiony przez `/fix` używa trybu `continue-branch`: startuje dokładnie
+z ostatniego SHA opublikowanego przez fabrykę na zapisanej gałęzi. Dzięki temu
+push jest fast-forward i aktualizuje istniejący PR. Niezgodny albo brakujący
+zdalny tip blokuje buildera przed uruchomieniem, więc `BRANCH_DIVERGED` nadal
+chroni cudzą pracę. Synchronizację z `origin/main` wykonuje etap testów przed
+publikacją; force-push nadal nie istnieje.
+
 ## Komentarze postępu
 
 Każde objęte mapą przejście lifecycle atomowo enqueue'uje komentarz w tym samym
