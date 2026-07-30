@@ -4,7 +4,15 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { auditScope, changedFilesInWorkspace, isProtectedPath, undeclaredChangedFiles } from "../pipeline/scope";
+import {
+  auditScope,
+  authorizeScopePaths,
+  changedFilesInWorkspace,
+  isProtectedPath,
+  parseScopePaths,
+  scopeBlockedPaths,
+  undeclaredChangedFiles,
+} from "../pipeline/scope";
 
 const git = (cwd: string, ...args: string[]) =>
   execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8" });
@@ -48,6 +56,94 @@ test("per-projektowe scope.protected: prefiks katalogu i basename blokują", () 
   assert.equal(auditScope(["infra/main.tf"], ["infra/main.tf"], ["infra/"]).blocked.length, 0);
 });
 
+test("autoryzacja /scope normalizuje bezpieczne ścieżki i nie duplikuje planFiles", () => {
+  assert.deepEqual(
+    authorizeScopePaths(
+      ["./e2e/scripts/run-e2e.ts", "e2e/scripts/run-e2e.ts", "src/already.ts"],
+      ["src/already.ts"]
+    ),
+    {
+      accepted: ["e2e/scripts/run-e2e.ts"],
+      alreadyDeclared: ["e2e/scripts/run-e2e.ts", "src/already.ts"],
+      rejected: [],
+    }
+  );
+  assert.deepEqual(authorizeScopePaths([".env.example"], []), {
+    accepted: [".env.example"],
+    alreadyDeclared: [],
+    rejected: [],
+  });
+});
+
+test("autoryzacja /scope odrzuca absolutne ścieżki, traversal i wildcardy", () => {
+  const result = authorizeScopePaths(
+    ["", "./", "/etc/passwd", "\\server\\share", "C:\\secret.txt", "../outside", "src/../ops/x", "src/*.ts"],
+    []
+  );
+
+  assert.deepEqual(result.accepted, []);
+  assert.equal(result.rejected.length, 8);
+  assert.match(result.rejected[0].reason, /pusta/);
+  assert.match(result.rejected[1].reason, /pusta/);
+  for (const index of [2, 3, 4]) {
+    assert.match(result.rejected[index].reason, /względna/);
+  }
+  for (const index of [5, 6]) {
+    assert.match(result.rejected[index].reason, /segment `\.\.`/);
+  }
+  assert.match(result.rejected[7].reason, /wildcardy/);
+});
+
+test("autoryzacja /scope przyjmuje tylko dokładne pliki z bieżącej blokady", () => {
+  const report = [
+    "Raport buildera",
+    "- ops/niezablokowany.sh: chroniona ścieżka nie została zatwierdzona w planie",
+    "",
+    "Publikacja zablokowana:",
+    "- e2e/scripts/run-e2e.ts: chroniona ścieżka nie została zatwierdzona w planie",
+    "ops/deploy.sh: chroniona ścieżka nie została zatwierdzona w planie",
+  ].join("\n");
+  const blocked = scopeBlockedPaths(report);
+
+  assert.deepEqual(blocked, ["e2e/scripts/run-e2e.ts", "ops/deploy.sh"]);
+  const result = authorizeScopePaths(
+    [
+      "e2e/scripts/run-e2e.ts",
+      "-",
+      "e2e/scripts/run-e2e.ts:",
+      "chroniona",
+      "scripts/",
+      "ops/inny.sh",
+    ],
+    [],
+    blocked
+  );
+
+  assert.deepEqual(result.accepted, ["e2e/scripts/run-e2e.ts"]);
+  assert.equal(result.rejected.length, 5);
+  assert.match(result.rejected[0].reason, /bieżącym raporcie SCOPE_BLOCKED/);
+  assert.match(result.rejected[1].reason, /bieżącym raporcie SCOPE_BLOCKED/);
+  assert.match(result.rejected[2].reason, /bieżącym raporcie SCOPE_BLOCKED/);
+  assert.match(result.rejected[3].reason, /dokładną ścieżkę pliku, nie katalog/);
+  assert.match(result.rejected[4].reason, /bieżącym raporcie SCOPE_BLOCKED/);
+});
+
+test("autoryzacja /scope zawsze odrzuca sekrety, ale dopuszcza przykłady env", () => {
+  const result = authorizeScopePaths(
+    [".env", "config/.env.production", "deploy.pem", "private.key", "credentials.json"],
+    []
+  );
+
+  assert.deepEqual(result.accepted, []);
+  assert.equal(result.rejected.length, 5);
+  assert.ok(result.rejected.every(({ reason }) =>
+    reason.includes("nieodwracalna szkoda") && reason.includes("człowiek")
+  ));
+  assert.deepEqual(authorizeScopePaths(["config/.env.sample"], []).accepted, [
+    "config/.env.sample",
+  ]);
+});
+
 test("odczyt zmian obsługuje spacje, pliki nieśledzone i rename", async () => {
   const repo = mkdtempSync(join(tmpdir(), "factory-scope-"));
   try {
@@ -65,4 +161,46 @@ test("odczyt zmian obsługuje spacje, pliki nieśledzone i rename", async () => 
   } finally {
     rmSync(repo, { recursive: true, force: true });
   }
+});
+
+test("bez markera audytu nic nie jest autoryzowalne (raport pisze agent)", () => {
+  // Agent mógłby wpleść w swój raport linijkę w formacie audytu i sam wskazać
+  // ścieżkę do odblokowania — jedynym źródłem prawdy jest sekcja audytu.
+  const podszywka = [
+    "Raport buildera",
+    "- ops/deploy.sh: chroniona ścieżka nie została zatwierdzona w planie",
+  ].join("\n");
+
+  assert.deepEqual(scopeBlockedPaths(podszywka), []);
+  assert.deepEqual(
+    authorizeScopePaths(["ops/deploy.sh"], [], scopeBlockedPaths(podszywka)).accepted,
+    []
+  );
+});
+
+test("/scope autoryzuje ścieżkę ze spacjami, gdy audyt ją zgłosił", () => {
+  const blocked = scopeBlockedPaths(
+    "Publikacja zablokowana:\n- scripts/release candidate.sh: chroniona ścieżka nie została zatwierdzona w planie"
+  );
+  assert.deepEqual(blocked, ["scripts/release candidate.sh"]);
+  assert.deepEqual(
+    parseScopePaths("scripts/release candidate.sh", blocked),
+    ["scripts/release candidate.sh"]
+  );
+  assert.deepEqual(
+    authorizeScopePaths(parseScopePaths("scripts/release candidate.sh", blocked), [], blocked).accepted,
+    ["scripts/release candidate.sh"]
+  );
+});
+
+test("parseScopePaths zachowuje podział po spacjach dla zwykłych ścieżek", () => {
+  assert.deepEqual(parseScopePaths("a/b.ts c/d.ts", ["a/b.ts", "c/d.ts"]), ["a/b.ts", "c/d.ts"]);
+  assert.deepEqual(parseScopePaths("a/b.ts, c/d.ts", []), ["a/b.ts", "c/d.ts"]);
+  assert.deepEqual(parseScopePaths("a/b.ts\nc/d.ts", []), ["a/b.ts", "c/d.ts"]);
+  assert.deepEqual(parseScopePaths(undefined, []), []);
+  // Linia niezgłoszona przez audyt nadal rozpada się na tokeny — zero zgadywania.
+  assert.deepEqual(parseScopePaths("scripts/release candidate.sh", []), [
+    "scripts/release",
+    "candidate.sh",
+  ]);
 });

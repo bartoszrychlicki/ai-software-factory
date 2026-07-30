@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { chmod, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import {
   LifecycleStore,
   type LifecycleRun,
@@ -427,6 +428,222 @@ test("autoformatowane /approve przechodzi przez processCommands do builda", asyn
     else process.env.FACTORY_ROOT = previousRoot;
     await rm(root, { recursive: true, force: true });
   }
+});
+
+async function exerciseScopeCommand(
+  body: string,
+  ticketId: string,
+  options: { extraBodies?: string[]; commentFailures?: number } = {}
+) {
+  const root = await mkdtemp(join(tmpdir(), "factory-scope-command-"));
+  const dbPath = join(root, "registry.db");
+  const previousRoot = process.env.FACTORY_ROOT;
+  const store = new LifecycleStore(dbPath);
+  const ticket = {
+    id: ticketId,
+    title: "Autoryzacja chronionej ścieżki",
+    description: "Opis",
+    labels: [] as string[],
+  };
+  const comments = [body, ...(options.extraBodies ?? [])].map((commentBody, index) => ({
+    id: index === 0 ? `comment-${ticketId}` : `comment-${ticketId}-${index}`,
+    body: commentBody,
+    createdAt: `2026-07-30T10:00:0${index}.000Z`,
+  }));
+  let commentFailures = options.commentFailures ?? 0;
+  try {
+    await writeHarnessFixture(root);
+    process.env.FACTORY_ROOT = root;
+    const inputHash = buildCommentContextSnapshot(
+      ticket.id,
+      ticket.title,
+      ticket.description,
+      []
+    ).effectiveInputHash;
+    store.createRun(ticket.id, "harness", { ...ticket, inputHash });
+    store.transition(ticket.id, {
+      stage: "build",
+      status: "blocked",
+      actor: "builder",
+      reason: "SCOPE_BLOCKED",
+      patch: {
+        plan: "zatwierdzony plan",
+        planFiles: ["e2e/foo.spec.ts"],
+        planDomain: "backend",
+        approvedAt: "2026-07-30T09:55:00.000Z",
+        blockedStage: "build",
+        errorCode: "SCOPE_BLOCKED",
+        // Format 1:1 jak w factory-job.ts — marker audytu jest jedynym źródłem
+        // autoryzowalnych ścieżek (raport agenta powyżej nie jest zaufany).
+        errorMessage:
+          "Raport buildera\n\nPublikacja zablokowana:\n" +
+          "- e2e/scripts/run-e2e.ts: chroniona ścieżka nie została zatwierdzona w planie",
+      },
+    });
+    const source = {
+      async listComments() { return comments; },
+      async getTicket() {
+        return {
+          ...ticket,
+          source: "linear",
+          stateName: "In Progress",
+          url: `https://linear.test/${ticket.id}`,
+        };
+      },
+      async getStateName() { return "In Progress"; },
+      async comment(_commentTicketId: string, commentBody: string) {
+        if (commentFailures > 0) {
+          commentFailures -= 1;
+          throw new Error("LINEAR_COMMENT_FAILED");
+        }
+        comments.push({
+          id: `factory-${comments.length}`,
+          body: commentBody,
+          createdAt: "2026-07-30T10:01:00.000Z",
+        });
+      },
+    };
+    const deps: PollerDependencies = {
+      store,
+      mastra: {
+        async cancelRun() {},
+      } as unknown as PollerDependencies["mastra"],
+      sources: new Map([["harness", source as never]]),
+      notifier: async () => {},
+    };
+
+    await reconcileRun(deps, store.getRun(ticket.id)!);
+    const after = store.getRun(ticket.id)!;
+    const commands = store.outstandingCommands(100);
+    const build = commands.find((command) =>
+      command.kind === "run-job" && command.payload.kind === "build"
+    );
+    const milestone = commands.find((command) =>
+      command.kind === "linear-comment" && command.payload.progress === "milestones"
+    );
+    const auditDb = new DatabaseSync(dbPath);
+    const lastTransition = auditDb.prepare(`
+      SELECT reason
+      FROM lifecycle_transitions
+      WHERE ticket_id = ?
+      ORDER BY rowid DESC
+      LIMIT 1
+    `).get(ticket.id) as { reason: string };
+    auditDb.close();
+    const snapshot = buildCommentContextSnapshot(
+      ticket.id,
+      ticket.title,
+      ticket.description,
+      comments
+    );
+
+    return {
+      after,
+      build,
+      milestone,
+      transitionReason: lastTransition.reason,
+      processed: store.isCommentProcessed(`comment-${ticketId}`),
+      processedExtra: (options.extraBodies ?? []).map((_, index) =>
+        store.isCommentProcessed(`comment-${ticketId}-${index + 1}`)
+      ),
+      comments: comments.map((comment) => comment.body),
+      inputHash,
+      effectiveInputHash: snapshot.effectiveInputHash,
+    };
+  } finally {
+    store.close();
+    if (previousRoot === undefined) delete process.env.FACTORY_ROOT;
+    else process.env.FACTORY_ROOT = previousRoot;
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+test("/scope przechodzi przez processCommands, zapisuje audyt i nie zmienia input hash", async () => {
+  const result = await exerciseScopeCommand(
+    "/scope e2e/scripts/run-e2e.ts",
+    "BAR-SCOPE-OK"
+  );
+
+  assert.deepEqual([result.after.stage, result.after.status], ["build", "running"]);
+  assert.deepEqual(result.after.planFiles, [
+    "e2e/foo.spec.ts",
+    "e2e/scripts/run-e2e.ts",
+  ]);
+  assert.equal(
+    result.transitionReason,
+    "/scope comment-BAR-SCOPE-OK: e2e/scripts/run-e2e.ts"
+  );
+  assert.deepEqual(result.build?.payload.planFiles, result.after.planFiles);
+  assert.match(String(result.build?.payload.feedback), /chroniona ścieżka/);
+  assert.match(String(result.build?.key), /:scope:comment-BAR-SCOPE-OK$/);
+  assert.equal(result.milestone?.payload.progress, "milestones");
+  assert.match(String(result.milestone?.payload.body), /🔓.*e2e\/scripts\/run-e2e\.ts/);
+  assert.equal(result.processed, true);
+  assert.equal(result.effectiveInputHash, result.inputHash);
+});
+
+test("/scope sekretu pozostawia blokadę, odmawia z wyjaśnieniem i nie zmienia input hash", async () => {
+  const result = await exerciseScopeCommand("/scope .env", "BAR-SCOPE-SECRET");
+
+  assert.deepEqual([result.after.stage, result.after.status], ["build", "blocked"]);
+  assert.deepEqual(result.after.planFiles, ["e2e/foo.spec.ts"]);
+  assert.equal(result.build, undefined);
+  assert.equal(result.transitionReason, "SCOPE_BLOCKED");
+  assert.ok(result.comments.some((body) =>
+    body.includes("Zakres nie został rozszerzony") &&
+    body.includes("nieodwracalna szkoda") &&
+    body.includes("/replan <powód>") &&
+    body.includes("[linear:BAR-SCOPE-SECRET:v2]")
+  ));
+  assert.equal(result.processed, true);
+  assert.equal(result.effectiveInputHash, result.inputHash);
+});
+
+test("/scope odrzuca skopiowaną linię raportu zamiast wykonywać pozorne przejście", async () => {
+  const result = await exerciseScopeCommand(
+    "/scope - e2e/scripts/run-e2e.ts: chroniona ścieżka nie została zatwierdzona w planie",
+    "BAR-SCOPE-NOISE"
+  );
+
+  assert.deepEqual([result.after.stage, result.after.status], ["build", "blocked"]);
+  assert.deepEqual(result.after.planFiles, ["e2e/foo.spec.ts"]);
+  assert.equal(result.build, undefined);
+  assert.equal(result.transitionReason, "SCOPE_BLOCKED");
+  assert.ok(result.comments.some((body) =>
+    body.includes("Zakres nie został rozszerzony") &&
+    body.includes("e2e/scripts/run-e2e.ts:") &&
+    body.includes("chroniona") &&
+    body.includes("bieżącym raporcie SCOPE_BLOCKED")
+  ));
+  assert.equal(result.processed, true);
+});
+
+test("/scope bez przejścia nie zatrzymuje kolejnej komendy w tym samym cyklu", async () => {
+  const result = await exerciseScopeCommand(
+    "/scope .env",
+    "BAR-SCOPE-CONTINUE",
+    { extraBodies: ["/replan popraw listę plików"] }
+  );
+
+  assert.equal(result.after.status, "running");
+  assert.equal(result.after.generation, 2);
+  assert.equal(result.transitionReason, "/replan comment-BAR-SCOPE-CONTINUE-1");
+  assert.equal(result.processed, true);
+  assert.deepEqual(result.processedExtra, [true]);
+});
+
+test("/scope ponawia odmowę po błędzie komentarza bez mylącego komunikatu", async () => {
+  const result = await exerciseScopeCommand(
+    "/scope .env",
+    "BAR-SCOPE-COMMENT-FAIL",
+    { commentFailures: 1 }
+  );
+
+  assert.deepEqual([result.after.stage, result.after.status], ["build", "blocked"]);
+  assert.deepEqual(result.after.planFiles, ["e2e/foo.spec.ts"]);
+  assert.equal(result.transitionReason, "SCOPE_BLOCKED");
+  assert.equal(result.processed, false);
+  assert.equal(result.comments.some((body) => body.includes("jest teraz niedozwolona")), false);
 });
 
 test("sweep Done odpowiada hintem /score na nierozpoznaną próbę komendy", async () => {

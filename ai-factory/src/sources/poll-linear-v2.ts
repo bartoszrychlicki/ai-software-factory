@@ -77,6 +77,7 @@ import {
 } from "../pipeline/signature";
 import { progressComment, type ProgressCommentContext } from "../pipeline/progress";
 import { resolveRoute } from "../pipeline/routing";
+import { authorizeScopePaths, parseScopePaths, scopeBlockedPaths } from "../pipeline/scope";
 import { extendedStatusName, LINEAR_STATE_MAP } from "./state-map";
 
 const POLL_INTERVAL_MS = Number(process.env.FACTORY_POLL_INTERVAL_MS ?? 60_000);
@@ -1440,6 +1441,64 @@ async function recordScore(
   ).catch(() => {});
 }
 
+async function applyScopeGrant(
+  deps: PollerDependencies,
+  run: LifecycleRun,
+  source: LinearSource,
+  commentId: string,
+  payload: string | undefined
+): Promise<boolean> {
+  const blockedPaths = scopeBlockedPaths(run.errorMessage);
+  const authorization = authorizeScopePaths(
+    parseScopePaths(payload, blockedPaths),
+    run.planFiles,
+    blockedPaths
+  );
+  const rejected = authorization.rejected.map(({ path, reason }) =>
+    `- \`${path || "(pusta ścieżka)"}\`: ${reason}`
+  );
+  const alreadyDeclared = authorization.alreadyDeclared.map((path) =>
+    `- \`${path}\`: ścieżka jest już w zatwierdzonym planie`
+  );
+  const notes = [...rejected, ...alreadyDeclared];
+
+  if (authorization.accepted.length === 0) {
+    const delivered = await source.comment(
+      run.ticketId,
+      [
+        "⛔ **Zakres nie został rozszerzony.**",
+        ...notes,
+        "Sekretów nie można autoryzować; jeśli plan wymaga innej bezpiecznej ścieżki, użyj `/replan <powód>`.",
+        marker(run.ticketId),
+      ].join("\n\n")
+    ).then(() => true).catch(() => false);
+    if (delivered) {
+      deps.store.markCommentProcessed(run.ticketId, commentId, "scope");
+    }
+    return false;
+  }
+
+  applyDecision(deps, run.ticketId, reduceLifecycle(run, {
+    type: "scope",
+    commentId,
+    paths: authorization.accepted,
+    nextAttempt: deps.store.nextAttempt(run.ticketId, "build"),
+  }));
+  deps.store.markCommentProcessed(run.ticketId, commentId, "scope");
+
+  if (notes.length) {
+    await source.comment(
+      run.ticketId,
+      [
+        "ℹ️ **Część argumentów `/scope` nie zmieniła zakresu:**",
+        ...notes,
+        marker(run.ticketId),
+      ].join("\n\n")
+    ).catch(() => {});
+  }
+  return true;
+}
+
 function enqueueUnknownCommandHint(
   deps: PollerDependencies,
   run: LifecycleRun,
@@ -1457,6 +1516,7 @@ function enqueueUnknownCommandHint(
         stage: run.stage,
         status: run.status,
         blockedStage: run.blockedStage,
+        errorCode: run.errorCode,
         planDomain: run.planDomain,
         approvedAt: run.approvedAt,
         reviewStatus: run.reviewStatus,
@@ -1481,6 +1541,25 @@ async function processCommands(deps: PollerDependencies, run: LifecycleRun): Pro
     if (parsed.kind === "score") {
       await recordScore(deps, run, source, comment.id, parsed.payload);
       continue;
+    }
+    if (parsed.kind === "scope") {
+      try {
+        const transitioned = await applyScopeGrant(
+          deps,
+          run,
+          source,
+          comment.id,
+          parsed.payload
+        );
+        if (!transitioned) continue;
+      } catch (error) {
+        await source.comment(
+          run.ticketId,
+          `ℹ️ Komenda \`${comment.body.split(/\s+/)[0]}\` jest teraz niedozwolona: ${error instanceof Error ? error.message : error}\n\n${marker(run.ticketId)}`
+        );
+        deps.store.markCommentProcessed(run.ticketId, comment.id, parsed.kind);
+      }
+      return;
     }
     let event: CoordinatorEvent | undefined;
     if (parsed.kind === "approve") event = {

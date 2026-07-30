@@ -16,6 +16,7 @@ import {
   REVIEW_CLIP_CHARS,
   type FactoryJobOutput,
 } from "./factory-job";
+import { authorizeScopePaths, scopeBlockedPaths } from "./scope";
 
 type NewCommand = Omit<
   LifecycleCommand,
@@ -37,6 +38,7 @@ export type CoordinatorEvent =
   | { type: "ops-done"; commentId: string }
   | { type: "reject"; commentId: string; reason: string }
   | { type: "retry"; commentId: string; nextAttempt?: number; nextAttempts?: NextAttempts }
+  | { type: "scope"; commentId: string; paths: string[]; nextAttempt?: number }
   | { type: "fix"; commentId: string; hints?: string; nextAttempt?: number }
   | { type: "replan"; commentId: string; reason: string; nextAttempt?: number; nextAttempts?: NextAttempts }
   | { type: "input-changed"; inputHash: string; commentContext?: string; title?: string; description?: string; labels?: string[]; nextAttempt?: number; nextAttempts?: NextAttempts }
@@ -251,12 +253,43 @@ function blocked(
       linearComment(
         run,
         `${stage}:${code}`,
-        `❌ **Proces zatrzymany (${stage})**\n\n${message}\n\nWznowienie tylko przez \`/retry\` albo \`/replan <powód>\`.`,
+        `❌ **Proces zatrzymany (${stage})**\n\n${message}\n\n${resumeHint(code)}`,
         stage,
         signature
       ),
     ],
   };
+}
+
+/**
+ * Blokada audytu zakresu ma własną, tańszą drogę wyjścia — bez tej wzmianki
+ * człowiek trafiający dokładnie na ten przypadek nie dowie się, że `/scope`
+ * istnieje, i zapłaci za pełne przeplanowanie.
+ */
+function resumeHint(code: string): string {
+  if (code === "SCOPE_BLOCKED") {
+    return "Wznowienie: `/scope <ścieżka>` (dopisujesz chronioną ścieżkę do zatwierdzonego planu " +
+      "i budowa rusza dalej), albo `/replan <powód>`.";
+  }
+  return "Wznowienie tylko przez `/retry` albo `/replan <powód>`.";
+}
+
+function blockedErrorMessage(report: string, errorCode: string | undefined): string {
+  const max = 6_000;
+  if (report.length <= max) return report;
+  if (errorCode !== "SCOPE_BLOCKED") return report.slice(0, max);
+
+  const auditMarker = "Publikacja zablokowana:";
+  const auditStart = report.lastIndexOf(auditMarker);
+  if (auditStart < 0) return report.slice(0, max);
+
+  const auditReport = report.slice(auditStart);
+  const separator = "\n\n[…] (środek raportu obcięty)\n\n";
+  const prefixLength = max - auditReport.length - separator.length;
+  // Sam audyt wypełnia limit (albo zostaje na prefiks < 1 znak) → tylko audyt.
+  // Bez tego ujemny prefixLength liczyłby slice od końca i zwracał cały raport.
+  if (prefixLength <= 0) return auditReport.slice(0, max);
+  return `${report.slice(0, prefixLength)}${separator}${auditReport}`;
 }
 
 function assertStage(run: LifecycleRun, expected: LifecycleStage, event: string): void {
@@ -607,6 +640,62 @@ export function reduceLifecycle(run: LifecycleRun, event: CoordinatorEvent): Coo
           payload: { prUrl: run.prUrl, body: prBody, outcome: "fix-dispatched" },
         },
       ],
+    };
+  }
+
+  if (event.type === "scope") {
+    if (
+      run.status !== "blocked" ||
+      run.blockedStage !== "build" ||
+      run.errorCode !== "SCOPE_BLOCKED"
+    ) {
+      throw new Error(
+        "/scope rozszerza zakres wyłącznie dla runu zatrzymanego przez audyt zakresu (SCOPE_BLOCKED)."
+      );
+    }
+    if (!event.paths.length) {
+      throw new Error("/scope wymaga co najmniej jednej dokładnej ścieżki.");
+    }
+    const authorization = authorizeScopePaths(
+      event.paths,
+      run.planFiles,
+      scopeBlockedPaths(run.errorMessage)
+    );
+    if (authorization.accepted.length !== event.paths.length) {
+      const details = [
+        ...authorization.rejected.map(({ path, reason }) => `${path || "(pusta)"}: ${reason}`),
+        ...authorization.alreadyDeclared.map((path) => `${path}: ścieżka jest już w planFiles`),
+      ].join("; ");
+      throw new Error(`/scope zawiera niedozwolone ścieżki${details ? `: ${details}` : "."}`);
+    }
+    const planFiles = [...run.planFiles, ...authorization.accepted];
+    const feedback =
+      `Zakres rozszerzony przez człowieka o: ${authorization.accepted.join(", ")}.\n\n` +
+      "Poprzednia próba została zatrzymana przez audyt zakresu:\n" +
+      clip(run.errorMessage ?? "Brak raportu poprzedniej blokady.", 4000);
+    const nextRun: LifecycleRun = { ...run, planFiles, feedback };
+    return {
+      transition: {
+        stage: "build",
+        status: "running",
+        actor: "human",
+        reason: `/scope ${event.commentId}: ${authorization.accepted.join(", ")}`,
+        patch: {
+          planFiles,
+          feedback,
+          blockedStage: undefined,
+          errorCode: undefined,
+          errorMessage: undefined,
+        },
+      },
+      commands: [jobCommand(
+        nextRun,
+        "build",
+        "build",
+        event.nextAttempt ?? 2,
+        { feedback },
+        `:scope:${event.commentId}`
+      )],
     };
   }
 
@@ -1086,7 +1175,7 @@ export function reduceLifecycle(run: LifecycleRun, event: CoordinatorEvent): Coo
           run,
           "build",
           event.output.errorCode ?? "BUILD_FAILED",
-          event.output.report.slice(0, 6000),
+          blockedErrorMessage(event.output.report, event.output.errorCode),
           event.output.signature
         );
         decision.transition.patch = {

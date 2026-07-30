@@ -5,6 +5,133 @@ const exec = promisify(execFile);
 
 const normalize = (path: string) => path.trim().replace(/^\.\//, "").replace(/\\/g, "/");
 
+export interface ScopeAuthorization {
+  accepted: string[];
+  alreadyDeclared: string[];
+  rejected: { path: string; reason: string }[];
+}
+
+/**
+ * Autoryzowalne są WYŁĄCZNIE ścieżki z deterministycznej sekcji audytu.
+ * Brak markera = nic nie jest autoryzowalne (fail-closed): raport pisze agent,
+ * więc skanowanie całej jego treści pozwoliłoby mu samemu wskazać ścieżkę do
+ * odblokowania. Człowiekowi zostaje wtedy `/replan`.
+ */
+export function scopeBlockedPaths(report: string | undefined): string[] {
+  if (!report) return [];
+  const auditMarker = "Publikacja zablokowana:";
+  const auditStart = report.lastIndexOf(auditMarker);
+  if (auditStart < 0) return [];
+  const auditReport = report.slice(auditStart + auditMarker.length);
+  const paths = auditReport
+    .split(/\r?\n/)
+    .map((line) =>
+      line.trim().match(
+        /^(?:-\s*)?(.+): chroniona ścieżka nie została zatwierdzona w planie$/
+      )?.[1]
+    )
+    .filter((path): path is string => Boolean(path))
+    .map(normalize)
+    .filter(Boolean);
+  return [...new Set(paths)];
+}
+
+/**
+ * Rozbija payload komendy na kandydatów na ścieżki.
+ *
+ * Sam podział po białych znakach gubi pliki ze spacjami (`scripts/release
+ * candidate.sh`) — a takie ścieżki audyt potrafi zablokować, więc bez tego
+ * człowiek nie mógłby ich autoryzować w ogóle. Całą linię bierzemy WYŁĄCZNIE
+ * wtedy, gdy pasuje 1:1 do ścieżki zgłoszonej przez audyt; w pozostałych
+ * przypadkach zostaje stary, zachowawczy podział po spacjach.
+ */
+export function parseScopePaths(payload: string | undefined, blockedPaths: string[] = []): string[] {
+  if (!payload) return [];
+  const blocked = new Set(blockedPaths.map(normalize).filter(Boolean));
+  const paths: string[] = [];
+  for (const chunk of payload.split(/[\n,]+/)) {
+    const line = chunk.trim();
+    if (!line) continue;
+    if (blocked.has(normalize(line))) {
+      paths.push(line);
+      continue;
+    }
+    for (const token of line.split(/\s+/)) {
+      if (token) paths.push(token);
+    }
+  }
+  return paths;
+}
+
+/**
+ * Człowiek może rozszerzyć wyłącznie dokładną allowlistę bieżącego planu.
+ * Reguły są celowo w tym samym module i używają tej samej normalizacji co
+ * auditScope, żeby autoryzowana ścieżka była porównywana 1:1 podczas audytu.
+ */
+export function authorizeScopePaths(
+  rawPaths: string[],
+  declaredFiles: string[],
+  currentlyBlockedPaths?: string[]
+): ScopeAuthorization {
+  const accepted: string[] = [];
+  const alreadyDeclared: string[] = [];
+  const rejected: ScopeAuthorization["rejected"] = [];
+  const declared = new Set(declaredFiles.map(normalize).filter(Boolean));
+  const currentlyBlocked = currentlyBlockedPaths
+    ? new Set(currentlyBlockedPaths.map(normalize).filter(Boolean))
+    : undefined;
+  const acceptedSet = new Set<string>();
+  const alreadyDeclaredSet = new Set<string>();
+
+  for (const rawPath of rawPaths) {
+    const trimmed = rawPath.trim();
+    const normalized = normalize(trimmed);
+    let reason: string | undefined;
+
+    if (!trimmed || !normalized) {
+      reason = "pusta ścieżka";
+    } else if (/^[\\/]/.test(trimmed) || /^[a-z]:[\\/]/i.test(trimmed)) {
+      reason = "ścieżka musi być względna wobec repozytorium";
+    } else if (normalized.split("/").includes("..")) {
+      reason = "segment `..` jest niedozwolony";
+    } else if (/[*?\[]/.test(normalized)) {
+      reason = "wildcardy są niedozwolone — podaj dokładną ścieżkę";
+    } else if (normalized.endsWith("/")) {
+      reason = "podaj dokładną ścieżkę pliku, nie katalog";
+    } else if (isSecretPath(normalized)) {
+      reason =
+        "plik sekretu/klucza — commit sekretu to nieodwracalna szkoda; człowiek też nie może go autoryzować";
+    }
+
+    if (reason) {
+      rejected.push({ path: trimmed, reason });
+      continue;
+    }
+
+    if (declared.has(normalized) || acceptedSet.has(normalized)) {
+      if (!alreadyDeclaredSet.has(normalized)) {
+        alreadyDeclared.push(normalized);
+        alreadyDeclaredSet.add(normalized);
+      }
+      continue;
+    }
+
+    if (currentlyBlocked && !currentlyBlocked.has(normalized)) {
+      rejected.push({
+        path: trimmed,
+        reason:
+          "ścieżka nie występuje w bieżącym raporcie SCOPE_BLOCKED — podaj dokładną zablokowaną ścieżkę pliku",
+      });
+      continue;
+    }
+
+    accepted.push(normalized);
+    acceptedSet.add(normalized);
+  }
+
+  return { accepted, alreadyDeclared, rejected };
+}
+
 /** Odczyt statusu NUL-separated nie psuje ścieżek ze spacjami ani rename'ów. */
 export async function changedFilesInWorkspace(cwd: string): Promise<string[]> {
   const { stdout } = await exec(
