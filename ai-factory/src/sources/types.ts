@@ -21,7 +21,7 @@ export interface Ticket {
 export interface TicketSource {
   name: string;
   listReady(): Promise<Ticket[]>;
-  claim(id: string): Promise<void>;
+  claim(id: string, preferredStateName?: string): Promise<void>;
   setStatus(id: string, status: FactoryStatus): Promise<void>;
   comment(id: string, body: string, signature?: ActionSignature): Promise<void>;
 }

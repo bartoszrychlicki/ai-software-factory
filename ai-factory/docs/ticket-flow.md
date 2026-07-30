@@ -63,6 +63,20 @@ Linear jest projekcją uproszczoną: `Todo`, `In Progress`, `In Review`, `Done`,
 `👤 ⛔ Zablokowany`, `Canceled`. Zdarzenia GitHub i SQLite pozostają źródłem
 prawdy nawet po ręcznym przestawieniu Lineara.
 
+### Kto pisze stan w Linear
+
+Poller v2 zapisuje stan wyłącznie przez `writeLinearState`. Bezpośrednio przed
+mutacją pobiera świeży stan issue. Jeśli człowiek ustawił stan terminalny
+`Done`, `Canceled` albo `Duplicate`, fabryka nie nadpisuje go żadną oczekującą
+projekcją z outboxa. Dozwolone pozostaje własne przejście fabryki ze stanu
+nieterminalnego do terminalnego: `Done` po smoke albo `Canceled` po obsłużeniu
+zdarzenia anulowania.
+
+Claim również przechodzi przez ten guard. Projekt z `statuses: extended`
+zaczyna od `🧠 Planowanie`, a projekt z projekcją prostą zachowuje
+`In Progress`. Nowsza oczekująca projekcja statusu unieważnia starszą, żeby
+opóźniona komenda nie cofnęła karty do poprzedniej fazy.
+
 ## Recovery
 
 Każdy efekt ma stabilny idempotency key. Po restarcie poller:
