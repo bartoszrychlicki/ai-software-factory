@@ -543,8 +543,9 @@ async function dispatchJob(
 
   const jobMinutes = jobBudgetMinutes(String(command.payload.kind));
   const perMinute = Number(process.env.FACTORY_SYNTH_USD_PER_MIN ?? 0.15);
-  // Zapas kosztuje jak druga pełna próba. Wpuszczamy go tylko, gdy po
-  // rezerwacji bieżącego joba nadal zostaje headroom na jeszcze jedną.
+  // Zapas liczy się jak kolejna próba. Wpuszczamy go tylko, gdy po rezerwacji
+  // bieżącego joba w obu limitach pozostaje dodatni margines; faktyczny koszt
+  // drugiej próby zostanie doliczony z outputu joba.
   const allowEngineFallback =
     usage.minutes + reserved.minutes + jobMinutes < maxMinutes &&
     usage.usd + reserved.usd + jobMinutes * perMinute < maxUsd;

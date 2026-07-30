@@ -1,18 +1,25 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { chmodSync, existsSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import type { EngineAdapter, EngineRunResult } from "../engines/types";
-import { classifyEngineFailure } from "../pipeline/failure-classes";
+import {
+  classifyEngineFailure,
+  classifyEngineRunFailure,
+} from "../pipeline/failure-classes";
 import {
   executeFactoryJobInput,
   type FactoryJobRuntime,
 } from "../pipeline/factory-job";
 import type { Route } from "../pipeline/routing";
 import { createTestGitRepo, useTestWorktrees } from "./git-fixture";
+
+const here = dirname(fileURLToPath(import.meta.url));
+const factoryDir = join(here, "../..");
 
 const validPlan = [
   "# Plan",
@@ -88,6 +95,39 @@ function adapter(
   };
 }
 
+function runAdapterInChild(
+  moduleName: "codex" | "claude-code",
+  exportName: "codex" | "claudeCode",
+  binEnv: "CODEX_BIN" | "CLAUDE_BIN",
+  bin: string,
+  workspace: string
+): EngineRunResult {
+  const moduleUrl = pathToFileURL(
+    join(factoryDir, "src", "engines", `${moduleName}.ts`)
+  ).href;
+  const source = [
+    `const { ${exportName} } = await import(${JSON.stringify(moduleUrl)});`,
+    `const result = await ${exportName}.run(${JSON.stringify({
+      role: "plan",
+      instructions: "instrukcje",
+      context: "kontekst",
+      workspace,
+      budget: { minutes: 1 },
+    })});`,
+    "process.stdout.write(JSON.stringify(result));",
+  ].join("\n");
+  const stdout = execFileSync(
+    process.execPath,
+    ["--import", "tsx", "--input-type=module", "--eval", source],
+    {
+      cwd: factoryDir,
+      env: { ...process.env, [binEnv]: bin },
+      encoding: "utf8",
+    }
+  );
+  return JSON.parse(stdout) as EngineRunResult;
+}
+
 test("infra-pad głównego przechodzi na zapas z jawną metryką, artefaktem i podpisem", async () => {
   await withFixture("success", async ({ root, repo }) => {
     const primaryCalls = { count: 0 };
@@ -97,6 +137,7 @@ test("infra-pad głównego przechodzi na zapas z jawną metryką, artefaktem i p
       adapter("primary", {
         ok: false,
         report: "failed to lookup address information",
+        stderr: "failed to lookup address information",
         costUsd: 1,
       }, primaryCalls),
       adapter("fallback", { ok: true, report: validPlan, costUsd: 2 }, fallbackCalls)
@@ -177,6 +218,15 @@ test("wyniki merytoryczne nie uruchamiają zapasu", async () => {
         result: { ok: false, report: "PLAN: BLOCKED — wymagania są sprzeczne" },
         expected: "failed",
       },
+      {
+        name: "proza modelu o awariach",
+        kind: "plan",
+        result: {
+          ok: false,
+          report: "Plan opisuje timeout, 429 rate limit i websocket jako wymagania systemu.",
+        },
+        expected: "failed",
+      },
     ];
     const headSha = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
 
@@ -213,7 +263,12 @@ test("pad zapasu kończy etap bez trzeciej próby", async () => {
     const fallbackCalls = { count: 0 };
     const runtime = runtimeWith(
       repo,
-      adapter("primary", { ok: false, report: "getaddrinfo ENOTFOUND primary", costUsd: 1 }, primaryCalls),
+      adapter("primary", {
+        ok: false,
+        report: "getaddrinfo ENOTFOUND primary",
+        stderr: "getaddrinfo ENOTFOUND primary",
+        costUsd: 1,
+      }, primaryCalls),
       adapter("fallback", { ok: false, report: "getaddrinfo ENOTFOUND fallback", costUsd: 2 }, fallbackCalls)
     );
     const output = await executeFactoryJobInput(
@@ -248,6 +303,52 @@ test("brak headroomu budżetu blokuje zapas", async () => {
       (await readFile(join(root, "runs", "metrics.jsonl"), "utf8")).trim()
     ) as Record<string, unknown>;
     assert.equal(metric.fallbackDecision, "budget");
+    assert.equal(metric.outcome, "failed");
+    assert.equal(metric.humanSummary, "summary-missing");
+    assert.equal(metric.resumed, false);
+  });
+});
+
+test("awaria bez kandydata zachowuje bogatą metrykę etapu planu", async () => {
+  await withFixture("no-candidate-metric", async ({ root, repo }) => {
+    const primaryCalls = { count: 0 };
+    const primary = adapter("primary", {
+      ok: false,
+      report: "",
+      terminationReason: "empty-report",
+      costUsd: 1,
+    }, primaryCalls);
+    const primaryRoute = route(primary, "primary/primary-model@high", "primary-model");
+    const runtime: FactoryJobRuntime = {
+      async route() {
+        return primaryRoute;
+      },
+      async routeCandidates() {
+        return [primaryRoute];
+      },
+      async project() {
+        return { repo, default_branch: "main", checks: ["true"] };
+      },
+    };
+
+    const output = await executeFactoryJobInput(
+      { kind: "plan", attempt: 1, ticket, planFiles: [] },
+      "run-no-candidate",
+      undefined,
+      runtime
+    );
+
+    assert.equal(output.outcome, "failed");
+    assert.equal(primaryCalls.count, 1);
+    const rows = (await readFile(join(root, "runs", "metrics.jsonl"), "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].outcome, "failed");
+    assert.equal(rows[0].fallbackDecision, "no-candidate");
+    assert.equal(rows[0].humanSummary, "summary-missing");
+    assert.equal(rows[0].resumed, false);
   });
 });
 
@@ -259,7 +360,12 @@ test("build czyści częściową pracę głównego silnika przed zapasem", async
       repo,
       adapter("primary", async (workspace) => {
         await writeFile(join(workspace, "partial.txt"), "częściowa praca\n");
-        return { ok: false, report: "failed to connect to websocket", costUsd: 1 };
+        return {
+          ok: false,
+          report: "failed to connect to websocket",
+          stderr: "failed to connect to websocket",
+          costUsd: 1,
+        };
       }, primaryCalls),
       adapter("fallback", async (workspace) => {
         assert.equal(existsSync(join(workspace, "partial.txt")), false);
@@ -294,6 +400,7 @@ test("classifyEngineFailure rozdziela awarie infrastruktury od wyników pracy", 
     "credit balance is too low",
     "429 rate limit",
     "spawn claude ENOENT",
+    "Proces codex zakończył się błędem (process-error)",
     "request timeout",
   ]) {
     assert.equal(classifyEngineFailure(message), "infra", message);
@@ -305,5 +412,109 @@ test("classifyEngineFailure rozdziela awarie infrastruktury od wyników pracy", 
     "budżet ticketu wyczerpany",
   ]) {
     assert.equal(classifyEngineFailure(message), "work", message);
+  }
+});
+
+test("klasyfikacja wyniku nie traktuje prozy modelu jak diagnostyki", () => {
+  assert.equal(classifyEngineRunFailure({
+    report: "Plan opisuje 429 rate limit, timeout uwierzytelniania i websocket.",
+  }), "work");
+  assert.equal(classifyEngineRunFailure({ report: "" }), "infra");
+  assert.equal(classifyEngineRunFailure({
+    report: "",
+    stderr: "nieznany komunikat diagnostyczny",
+  }), "infra");
+  assert.equal(classifyEngineRunFailure({
+    report: "Model zdążył opisać timeout jako wymaganie.",
+    stderr: "failed to connect to websocket",
+    terminationReason: "process-error",
+  }), "infra");
+  assert.equal(classifyEngineRunFailure({
+    report: "",
+    stderr: "SIGTERM",
+    terminationReason: "abort",
+  }), "work");
+});
+
+test("codex i claude-code wystawiają stderr oraz przyczynę zakończenia poza raportem modelu", async () => {
+  const root = await mkdtemp(join(tmpdir(), "factory-engine-adapter-errors-"));
+  const fakeCodex = join(root, "codex");
+  const silentCodex = join(root, "codex-silent");
+  const fakeClaude = join(root, "claude");
+  try {
+    await writeFile(fakeCodex, [
+      "#!/usr/bin/env node",
+      'const { writeFileSync } = require("node:fs");',
+      "const args = process.argv.slice(2);",
+      'const outputIndex = args.indexOf("--output-last-message");',
+      "process.stdin.resume();",
+      'process.stdin.on("end", () => {',
+      '  writeFileSync(args[outputIndex + 1], "Plan opisuje timeout i 429 jako wymagania.");',
+      '  process.stderr.write("failed to connect to websocket\\n");',
+      "  process.exit(1);",
+      "});",
+    ].join("\n"));
+    await writeFile(silentCodex, [
+      "#!/usr/bin/env node",
+      "process.stdin.resume();",
+      'process.stdin.on("end", () => process.exit(0));',
+    ].join("\n"));
+    await writeFile(fakeClaude, [
+      "#!/usr/bin/env node",
+      `process.stdout.write(${JSON.stringify(JSON.stringify({
+        type: "assistant",
+        message: {
+          content: [{
+            type: "text",
+            text: "Recenzja omawia authentication, quota i timeout jako część projektu.",
+          }],
+        },
+      }) + "\n")});`,
+      'process.stderr.write("failed to lookup address information\\n");',
+      "process.exit(1);",
+    ].join("\n"));
+    chmodSync(fakeCodex, 0o755);
+    chmodSync(silentCodex, 0o755);
+    chmodSync(fakeClaude, 0o755);
+
+    const codexResult = runAdapterInChild(
+      "codex",
+      "codex",
+      "CODEX_BIN",
+      fakeCodex,
+      root
+    );
+    assert.equal(codexResult.ok, false);
+    assert.match(codexResult.report, /Plan opisuje timeout/);
+    assert.match(codexResult.stderr ?? "", /failed to connect to websocket/);
+    assert.equal(codexResult.terminationReason, "process-error");
+    assert.equal(classifyEngineRunFailure(codexResult), "infra");
+
+    const claudeResult = runAdapterInChild(
+      "claude-code",
+      "claudeCode",
+      "CLAUDE_BIN",
+      fakeClaude,
+      root
+    );
+    assert.equal(claudeResult.ok, false);
+    assert.match(claudeResult.report, /Recenzja omawia authentication/);
+    assert.match(claudeResult.stderr ?? "", /failed to lookup address information/);
+    assert.equal(claudeResult.terminationReason, "process-error");
+    assert.equal(classifyEngineRunFailure(claudeResult), "infra");
+
+    const silentResult = runAdapterInChild(
+      "codex",
+      "codex",
+      "CODEX_BIN",
+      silentCodex,
+      root
+    );
+    assert.equal(silentResult.ok, false);
+    assert.equal(silentResult.report, "");
+    assert.equal(silentResult.terminationReason, "empty-report");
+    assert.equal(classifyEngineRunFailure(silentResult), "infra");
+  } finally {
+    await rm(root, { recursive: true, force: true });
   }
 });

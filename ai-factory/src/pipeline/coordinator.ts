@@ -353,17 +353,13 @@ function annotateEngineFallback(
   return decision;
 }
 
-function reduceJobFinished(run: LifecycleRun, event: JobFinishedEvent): CoordinatorDecision {
-  return reduceLifecycleCore(run, event);
-}
-
 export function reduceLifecycle(run: LifecycleRun, event: CoordinatorEvent): CoordinatorDecision {
   if (event.type !== "job-finished") return reduceLifecycleCore(run, event);
   const note = engineFallbackNote(event);
   const annotatedRun = note && !(run.degradations ?? []).includes(note)
     ? { ...run, degradations: [...(run.degradations ?? []), note] }
     : run;
-  return annotateEngineFallback(run, event, reduceJobFinished(annotatedRun, event));
+  return annotateEngineFallback(run, event, reduceLifecycleCore(annotatedRun, event));
 }
 
 function reduceLifecycleCore(run: LifecycleRun, event: CoordinatorEvent): CoordinatorDecision {

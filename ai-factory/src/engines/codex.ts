@@ -109,14 +109,19 @@ export const codex: EngineAdapter = {
         report: report || `Proces codex zakończył się błędem (${reason}). stderr:\n${stderr.slice(-2000)}`,
         costUsd,
         costSource,
+        stderr: stderr.slice(-5000),
+        terminationReason: reason,
         raw: { stderr: stderr.slice(-5000) },
       };
     }
+    const ok = report.trim().length > 0;
     return {
-      ok: report.trim().length > 0,
+      ok,
       report,
       costUsd,
       costSource,
+      stderr: stderr.slice(-5000),
+      terminationReason: ok ? undefined : "empty-report",
       raw: { stdout: stdout.slice(-5000), tokenUsage: usage },
     };
   },

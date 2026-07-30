@@ -29,7 +29,10 @@ import {
 import { changeManifest } from "./quality";
 import { auditScope, changedFilesInWorkspace } from "./scope";
 import { critiqueMeaningOf, humanSummaryOf } from "./human-summary";
-import { classifyEngineFailure } from "./failure-classes";
+import {
+  classifyEngineRunFailure,
+  engineFailureDiagnostic,
+} from "./failure-classes";
 import type { Route, Stage } from "./routing";
 import type { ProjectConfig } from "./projects";
 import type { ActionSignature } from "./signature";
@@ -204,8 +207,6 @@ interface EngineAttempt {
   /** Koszt/czas wyłącznie faktycznie użytego, finalnego kandydata. */
   finalCostUsd: number;
   finalDurationMs: number;
-  /** `true`, gdy helper zapisał już finalną metrykę engine-fail. */
-  finalFailureMetricRecorded: boolean;
 }
 
 async function jobRouteCandidates(
@@ -223,12 +224,16 @@ async function jobRouteCandidates(
 function fallbackMetricFields(attempt: EngineAttempt): {
   engineFallback?: string;
   fallbackReason?: string;
+  fallbackDecision?: FallbackDecision;
 } {
-  return attempt.fallback
-    ? {
-        engineFallback: `${attempt.fallback.from} → ${attempt.fallback.to}`,
-        fallbackReason: attempt.fallback.reason,
-      }
+  if (attempt.fallback) {
+    return {
+      engineFallback: `${attempt.fallback.from} → ${attempt.fallback.to}`,
+      fallbackReason: attempt.fallback.reason,
+    };
+  }
+  return attempt.fallbackDecision
+    ? { fallbackDecision: attempt.fallbackDecision }
     : {};
 }
 
@@ -278,7 +283,6 @@ async function runEngineWithFallback(
       costSource: first.costSource,
       finalCostUsd: first.costUsd,
       finalDurationMs: first.durationMs,
-      finalFailureMetricRecorded: false,
     };
   }
 
@@ -286,9 +290,27 @@ async function runEngineWithFallback(
     ? "budget"
     : !candidates[1]
       ? "no-candidate"
-      : classifyEngineFailure(first.result.report) === "work"
+      : classifyEngineRunFailure(first.result) === "work"
         ? "not-infra"
         : "used";
+
+  if (decision !== "used") {
+    return {
+      result: first.result,
+      route: primary,
+      signature: buildSignature(stage, primary),
+      fallbackDecision: decision,
+      costUsd: first.costUsd,
+      durationMs: first.durationMs,
+      costSource: first.costSource,
+      finalCostUsd: first.costUsd,
+      finalDurationMs: first.durationMs,
+    };
+  }
+
+  // Osobny wiersz próby głównej istnieje wyłącznie wtedy, gdy faktycznie
+  // uruchamiamy drugi silnik. Bez zapasu etap zapisuje swój dotychczasowy,
+  // bogatszy wiersz metryki (np. humanSummary/resumed).
   await recordMetric({
     ticket: ctx.ticket,
     runId: ctx.runId,
@@ -303,55 +325,15 @@ async function runEngineWithFallback(
     fallbackDecision: decision,
   });
 
-  if (decision !== "used") {
-    return {
-      result: first.result,
-      route: primary,
-      signature: buildSignature(stage, primary),
-      fallbackDecision: decision,
-      costUsd: first.costUsd,
-      durationMs: first.durationMs,
-      costSource: first.costSource,
-      finalCostUsd: first.costUsd,
-      finalDurationMs: first.durationMs,
-      finalFailureMetricRecorded: true,
-    };
-  }
-
   const fallbackRoute = candidates[1];
   await beforeFallback?.();
+  const diagnostic = engineFailureDiagnostic(first.result);
   const fallback: EngineFallback = {
     from: primary.spec,
     to: fallbackRoute.spec,
-    reason: first.result.report.slice(0, 200),
+    reason: (diagnostic || "silnik nie zwrócił raportu ani diagnostyki").slice(0, 200),
   };
   const second = await runOne(fallbackRoute);
-  if (!second.result.ok) {
-    await recordMetric({
-      ticket: ctx.ticket,
-      runId: ctx.runId,
-      stage: ctx.metricStage,
-      engine: fallbackRoute.spec,
-      attempt: ctx.attempt,
-      ok: false,
-      outcome: "engine-fail",
-      costUsd: second.costUsd,
-      durationMs: second.durationMs,
-      baseSha: ctx.baseSha,
-      ...fallbackMetricFields({
-        result: second.result,
-        route: fallbackRoute,
-        signature: buildSignature(stage, fallbackRoute),
-        fallback,
-        costUsd: first.costUsd + second.costUsd,
-        durationMs: first.durationMs + second.durationMs,
-        costSource: second.costSource,
-        finalCostUsd: second.costUsd,
-        finalDurationMs: second.durationMs,
-        finalFailureMetricRecorded: true,
-      }),
-    });
-  }
   return {
     result: second.result,
     route: fallbackRoute,
@@ -363,7 +345,6 @@ async function runEngineWithFallback(
     costSource: second.costSource,
     finalCostUsd: second.costUsd,
     finalDurationMs: second.durationMs,
-    finalFailureMetricRecorded: !second.result.ok,
   };
 }
 
@@ -552,23 +533,21 @@ async function runPlan(
             ? "questions"
             : "failed";
       const questions = verdict.questions ? formatClarifyQuestions(verdict.questions) : undefined;
-      if (!engineAttempt.finalFailureMetricRecorded) {
-        await recordMetric({
-          ticket: input.ticket.id,
-          runId,
-          stage: "plan",
-          engine: route.spec,
-          attempt: input.attempt,
-          ok: outcome !== "failed",
-          outcome,
-          costUsd: engineAttempt.finalCostUsd,
-          durationMs: engineAttempt.finalDurationMs,
-          baseSha: base.sha,
-          resumed: false,
-          humanSummary: summary ? "summary-present" : "summary-missing",
-          ...fallbackMetricFields(engineAttempt),
-        });
-      }
+      await recordMetric({
+        ticket: input.ticket.id,
+        runId,
+        stage: "plan",
+        engine: route.spec,
+        attempt: input.attempt,
+        ok: outcome !== "failed",
+        outcome,
+        costUsd: engineAttempt.finalCostUsd,
+        durationMs: engineAttempt.finalDurationMs,
+        baseSha: base.sha,
+        resumed: false,
+        humanSummary: summary ? "summary-present" : "summary-missing",
+        ...fallbackMetricFields(engineAttempt),
+      });
       await saveArtifact(
         input.ticket.id,
         runId,
@@ -673,21 +652,19 @@ async function runTriage(
         : verdict.questions
           ? "questions"
           : "success";
-      if (!engineAttempt.finalFailureMetricRecorded) {
-        await recordMetric({
-          ticket: input.ticket.id,
-          runId,
-          stage: "triage",
-          engine: route.spec,
-          attempt: input.attempt,
-          ok: outcome !== "failed",
-          outcome,
-          costUsd: engineAttempt.finalCostUsd,
-          durationMs: engineAttempt.finalDurationMs,
-          baseSha: base.sha,
-          ...fallbackMetricFields(engineAttempt),
-        });
-      }
+      await recordMetric({
+        ticket: input.ticket.id,
+        runId,
+        stage: "triage",
+        engine: route.spec,
+        attempt: input.attempt,
+        ok: outcome !== "failed",
+        outcome,
+        costUsd: engineAttempt.finalCostUsd,
+        durationMs: engineAttempt.finalDurationMs,
+        baseSha: base.sha,
+        ...fallbackMetricFields(engineAttempt),
+      });
       await saveArtifact(
         input.ticket.id,
         runId,
@@ -806,21 +783,19 @@ async function runResearch(
       const { costUsd, costSource, durationMs } = engineAttempt;
       const brief = (result.transcript ?? result.report).trim();
       const outcome = result.ok && brief ? "success" : "failed";
-      if (!engineAttempt.finalFailureMetricRecorded) {
-        await recordMetric({
-          ticket: input.ticket.id,
-          runId,
-          stage,
-          engine: route.spec,
-          attempt: input.attempt,
-          ok: outcome === "success",
-          outcome,
-          costUsd: engineAttempt.finalCostUsd,
-          durationMs: engineAttempt.finalDurationMs,
-          baseSha: base.sha,
-          ...fallbackMetricFields(engineAttempt),
-        });
-      }
+      await recordMetric({
+        ticket: input.ticket.id,
+        runId,
+        stage,
+        engine: route.spec,
+        attempt: input.attempt,
+        ok: outcome === "success",
+        outcome,
+        costUsd: engineAttempt.finalCostUsd,
+        durationMs: engineAttempt.finalDurationMs,
+        baseSha: base.sha,
+        ...fallbackMetricFields(engineAttempt),
+      });
       await saveArtifact(
         input.ticket.id,
         runId,
@@ -943,22 +918,20 @@ async function runSynthesis(
           : verdict.questions
             ? "questions"
             : "failed";
-      if (!engineAttempt.finalFailureMetricRecorded) {
-        await recordMetric({
-          ticket: input.ticket.id,
-          runId,
-          stage: "synthesis",
-          engine: route.spec,
-          attempt: input.attempt,
-          ok: outcome !== "failed",
-          outcome,
-          costUsd: engineAttempt.finalCostUsd,
-          durationMs: engineAttempt.finalDurationMs,
-          baseSha: base.sha,
-          humanSummary: summary ? "summary-present" : "summary-missing",
-          ...fallbackMetricFields(engineAttempt),
-        });
-      }
+      await recordMetric({
+        ticket: input.ticket.id,
+        runId,
+        stage: "synthesis",
+        engine: route.spec,
+        attempt: input.attempt,
+        ok: outcome !== "failed",
+        outcome,
+        costUsd: engineAttempt.finalCostUsd,
+        durationMs: engineAttempt.finalDurationMs,
+        baseSha: base.sha,
+        humanSummary: summary ? "summary-present" : "summary-missing",
+        ...fallbackMetricFields(engineAttempt),
+      });
       await saveArtifact(
         input.ticket.id,
         runId,
@@ -1103,21 +1076,19 @@ async function runCritique(
       const critiqueMeaning = critiqueMeaningOf(report);
       const verdict = parseCritiqueVerdict(report);
       const critiqueVerdict = !result.ok || verdict.source === "missing" ? "unavailable" : verdict.verdict;
-      if (!engineAttempt.finalFailureMetricRecorded) {
-        await recordMetric({
-          ticket: input.ticket.id,
-          runId,
-          stage: "critique",
-          engine: route.spec,
-          attempt: input.attempt,
-          ok: critiqueVerdict !== "unavailable",
-          outcome: critiqueVerdict,
-          costUsd: engineAttempt.finalCostUsd,
-          durationMs: engineAttempt.finalDurationMs,
-          baseSha: base.sha,
-          ...fallbackMetricFields(engineAttempt),
-        });
-      }
+      await recordMetric({
+        ticket: input.ticket.id,
+        runId,
+        stage: "critique",
+        engine: route.spec,
+        attempt: input.attempt,
+        ok: critiqueVerdict !== "unavailable",
+        outcome: critiqueVerdict,
+        costUsd: engineAttempt.finalCostUsd,
+        durationMs: engineAttempt.finalDurationMs,
+        baseSha: base.sha,
+        ...fallbackMetricFields(engineAttempt),
+      });
       await saveArtifact(
         input.ticket.id,
         runId,
@@ -1314,6 +1285,18 @@ async function runBuild(
   const { result, route, signature } = engineAttempt;
   const { costUsd, costSource, durationMs } = engineAttempt;
   if (!result.ok) {
+    await recordMetric({
+      ticket: input.ticket.id,
+      runId,
+      stage: "build",
+      engine: route.spec,
+      attempt: input.attempt,
+      ok: false,
+      outcome: "engine-fail",
+      costUsd: engineAttempt.finalCostUsd,
+      durationMs: engineAttempt.finalDurationMs,
+      ...fallbackMetricFields(engineAttempt),
+    });
     await saveArtifact(
       input.ticket.id,
       runId,
@@ -1513,21 +1496,19 @@ async function runReview(
       : verdict.needsFix
         ? "advisory-fix"
         : "lgtm";
-    if (!engineAttempt.finalFailureMetricRecorded) {
-      await recordMetric({
-        ticket: input.ticket.id,
-        runId,
-        stage: "review",
-        engine: route.spec,
-        attempt: input.attempt,
-        ok: reviewVerdict !== "unavailable",
-        outcome: reviewVerdict,
-        costUsd: engineAttempt.finalCostUsd,
-        durationMs: engineAttempt.finalDurationMs,
-        baseSha: input.headSha,
-        ...fallbackMetricFields(engineAttempt),
-      });
-    }
+    await recordMetric({
+      ticket: input.ticket.id,
+      runId,
+      stage: "review",
+      engine: route.spec,
+      attempt: input.attempt,
+      ok: reviewVerdict !== "unavailable",
+      outcome: reviewVerdict,
+      costUsd: engineAttempt.finalCostUsd,
+      durationMs: engineAttempt.finalDurationMs,
+      baseSha: input.headSha,
+      ...fallbackMetricFields(engineAttempt),
+    });
     await saveArtifact(
       input.ticket.id,
       runId,
