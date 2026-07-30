@@ -840,6 +840,14 @@ export class LifecycleStore {
     ).get(commentId);
   }
 
+  processedCommandIds(ticketId: string): Set<string> {
+    const rows = this.db.prepare(`
+      SELECT comment_id FROM lifecycle_processed_comments
+      WHERE ticket_id=?
+    `).all(ticketId) as { comment_id: string }[];
+    return new Set(rows.map((row) => row.comment_id));
+  }
+
   markCommentProcessed(ticketId: string, commentId: string, command?: string): void {
     this.db.prepare(`
       INSERT OR IGNORE INTO lifecycle_processed_comments (

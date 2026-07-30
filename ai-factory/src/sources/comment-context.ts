@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { isCommandAttempt, parseCommand } from "./commands";
+import { ALL_COMMAND_KINDS, isCommandAttempt, parseCommand } from "./commands";
 import type { LinearComment } from "./linear";
 
 export interface RelevantComment {
@@ -28,14 +28,17 @@ const hasFactoryMarker = (body: string, ticketId: string) =>
  * merytoryczną, więc zachowujemy go bez tokenu komendy.
  */
 export function extractRelevantComments(
-  comments: readonly Pick<LinearComment, "body" | "createdAt">[],
-  ticketId: string
+  comments: readonly (Pick<LinearComment, "body" | "createdAt"> & { id?: string })[],
+  ticketId: string,
+  executedCommandIds: ReadonlySet<string> = new Set()
 ): RelevantComment[] {
   return comments
     .flatMap((comment): RelevantComment[] => {
       const body = comment.body.trim();
       if (!body || hasFactoryMarker(body, ticketId)) return [];
-      const command = parseCommand(body);
+      const command = comment.id && executedCommandIds.has(comment.id)
+        ? parseCommand(body, ALL_COMMAND_KINDS)
+        : parseCommand(body);
       if (!command) {
         // Nieudana próba komendy nie jest treścią planistyczną i nie może
         // zmieniać effectiveInputHash ani uruchamiać input-changed.
@@ -54,10 +57,18 @@ export function buildCommentContextSnapshot(
   ticketId: string,
   title: string,
   description: string,
-  rawComments: readonly Pick<LinearComment, "body" | "createdAt">[],
-  options: { maxComments?: number; maxChars?: number } = {}
+  rawComments: readonly (Pick<LinearComment, "body" | "createdAt"> & { id?: string })[],
+  options: {
+    maxComments?: number;
+    maxChars?: number;
+    executedCommandIds?: ReadonlySet<string>;
+  } = {}
 ): CommentContextSnapshot {
-  const relevant = extractRelevantComments(rawComments, ticketId);
+  const relevant = extractRelevantComments(
+    rawComments,
+    ticketId,
+    options.executedCommandIds
+  );
   const maxComments = options.maxComments ?? DEFAULT_COMMENT_LIMIT;
   const maxChars = options.maxChars ?? DEFAULT_COMMENT_CHARS;
   const selected: RelevantComment[] = [];

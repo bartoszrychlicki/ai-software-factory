@@ -201,7 +201,7 @@ function approvalGateComment(
     critiqueSection,
     degradations,
     cost,
-    "Zatwierdź wyłącznie komendą `/approve` albo odrzuć: `/reject <powód>`.",
+    "Zatwierdź komendą `approve` (albo `/approve`) lub odrzuć: `reject <powód>` (albo `/reject <powód>`).",
   ].filter(Boolean).join("\n\n");
   return linearComment(run, suffix, body, "approval", opts.signature);
 }
@@ -225,7 +225,7 @@ function blocked(
       linearComment(
         run,
         `${stage}:${code}`,
-        `❌ **Proces zatrzymany (${stage})**\n\n${message}\n\nWznowienie tylko przez \`/retry\` albo \`/replan <powód>\`.`,
+        `❌ **Proces zatrzymany (${stage})**\n\n${message}\n\nWznowienie przez \`retry\` (albo \`/retry\`) lub \`replan <powód>\` (albo \`/replan <powód>\`).`,
         stage,
         signature
       ),
@@ -364,7 +364,7 @@ export function reduceLifecycle(run: LifecycleRun, event: CoordinatorEvent): Coo
         commands: [linearComment(
           run,
           "ops-checklist",
-          "🧾 **Plan ops zatwierdzony.** Wykonaj checklistę ręcznie, a następnie potwierdź wyłącznie komendą `/done`.",
+          "🧾 **Plan ops zatwierdzony.** Wykonaj checklistę ręcznie, a następnie potwierdź komendą `done` (albo `/done`).",
           "approval"
         )],
       };
@@ -654,7 +654,7 @@ export function reduceLifecycle(run: LifecycleRun, event: CoordinatorEvent): Coo
           commands: [linearComment(
             run,
             `questions:${run.clarifyRound + 1}`,
-            `❓ **Pytania do planu — runda ${run.clarifyRound + 1}/2**\n\n${event.output.questions}\n\nOdpowiedz: \`/answer <odpowiedź>\`.`,
+            `❓ **Pytania do planu — runda ${run.clarifyRound + 1}/2**\n\n${event.output.questions}\n\nOdpowiedz: \`answer <odpowiedź>\` (albo \`/answer <odpowiedź>\`).`,
             "plan",
             event.output.signature
           )],
@@ -706,7 +706,7 @@ export function reduceLifecycle(run: LifecycleRun, event: CoordinatorEvent): Coo
           commands: [linearComment(
             run,
             "questions:1",
-            `❓ **Pytania do ticketu (triage) — runda 1/2**\n\n${event.output.questions}\n\nOdpowiedz: \`/answer <odpowiedź>\`.`,
+            `❓ **Pytania do ticketu (triage) — runda 1/2**\n\n${event.output.questions}\n\nOdpowiedz: \`answer <odpowiedź>\` (albo \`/answer <odpowiedź>\`).`,
             "triage",
             event.output.signature
           )],
@@ -863,7 +863,7 @@ export function reduceLifecycle(run: LifecycleRun, event: CoordinatorEvent): Coo
           commands: [linearComment(
             run,
             `questions:${run.clarifyRound + 1}`,
-            `❓ **Pytania do planu (synteza) — runda ${run.clarifyRound + 1}/2**\n\n${event.output.questions}\n\nOdpowiedz: \`/answer <odpowiedź>\`.`,
+            `❓ **Pytania do planu (synteza) — runda ${run.clarifyRound + 1}/2**\n\n${event.output.questions}\n\nOdpowiedz: \`answer <odpowiedź>\` (albo \`/answer <odpowiedź>\`).`,
             "synthesis",
             event.output.signature
           )],
