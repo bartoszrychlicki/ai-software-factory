@@ -168,6 +168,24 @@ function linearComment(
   };
 }
 
+/** Sprzątanie artefaktów GitHub poprzedniej generacji — dane kopiujemy przed resetem runu. */
+function retireGenerationCommand(run: LifecycleRun, reason: string): NewCommand | undefined {
+  if (!run.prUrl || run.mergedSha || !run.branch) return undefined;
+  return {
+    key: key(run, `retire:${run.generation}`),
+    ticketId: run.ticketId,
+    kind: "retire-generation",
+    stage: run.stage,
+    payload: {
+      prUrl: run.prUrl,
+      branch: run.branch,
+      workspaceDir: run.workspaceDir,
+      generation: run.generation,
+      reason,
+    },
+  };
+}
+
 /**
  * Komentarz bramki aprobat: plan + werdykt krytyki + jawne degradacje + koszt.
  * Człowiek decyduje z pełnym obrazem; mechanika /approve i /reject bez zmian.
@@ -304,6 +322,10 @@ export function reduceLifecycle(run: LifecycleRun, event: CoordinatorEvent): Coo
         ...PLAN_RESET_PATCH,
         critiqueRound: 0,
       };
+      const retire = retireGenerationCommand(
+        run,
+        "zastąpione nową generacją po zmianie wejścia ticketu"
+      );
       return {
         transition: {
           stage: entry,
@@ -314,13 +336,16 @@ export function reduceLifecycle(run: LifecycleRun, event: CoordinatorEvent): Coo
           cancelOutstandingRunJobs: true,
           patch: { manifest, ...PLAN_RESET_PATCH },
         },
-        commands: [jobCommand(
-          nextRun,
-          entry,
-          entry,
-          (entry === "triage" ? event.nextAttempts?.triage : event.nextAttempts?.plan)
-            ?? event.nextAttempt ?? 1
-        )],
+        commands: [
+          ...(retire ? [retire] : []),
+          jobCommand(
+            nextRun,
+            entry,
+            entry,
+            (entry === "triage" ? event.nextAttempts?.triage : event.nextAttempts?.plan)
+              ?? event.nextAttempt ?? 1
+          ),
+        ],
       };
     }
     const decision = blocked(
@@ -458,6 +483,10 @@ export function reduceLifecycle(run: LifecycleRun, event: CoordinatorEvent): Coo
       ...PLAN_RESET_PATCH,
       feedback: event.reason,
     };
+    const retire = retireGenerationCommand(
+      run,
+      "zastąpione nową generacją planu po /replan"
+    );
     return {
       transition: {
         stage: entry,
@@ -479,14 +508,17 @@ export function reduceLifecycle(run: LifecycleRun, event: CoordinatorEvent): Coo
           smokeStatus: undefined,
         },
       },
-      commands: [jobCommand(
-        nextRun,
-        entry,
-        entry,
-        (entry === "triage" ? event.nextAttempts?.triage : event.nextAttempts?.plan)
-          ?? event.nextAttempt ?? 1,
-        { feedback: event.reason }
-      )],
+      commands: [
+        ...(retire ? [retire] : []),
+        jobCommand(
+          nextRun,
+          entry,
+          entry,
+          (entry === "triage" ? event.nextAttempts?.triage : event.nextAttempts?.plan)
+            ?? event.nextAttempt ?? 1,
+          { feedback: event.reason }
+        ),
+      ],
     };
   }
 

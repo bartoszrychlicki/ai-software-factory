@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   backoffAt,
   classifyDispatchError,
+  FatalDispatchError,
   maxDispatchAttempts,
 } from "../pipeline/retry-policy";
 import { MastraHttpError } from "../sources/mastra-client";
@@ -22,6 +23,14 @@ test("klasyfikacja: 5xx/429/sieć/timeout są transient, walidacja jest permanen
   assert.equal(classifyDispatchError(fetchFailed), "transient");
   assert.equal(classifyDispatchError(new Error("Publish wymaga branch, SHA i konfiguracji GitHub.")), "permanent");
   assert.equal(classifyDispatchError("string error"), "permanent");
+});
+
+test("FatalDispatchError jest terminalny i nie dostaje ponowienia outboxu", () => {
+  assert.equal(
+    classifyDispatchError(new FatalDispatchError("BRANCH_DIVERGED", "BRANCH_DIVERGED")),
+    "terminal"
+  );
+  assert.equal(maxDispatchAttempts("terminal"), 0);
 });
 
 test("maxDispatchAttempts: transient ma wyższy limit, env nadpisuje", () => {

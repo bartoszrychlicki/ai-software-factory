@@ -126,6 +126,7 @@ export type CommandKind =
   | "publish-pr"
   | "mark-pr-ready"
   | "comment-pr"
+  | "retire-generation"
   | "cleanup-workspace";
 
 export interface LifecycleCommand {

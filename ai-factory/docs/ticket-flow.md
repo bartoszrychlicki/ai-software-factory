@@ -85,6 +85,23 @@ Registry v1 jest tylko do odczytu. Import wymaga zatwierdzonego planu,
 jednoznacznego checkpointu lub jawnie wskazanego bieżącego PR-a oraz świeżego
 odczytu Lineara/GitHuba/repo przed apply.
 
+### Sprzątanie poprzedniej generacji
+
+`/replan` oraz zmiana wejścia przed buildem atomowo enqueue'ują
+`retire-generation`, ale tylko gdy poprzednia generacja miała zapisany `prUrl`
+i niezmergowaną gałąź. Payload kopiuje stare `prUrl`, `branch` i
+`workspaceDir` przed resetem rejestru. Komenda dodaje idempotentny komentarz,
+zamyka niezmergowany PR, usuwa jego zdalną gałąź oraz lokalny worktree i branch.
+Guard własności dopuszcza wyłącznie `agent/<ticket>-*`; PR o stanie `MERGED`
+nie jest komentowany, zamykany ani pozbawiany zdalnej gałęzi.
+
+Publikacja sprawdza, czy istniejący zdalny branch jest przodkiem checkpointu.
+Rozjazd generacji zwraca czytelny `BRANCH_DIVERGED` jako błąd `terminal`
+(zero ponowień outboxu); force-push nie jest używany. Nazwy gałęzi pozostają
+deterministyczne bez numeru generacji: wersjonowanie nazw odrzucono, ponieważ
+sprzątanie i tak jest wymagane, a jeden otwarty PR na ticket utrzymuje czytelny
+przegląd.
+
 ## Komentarze postępu
 
 Każde objęte mapą przejście lifecycle atomowo enqueue'uje komentarz w tym samym

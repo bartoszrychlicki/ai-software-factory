@@ -4,12 +4,21 @@ import { MastraHttpError } from "../sources/mastra-client";
  * Czysta polityka ponowień outboxu: klasyfikacja błędu dispatchu oraz
  * wykładniczy backoff z jitterem. Zero I/O — decyzje wykonuje poller.
  */
-export type DispatchErrorClass = "transient" | "permanent";
+export type DispatchErrorClass = "transient" | "permanent" | "terminal";
+
+/** Błąd, którego ponowienie bez interwencji nie może zmienić wyniku. */
+export class FatalDispatchError extends Error {
+  constructor(message: string, readonly code?: string) {
+    super(message);
+    this.name = "FatalDispatchError";
+  }
+}
 
 const TRANSIENT_PATTERN =
   /ECONNREFUSED|ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|EPIPE|socket hang up|fetch failed|network|timed?\s?out|could not resolve|rate limit|temporar/i;
 
 export function classifyDispatchError(error: unknown): DispatchErrorClass {
+  if (error instanceof FatalDispatchError) return "terminal";
   if (error instanceof MastraHttpError) {
     return error.status >= 500 || error.status === 429 ? "transient" : "permanent";
   }
@@ -26,6 +35,7 @@ export function classifyDispatchError(error: unknown): DispatchErrorClass {
 
 /** Maksymalna liczba prób outboxu zanim komenda trafi do dead-letter. */
 export function maxDispatchAttempts(errorClass: DispatchErrorClass): number {
+  if (errorClass === "terminal") return 0;
   // attempts w lifecycle_commands rośnie także przy markach dispatched/done,
   // więc limit transient jest wyższy niż liczba realnych ponowień.
   return errorClass === "transient"
