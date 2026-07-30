@@ -1,10 +1,77 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { homedir } from "node:os";
-import { join, basename } from "node:path";
-import { rm } from "node:fs/promises";
+import { join, basename, resolve } from "node:path";
+import { readdir, rm, stat } from "node:fs/promises";
+import { setTimeout as delay } from "node:timers/promises";
+import { execFileControlled } from "./process-control";
 
 const exec = promisify(execFile);
+const GIT_NETWORK_TIMEOUT_MS = 60_000;
+const BASE_FETCH_RETRY_DELAY_MS = 2_000;
+const STALE_BASE_CHECKOUT_AGE_MS = 6 * 60 * 60 * 1_000;
+const BASE_CHECKOUT_NAME_PATTERN =
+  /-(?:plan|triage|research-(?:recon|solution-a|solution-b)|synthesis|critique)-/;
+
+const repoLocks = new Map<string, Promise<void>>();
+
+/**
+ * Operacje administracyjne worktree muszą być sekwencyjne per repo.
+ * Sam job działa już poza blokadą, we własnym katalogu.
+ */
+async function withRepoLock<T>(repoPath: string, fn: () => Promise<T>): Promise<T> {
+  const lockKey = resolve(repoPath);
+  const previous = repoLocks.get(lockKey) ?? Promise.resolve();
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const tail = previous.then(() => gate);
+  repoLocks.set(lockKey, tail);
+
+  await previous;
+  try {
+    return await fn();
+  } finally {
+    release();
+    if (repoLocks.get(lockKey) === tail) {
+      repoLocks.delete(lockKey);
+    }
+  }
+}
+
+function gitNetwork(
+  repoPath: string,
+  args: readonly string[],
+  signal?: AbortSignal
+): Promise<{ stdout: string; stderr: string }> {
+  return execFileControlled("git", ["-C", repoPath, ...args], {
+    env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+    signal,
+    timeoutMs: GIT_NETWORK_TIMEOUT_MS,
+  });
+}
+
+async function cleanupStaleBaseCheckouts(repoPath: string): Promise<void> {
+  const repoWorktreesDir = join(worktreesRoot(), basename(repoPath));
+  const entries = await readdir(repoWorktreesDir, { withFileTypes: true }).catch(() => []);
+  let removedAny = false;
+
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !BASE_CHECKOUT_NAME_PATTERN.test(entry.name)) continue;
+    const dir = join(repoWorktreesDir, entry.name);
+    const info = await stat(dir).catch(() => undefined);
+    if (!info || Date.now() - info.mtimeMs < STALE_BASE_CHECKOUT_AGE_MS) continue;
+
+    await exec("git", ["-C", repoPath, "worktree", "remove", "--force", dir]).catch(() => {});
+    await rm(dir, { recursive: true, force: true });
+    removedAny = true;
+  }
+
+  if (removedAny) {
+    await exec("git", ["-C", repoPath, "worktree", "prune"]).catch(() => {});
+  }
+}
 
 export interface Workspace {
   ticketId: string;
@@ -31,9 +98,24 @@ export interface WorkspaceOptions {
 }
 
 // worktrees trzymamy POZA repo — zero śmieci w projekcie, łatwe sprzątanie
-const ROOT = process.env.FACTORY_WORKTREES ?? join(homedir(), ".ai-factory", "worktrees");
+function worktreesRoot(): string {
+  return process.env.FACTORY_WORKTREES ?? join(homedir(), ".ai-factory", "worktrees");
+}
 
 export async function createWorkspace(
+  repoPath: string,
+  ticketId: string,
+  slug: string,
+  defaultBranch = "main",
+  baseRef?: string,
+  options: WorkspaceOptions = {}
+): Promise<Workspace> {
+  return withRepoLock(repoPath, () =>
+    createWorkspaceUnlocked(repoPath, ticketId, slug, defaultBranch, baseRef, options)
+  );
+}
+
+async function createWorkspaceUnlocked(
   repoPath: string,
   ticketId: string,
   slug: string,
@@ -48,7 +130,7 @@ export async function createWorkspace(
   if (!branch) {
     throw new Error("FIX_BASE_INVALID: /fix wymaga nazwy opublikowanej gałęzi.");
   }
-  const dir = join(ROOT, basename(repoPath), ticketId);
+  const dir = join(worktreesRoot(), basename(repoPath), ticketId);
   // Rozwiąż checkpoint przed usunięciem starej gałęzi, która może być jego
   // jedyną czytelną referencją. Sam obiekt commita pozostaje dostępny po SHA.
   const checkpoint = baseRef
@@ -63,14 +145,14 @@ export async function createWorkspace(
         "FIX_BASE_INVALID: /fix wymaga opublikowanego SHA poprzedniego checkpointu."
       );
     }
-    await exec("git", ["-C", repoPath, "fetch", "origin", branch]).catch(() => {
+    await gitNetwork(repoPath, ["fetch", "origin", branch]).catch(() => {
       throw new Error(
         `FIX_BASE_MISSING: zdalna gałąź ${branch} nie istnieje; zamknij PR i użyj /replan.`
       );
     });
-    const remoteTip = await exec(
-      "git",
-      ["-C", repoPath, "ls-remote", "--heads", "origin", branch]
+    const remoteTip = await gitNetwork(
+      repoPath,
+      ["ls-remote", "--heads", "origin", branch]
     ).then(({ stdout }) => stdout.trim().split(/\s+/)[0] || undefined);
     if (!remoteTip) {
       throw new Error(
@@ -111,7 +193,7 @@ export async function createWorkspace(
 
   // BAZA zawsze = świeży origin/<default>. Checkpoint jest zmianą kandydata,
   // nie bazą: nakładamy go na aktualny main i odrzucamy przy konflikcie.
-  await exec("git", ["-C", repoPath, "fetch", "origin", defaultBranch]).catch(() => {});
+  await gitNetwork(repoPath, ["fetch", "origin", defaultBranch]).catch(() => {});
   const base = await exec("git", ["-C", repoPath, "rev-parse", "--verify", `origin/${defaultBranch}`])
     .then(() => `origin/${defaultBranch}`)
     .catch(() => defaultBranch);
@@ -163,8 +245,75 @@ export async function checkpointWithinScope(
 }
 
 export async function removeWorkspace(ws: Workspace): Promise<void> {
-  await exec("git", ["-C", ws.repoPath, "worktree", "remove", "--force", ws.dir]).catch(() => {});
-  await exec("git", ["-C", ws.repoPath, "branch", "-D", ws.branch]).catch(() => {});
+  await withRepoLock(ws.repoPath, async () => {
+    await exec("git", ["-C", ws.repoPath, "worktree", "remove", "--force", ws.dir]).catch(() => {});
+    await exec("git", ["-C", ws.repoPath, "branch", "-D", ws.branch]).catch(() => {});
+  });
+}
+
+/**
+ * Świeży, oddzielny checkout aktualnego origin/<default> dla jobów read-only.
+ * Brak łączności lub refa zatrzymuje job zamiast używać potencjalnie starej bazy.
+ */
+export async function createBaseCheckout(
+  repoPath: string,
+  defaultBranch: string,
+  name: string,
+  signal?: AbortSignal
+): Promise<{ dir: string; sha: string }> {
+  return withRepoLock(repoPath, async () => {
+    await cleanupStaleBaseCheckouts(repoPath);
+    let fetchError: unknown;
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      try {
+        await gitNetwork(repoPath, ["fetch", "origin", defaultBranch], signal);
+        fetchError = undefined;
+        break;
+      } catch (error) {
+        const terminationReason = (error as { terminationReason?: unknown } | null)
+          ?.terminationReason;
+        if (signal?.aborted || terminationReason === "abort") {
+          signal?.throwIfAborted();
+          throw error;
+        }
+        fetchError = error;
+      }
+      if (attempt < 2) {
+        await delay(BASE_FETCH_RETRY_DELAY_MS, undefined, { signal });
+      }
+    }
+    signal?.throwIfAborted();
+    if (fetchError) {
+      const detail = fetchError instanceof Error ? fetchError.message : String(fetchError);
+      const stderr = (fetchError as { stderr?: unknown } | null)?.stderr;
+      const stderrDetail = typeof stderr === "string" && stderr.trim()
+        ? `\nstderr: ${stderr.trim()}`
+        : "";
+      throw new Error(
+        `BASE_UNAVAILABLE: nie udało się pobrać origin/${defaultBranch} po 2 próbach. ` +
+          `Przyczyna: ${detail}${stderrDetail}`,
+        { cause: fetchError }
+      );
+    }
+
+    const sha = await exec(
+      "git",
+      ["-C", repoPath, "rev-parse", "--verify", `origin/${defaultBranch}^{commit}`]
+    ).then(({ stdout }) => stdout.trim()).catch((error) => {
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new Error(
+        `BASE_UNAVAILABLE: brak poprawnego refa origin/${defaultBranch} po udanym fetchu. ` +
+          `Przyczyna: ${detail}`,
+        { cause: error }
+      );
+    });
+    const dir = join(worktreesRoot(), basename(repoPath), name);
+    await exec("git", ["-C", repoPath, "worktree", "remove", "--force", dir]).catch(() => {});
+    await rm(dir, { recursive: true, force: true });
+    await exec("git", ["-C", repoPath, "worktree", "prune"]).catch(() => {});
+    await exec("git", ["-C", repoPath, "worktree", "add", "--detach", dir, sha]);
+    return { dir, sha };
+  });
 }
 
 /**
@@ -176,16 +325,21 @@ export async function createCheckout(
   ref: string,
   name: string
 ): Promise<{ dir: string }> {
-  const dir = join(ROOT, basename(repoPath), name);
-  await exec("git", ["-C", repoPath, "worktree", "remove", "--force", dir]).catch(() => {});
-  await rm(dir, { recursive: true, force: true });
-  // sprzątnij martwe rejestracje (katalog skasowany, wpis w .git został)
-  await exec("git", ["-C", repoPath, "worktree", "prune"]).catch(() => {});
-  await exec("git", ["-C", repoPath, "worktree", "add", "--detach", dir, ref]);
-  return { dir };
+  return withRepoLock(repoPath, async () => {
+    const dir = join(worktreesRoot(), basename(repoPath), name);
+    await exec("git", ["-C", repoPath, "worktree", "remove", "--force", dir]).catch(() => {});
+    await rm(dir, { recursive: true, force: true });
+    // sprzątnij martwe rejestracje (katalog skasowany, wpis w .git został)
+    await exec("git", ["-C", repoPath, "worktree", "prune"]).catch(() => {});
+    await exec("git", ["-C", repoPath, "worktree", "add", "--detach", dir, ref]);
+    return { dir };
+  });
 }
 
 export async function removeCheckout(repoPath: string, dir: string): Promise<void> {
-  await exec("git", ["-C", repoPath, "worktree", "remove", "--force", dir]).catch(() => {});
-  await rm(dir, { recursive: true, force: true }).catch(() => {});
+  await withRepoLock(repoPath, async () => {
+    await exec("git", ["-C", repoPath, "worktree", "remove", "--force", dir]).catch(() => {});
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+    await exec("git", ["-C", repoPath, "worktree", "prune"]).catch(() => {});
+  });
 }

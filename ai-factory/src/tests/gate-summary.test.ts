@@ -16,6 +16,7 @@ import {
   type TicketManifestV2,
 } from "../pipeline/lifecycle-store";
 import { parseCritiqueVerdict, parsePlanVerdict } from "../pipeline/verdicts";
+import { createTestGitRepo, useTestWorktrees } from "./git-fixture";
 
 const manifest: TicketManifestV2 = {
   title: "Czytelna bramka",
@@ -197,8 +198,10 @@ test("critiqueMeaning przechodzi przez addytywną kolumnę SQLite", async () => 
 test("brak streszczenia jest fail-open i zapisuje summary-missing w metryce planu", async () => {
   const root = await mkdtemp(join(tmpdir(), "factory-summary-missing-"));
   const previousRoot = process.env.FACTORY_ROOT;
+  const restoreWorktrees = useTestWorktrees(root);
   process.env.FACTORY_ROOT = root;
   await writeFile(join(root, "package.json"), "{}");
+  const repo = createTestGitRepo(root);
   const report = planReport(false);
   const engine: EngineAdapter = {
     name: "fake",
@@ -216,7 +219,7 @@ test("brak streszczenia jest fail-open i zapisuje summary-missing w metryce plan
       return { engine, model: "fake-model", spec: "fake/fake-model" };
     },
     async project() {
-      return { repo: root, checks: ["true"] };
+      return { repo, default_branch: "main", checks: ["true"] };
     },
   };
 
@@ -260,6 +263,7 @@ test("brak streszczenia jest fail-open i zapisuje summary-missing w metryce plan
   } finally {
     if (previousRoot === undefined) delete process.env.FACTORY_ROOT;
     else process.env.FACTORY_ROOT = previousRoot;
+    restoreWorktrees();
     await rm(root, { recursive: true, force: true });
   }
 });
@@ -267,8 +271,10 @@ test("brak streszczenia jest fail-open i zapisuje summary-missing w metryce plan
 test("synteza wymaga pięciu bloków, zapisuje summary-present, a krytyka ekstrahuje zdanie", async () => {
   const root = await mkdtemp(join(tmpdir(), "factory-summary-deep-jobs-"));
   const previousRoot = process.env.FACTORY_ROOT;
+  const restoreWorktrees = useTestWorktrees(root);
   process.env.FACTORY_ROOT = root;
   await writeFile(join(root, "package.json"), "{}");
+  const repo = createTestGitRepo(root);
   const ticket = {
     id: "BAR-187-DEEP",
     title: manifest.title,
@@ -300,7 +306,7 @@ test("synteza wymaga pięciu bloków, zapisuje summary-present, a krytyka ekstra
         return { engine: synthesisEngine, model: "fake-model", spec: "fake/fake-model" };
       },
       async project() {
-        return { repo: root, checks: ["true"] };
+        return { repo, default_branch: "main", checks: ["true"] };
       },
     };
     const synthesis = await executeFactoryJobInput(
@@ -335,7 +341,7 @@ test("synteza wymaga pięciu bloków, zapisuje summary-present, a krytyka ekstra
         return { engine: critiqueEngine, model: "fake-model", spec: "fake/fake-model" };
       },
       async project() {
-        return { repo: root, checks: ["true"] };
+        return { repo, default_branch: "main", checks: ["true"] };
       },
     };
     const critique = await executeFactoryJobInput(
@@ -366,6 +372,7 @@ test("synteza wymaga pięciu bloków, zapisuje summary-present, a krytyka ekstra
   } finally {
     if (previousRoot === undefined) delete process.env.FACTORY_ROOT;
     else process.env.FACTORY_ROOT = previousRoot;
+    restoreWorktrees();
     await rm(root, { recursive: true, force: true });
   }
 });

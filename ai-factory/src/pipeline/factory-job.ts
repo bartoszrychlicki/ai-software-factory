@@ -1,7 +1,12 @@
 import { createStep, createWorkflow } from "@mastra/core/workflows";
 import { z } from "zod";
 import { execFileControlled } from "./process-control";
-import { createCheckout, createWorkspace, removeCheckout } from "./workspace";
+import {
+  createBaseCheckout,
+  createCheckout,
+  createWorkspace,
+  removeCheckout,
+} from "./workspace";
 import { getProject } from "./projects";
 import { resolveRoute } from "./routing";
 import { artifactHeader, saveArtifact } from "./artifacts";
@@ -26,6 +31,7 @@ import { auditScope, changedFilesInWorkspace } from "./scope";
 import { critiqueMeaningOf, humanSummaryOf } from "./human-summary";
 import type { Route, Stage } from "./routing";
 import type { ProjectConfig } from "./projects";
+import type { ActionSignature } from "./signature";
 
 const ticketSchema = z.object({
   id: z.string(),
@@ -85,6 +91,8 @@ export const factoryJobOutputSchema = z.object({
   branch: z.string().optional(),
   workspaceDir: z.string().optional(),
   headSha: z.string().optional(),
+  /** SHA kodu, który agent faktycznie widział w swoim checkoutcie. */
+  baseSha: z.string().optional(),
   changedFiles: z.array(z.string()).default([]),
   scopeWarnings: z.array(z.string()).default([]),
   reviewVerdict: z.enum(["lgtm", "advisory-fix", "unavailable"]).optional(),
@@ -160,6 +168,127 @@ const defaultRuntime: FactoryJobRuntime = {
   project: getProject,
 };
 
+type ReadOnlyJobKind = "plan" | "triage" | "research" | "synthesis" | "critique";
+type ReadOnlyMetricStage =
+  | "plan"
+  | "triage"
+  | "research-recon"
+  | "research-solution-a"
+  | "research-solution-b"
+  | "synthesis"
+  | "critique";
+
+class BaseCheckoutUnavailableError extends Error {
+  constructor(error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    const stderr = (error as { stderr?: unknown } | null)?.stderr;
+    const detail = typeof stderr === "string" && stderr.trim() && !message.includes(stderr.trim())
+      ? `${message}\nstderr: ${stderr.trim()}`
+      : message;
+    super(
+      detail.startsWith("BASE_UNAVAILABLE:")
+        ? detail
+        : `BASE_UNAVAILABLE: nie udało się przygotować świeżego checkoutu bazy. ` +
+          `Przyczyna: ${detail}`,
+      { cause: error }
+    );
+    this.name = "BaseCheckoutUnavailableError";
+  }
+}
+
+async function withBaseCheckout<T>(
+  runtime: FactoryJobRuntime,
+  ticket: FactoryJobInput["ticket"],
+  kind: string,
+  runId: string,
+  signal: AbortSignal | undefined,
+  fn: (base: { dir: string; sha: string }) => Promise<T>
+): Promise<T> {
+  const project = await runtime.project(ticket.project);
+  let base: { dir: string; sha: string };
+  try {
+    base = await createBaseCheckout(
+      project.repo,
+      project.default_branch ?? "main",
+      `${ticket.id}-${kind}-${runId}`,
+      signal
+    );
+  } catch (error) {
+    const terminationReason = (error as { terminationReason?: unknown } | null)
+      ?.terminationReason;
+    if (
+      signal?.aborted ||
+      terminationReason === "abort" ||
+      (error instanceof Error && error.name === "AbortError")
+    ) {
+      throw error;
+    }
+    throw new BaseCheckoutUnavailableError(error);
+  }
+
+  try {
+    return await fn(base);
+  } finally {
+    await removeCheckout(project.repo, base.dir);
+  }
+}
+
+async function baseUnavailableOutput(
+  input: FactoryJobInput,
+  runId: string,
+  kind: ReadOnlyJobKind,
+  stage: ReadOnlyMetricStage,
+  artifactName: string,
+  route: Route,
+  signature: ActionSignature,
+  startedAt: number,
+  error: BaseCheckoutUnavailableError
+): Promise<FactoryJobOutput> {
+  const durationMs = Date.now() - startedAt;
+  const errorCode = `${kind.toUpperCase()}_BASE_UNAVAILABLE`;
+  const report = error.message;
+  await recordMetric({
+    ticket: input.ticket.id,
+    runId,
+    stage,
+    engine: route.spec,
+    attempt: input.attempt,
+    ok: false,
+    outcome: "base-unavailable",
+    costUsd: 0,
+    durationMs,
+  });
+  await saveArtifact(
+    input.ticket.id,
+    runId,
+    artifactName,
+    artifactHeader({
+      jobId: runId,
+      ticket: input.ticket.id,
+      step: stage,
+      attempt: input.attempt,
+      outcome: "base-unavailable",
+      ...signatureMeta(signature),
+      engine: route.spec,
+      costUsd: 0,
+    }) + report
+  );
+  return {
+    kind,
+    outcome: "failed",
+    report,
+    errorCode,
+    signature: signatureLine(signature),
+    costUsd: 0,
+    durationMs,
+    researchRole: kind === "research" ? input.researchRole : undefined,
+    critiqueVerdict: kind === "critique" ? "unavailable" : undefined,
+    files: [],
+    changedFiles: [],
+    scopeWarnings: [],
+  };
+}
+
 const planInstructions = [
   "Jesteś plannerem w fabryce software. Przygotuj implementowalny plan dla ticketu.",
   "Opisz zakres, poza zakresem, kryteria akceptacji, zmiany plik po pliku i testy.",
@@ -192,75 +321,95 @@ async function runPlan(
   const route = await runtime.route("plan", input.ticket);
   const signature = buildSignature("plan", route);
   const startedAt = Date.now();
-  const result = await route.engine.run({
-    role: "plan",
-    model: route.model,
-    effort: route.effort,
-    instructions: planInstructions,
-    context: planContext(input),
-    workspace: (await runtime.project(input.ticket.project)).repo,
-    budget: { minutes: JOB_BUDGET_MINUTES.plan },
-    signal,
-  });
-  const durationMs = Date.now() - startedAt;
-  const { costUsd, costSource } = effectiveCost(result, durationMs);
-  const report = result.transcript ?? result.report;
-  const summary = humanSummaryOf(report);
-  const verdict = parsePlanVerdict(report);
-  const outcome = !result.ok || verdict.source === "missing"
-    ? "failed"
-    : verdict.ok
-      ? "success"
-      : verdict.questions
-        ? "questions"
-        : "failed";
-  const questions = verdict.questions ? formatClarifyQuestions(verdict.questions) : undefined;
-  await recordMetric({
-    ticket: input.ticket.id,
-    runId,
-    stage: "plan",
-    engine: route.spec,
-    attempt: input.attempt,
-    ok: outcome !== "failed",
-    outcome,
-    costUsd,
-    durationMs,
-    resumed: false,
-    humanSummary: summary ? "summary-present" : "summary-missing",
-  });
-  await saveArtifact(
-    input.ticket.id,
-    runId,
-    `plan-attempt-${input.attempt}.md`,
-    artifactHeader({
-      jobId: runId,
-      ticket: input.ticket.id,
-      step: "plan",
-      attempt: input.attempt,
-      outcome,
-      ...signatureMeta(signature),
-      engine: route.spec,
-      costUsd,
-    }) + report
-  );
-  return {
-    kind: "plan",
-    outcome,
-    report,
-    errorCode: outcome === "failed"
-      ? result.ok ? "PLAN_CONTRACT_MISSING" : "PLAN_ENGINE_FAILED"
-      : undefined,
-    signature: signatureLine(signature),
-    costUsd,
-    costSource,
-    durationMs,
-    plan: outcome === "success" ? report : undefined,
-    questions,
-    files: verdict.files,
-    domain: verdict.domain,
-    changedFiles: [],
-    scopeWarnings: [],
-  };
+  try {
+    return await withBaseCheckout(runtime, input.ticket, "plan", runId, signal, async (base) => {
+      const result = await route.engine.run({
+        role: "plan",
+        model: route.model,
+        effort: route.effort,
+        instructions: planInstructions,
+        context: planContext(input),
+        workspace: base.dir,
+        budget: { minutes: JOB_BUDGET_MINUTES.plan },
+        signal,
+      });
+      const durationMs = Date.now() - startedAt;
+      const { costUsd, costSource } = effectiveCost(result, durationMs);
+      const report = result.transcript ?? result.report;
+      const summary = humanSummaryOf(report);
+      const verdict = parsePlanVerdict(report);
+      const outcome = !result.ok || verdict.source === "missing"
+        ? "failed"
+        : verdict.ok
+          ? "success"
+          : verdict.questions
+            ? "questions"
+            : "failed";
+      const questions = verdict.questions ? formatClarifyQuestions(verdict.questions) : undefined;
+      await recordMetric({
+        ticket: input.ticket.id,
+        runId,
+        stage: "plan",
+        engine: route.spec,
+        attempt: input.attempt,
+        ok: outcome !== "failed",
+        outcome,
+        costUsd,
+        durationMs,
+        baseSha: base.sha,
+        resumed: false,
+        humanSummary: summary ? "summary-present" : "summary-missing",
+      });
+      await saveArtifact(
+        input.ticket.id,
+        runId,
+        `plan-attempt-${input.attempt}.md`,
+        artifactHeader({
+          jobId: runId,
+          ticket: input.ticket.id,
+          sha: base.sha,
+          step: "plan",
+          attempt: input.attempt,
+          outcome,
+          ...signatureMeta(signature),
+          engine: route.spec,
+          costUsd,
+        }) + report
+      );
+      return {
+        kind: "plan",
+        outcome,
+        report,
+        errorCode: outcome === "failed"
+          ? result.ok ? "PLAN_CONTRACT_MISSING" : "PLAN_ENGINE_FAILED"
+          : undefined,
+        signature: signatureLine(signature),
+        costUsd,
+        costSource,
+        durationMs,
+        plan: outcome === "success" ? report : undefined,
+        questions,
+        files: verdict.files,
+        domain: verdict.domain,
+        baseSha: base.sha,
+        changedFiles: [],
+        scopeWarnings: [],
+      };
+    });
+  } catch (error) {
+    if (!(error instanceof BaseCheckoutUnavailableError)) throw error;
+    return baseUnavailableOutput(
+      input,
+      runId,
+      "plan",
+      "plan",
+      `plan-attempt-${input.attempt}.md`,
+      route,
+      signature,
+      startedAt,
+      error
+    );
+  }
 }
 
 const triageInstructions = [
@@ -285,70 +434,90 @@ async function runTriage(
   const route = await runtime.route("triage", input.ticket);
   const signature = buildSignature("triage", route);
   const startedAt = Date.now();
-  const result = await route.engine.run({
-    role: "plan",
-    model: route.model,
-    effort: route.effort,
-    instructions: triageInstructions,
-    context: planContext(input),
-    workspace: (await runtime.project(input.ticket.project)).repo,
-    budget: { minutes: JOB_BUDGET_MINUTES.triage },
-    signal,
-  });
-  const durationMs = Date.now() - startedAt;
-  const { costUsd, costSource } = effectiveCost(result, durationMs);
-  const report = result.transcript ?? result.report;
-  const verdict = parseTriageVerdict(report);
-  const outcome = !result.ok || verdict.source === "missing"
-    ? "failed"
-    : verdict.questions
-      ? "questions"
-      : "success";
-  await recordMetric({
-    ticket: input.ticket.id,
-    runId,
-    stage: "triage",
-    engine: route.spec,
-    attempt: input.attempt,
-    ok: outcome !== "failed",
-    outcome,
-    costUsd,
-    durationMs,
-  });
-  await saveArtifact(
-    input.ticket.id,
-    runId,
-    `triage-attempt-${input.attempt}.md`,
-    artifactHeader({
-      jobId: runId,
-      ticket: input.ticket.id,
-      step: "triage",
-      attempt: input.attempt,
-      outcome: outcome === "success" ? `path:${verdict.path}` : outcome,
-      ...signatureMeta(signature),
-      engine: route.spec,
-      costUsd,
-    }) + report
-  );
-  return {
-    kind: "triage",
-    outcome,
-    report,
-    errorCode: outcome === "failed"
-      ? result.ok ? "TRIAGE_CONTRACT_MISSING" : "TRIAGE_ENGINE_FAILED"
-      : undefined,
-    signature: signatureLine(signature),
-    costUsd,
-    costSource,
-    durationMs,
-    questions: verdict.questions ? formatClarifyQuestions(verdict.questions) : undefined,
-    triagePath: verdict.path,
-    triageSummary: verdict.summary,
-    domain: verdict.domain,
-    files: [],
-    changedFiles: [],
-    scopeWarnings: [],
-  };
+  try {
+    return await withBaseCheckout(runtime, input.ticket, "triage", runId, signal, async (base) => {
+      const result = await route.engine.run({
+        role: "plan",
+        model: route.model,
+        effort: route.effort,
+        instructions: triageInstructions,
+        context: planContext(input),
+        workspace: base.dir,
+        budget: { minutes: JOB_BUDGET_MINUTES.triage },
+        signal,
+      });
+      const durationMs = Date.now() - startedAt;
+      const { costUsd, costSource } = effectiveCost(result, durationMs);
+      const report = result.transcript ?? result.report;
+      const verdict = parseTriageVerdict(report);
+      const outcome = !result.ok || verdict.source === "missing"
+        ? "failed"
+        : verdict.questions
+          ? "questions"
+          : "success";
+      await recordMetric({
+        ticket: input.ticket.id,
+        runId,
+        stage: "triage",
+        engine: route.spec,
+        attempt: input.attempt,
+        ok: outcome !== "failed",
+        outcome,
+        costUsd,
+        durationMs,
+        baseSha: base.sha,
+      });
+      await saveArtifact(
+        input.ticket.id,
+        runId,
+        `triage-attempt-${input.attempt}.md`,
+        artifactHeader({
+          jobId: runId,
+          ticket: input.ticket.id,
+          sha: base.sha,
+          step: "triage",
+          attempt: input.attempt,
+          outcome: outcome === "success" ? `path:${verdict.path}` : outcome,
+          ...signatureMeta(signature),
+          engine: route.spec,
+          costUsd,
+        }) + report
+      );
+      return {
+        kind: "triage",
+        outcome,
+        report,
+        errorCode: outcome === "failed"
+          ? result.ok ? "TRIAGE_CONTRACT_MISSING" : "TRIAGE_ENGINE_FAILED"
+          : undefined,
+        signature: signatureLine(signature),
+        costUsd,
+        costSource,
+        durationMs,
+        questions: verdict.questions ? formatClarifyQuestions(verdict.questions) : undefined,
+        triagePath: verdict.path,
+        triageSummary: verdict.summary,
+        domain: verdict.domain,
+        baseSha: base.sha,
+        files: [],
+        changedFiles: [],
+        scopeWarnings: [],
+      };
+    });
+  } catch (error) {
+    if (!(error instanceof BaseCheckoutUnavailableError)) throw error;
+    return baseUnavailableOutput(
+      input,
+      runId,
+      "triage",
+      "triage",
+      `triage-attempt-${input.attempt}.md`,
+      route,
+      signature,
+      startedAt,
+      error
+    );
+  }
 }
 
 const researchInstructions: Record<"recon" | "solution-a" | "solution-b", string> = {
@@ -386,66 +555,88 @@ async function runResearch(
   const route = await runtime.route("research", input.ticket, role);
   const signature = buildSignature("research", route);
   const startedAt = Date.now();
-  const result = await route.engine.run({
-    role: "plan",
-    model: route.model,
-    effort: route.effort,
-    instructions: researchInstructions[role],
-    context: [
-      planContext(input),
-      input.triageSummary ? `# Klasyfikacja triage\n${input.triageSummary}` : "",
-    ].filter(Boolean).join("\n\n"),
-    workspace: (await runtime.project(input.ticket.project)).repo,
-    budget: { minutes: JOB_BUDGET_MINUTES.research },
-    signal,
-  });
-  const durationMs = Date.now() - startedAt;
-  const { costUsd, costSource } = effectiveCost(result, durationMs);
-  const brief = (result.transcript ?? result.report).trim();
-  const outcome = result.ok && brief ? "success" : "failed";
-  await recordMetric({
-    ticket: input.ticket.id,
-    runId,
-    stage: `research-${role}`,
-    engine: route.spec,
-    attempt: input.attempt,
-    ok: outcome === "success",
-    outcome,
-    costUsd,
-    durationMs,
-  });
-  await saveArtifact(
-    input.ticket.id,
-    runId,
-    `research-${role}-attempt-${input.attempt}.md`,
-    artifactHeader({
-      jobId: runId,
-      ticket: input.ticket.id,
-      step: `research-${role}`,
-      attempt: input.attempt,
-      outcome,
-      ...signatureMeta(signature),
-      engine: route.spec,
-      costUsd,
-    }) + (brief || result.report)
-  );
-  return {
-    kind: "research",
-    outcome,
-    report: brief || result.report,
-    errorCode: outcome === "failed"
-      ? result.ok ? "RESEARCH_EMPTY" : "RESEARCH_ENGINE_FAILED"
-      : undefined,
-    signature: signatureLine(signature),
-    costUsd,
-    costSource,
-    durationMs,
-    researchRole: role,
-    brief: outcome === "success" ? clip(brief, BRIEF_CLIP_CHARS) : undefined,
-    files: [],
-    changedFiles: [],
-    scopeWarnings: [],
-  };
+  const stage = `research-${role}` as const;
+  const artifactName = `${stage}-attempt-${input.attempt}.md`;
+  try {
+    return await withBaseCheckout(runtime, input.ticket, stage, runId, signal, async (base) => {
+      const result = await route.engine.run({
+        role: "plan",
+        model: route.model,
+        effort: route.effort,
+        instructions: researchInstructions[role],
+        context: [
+          planContext(input),
+          input.triageSummary ? `# Klasyfikacja triage\n${input.triageSummary}` : "",
+        ].filter(Boolean).join("\n\n"),
+        workspace: base.dir,
+        budget: { minutes: JOB_BUDGET_MINUTES.research },
+        signal,
+      });
+      const durationMs = Date.now() - startedAt;
+      const { costUsd, costSource } = effectiveCost(result, durationMs);
+      const brief = (result.transcript ?? result.report).trim();
+      const outcome = result.ok && brief ? "success" : "failed";
+      await recordMetric({
+        ticket: input.ticket.id,
+        runId,
+        stage,
+        engine: route.spec,
+        attempt: input.attempt,
+        ok: outcome === "success",
+        outcome,
+        costUsd,
+        durationMs,
+        baseSha: base.sha,
+      });
+      await saveArtifact(
+        input.ticket.id,
+        runId,
+        artifactName,
+        artifactHeader({
+          jobId: runId,
+          ticket: input.ticket.id,
+          sha: base.sha,
+          step: stage,
+          attempt: input.attempt,
+          outcome,
+          ...signatureMeta(signature),
+          engine: route.spec,
+          costUsd,
+        }) + (brief || result.report)
+      );
+      return {
+        kind: "research",
+        outcome,
+        report: brief || result.report,
+        errorCode: outcome === "failed"
+          ? result.ok ? "RESEARCH_EMPTY" : "RESEARCH_ENGINE_FAILED"
+          : undefined,
+        signature: signatureLine(signature),
+        costUsd,
+        costSource,
+        durationMs,
+        researchRole: role,
+        brief: outcome === "success" ? clip(brief, BRIEF_CLIP_CHARS) : undefined,
+        baseSha: base.sha,
+        files: [],
+        changedFiles: [],
+        scopeWarnings: [],
+      };
+    });
+  } catch (error) {
+    if (!(error instanceof BaseCheckoutUnavailableError)) throw error;
+    return baseUnavailableOutput(
+      input,
+      runId,
+      "research",
+      stage,
+      artifactName,
+      route,
+      signature,
+      startedAt,
+      error
+    );
+  }
 }
 
 function briefsContext(briefs: FactoryJobInput["briefs"]): string {
@@ -482,77 +673,97 @@ async function runSynthesis(
   const route = await runtime.route("synthesis", input.ticket);
   const signature = buildSignature("synthesis", route);
   const startedAt = Date.now();
-  const result = await route.engine.run({
-    role: "plan",
-    model: route.model,
-    effort: route.effort,
-    instructions: synthesisInstructions,
-    context: [
-      planContext(input),
-      input.triageSummary ? `# Klasyfikacja triage\n${input.triageSummary}` : "",
-      briefsContext(input.briefs),
-    ].filter(Boolean).join("\n\n"),
-    workspace: (await runtime.project(input.ticket.project)).repo,
-    budget: { minutes: JOB_BUDGET_MINUTES.synthesis },
-    signal,
-  });
-  const durationMs = Date.now() - startedAt;
-  const { costUsd, costSource } = effectiveCost(result, durationMs);
-  const report = result.transcript ?? result.report;
-  const summary = humanSummaryOf(report);
-  const verdict = parsePlanVerdict(report);
-  const outcome = !result.ok || verdict.source === "missing"
-    ? "failed"
-    : verdict.ok
-      ? "success"
-      : verdict.questions
-        ? "questions"
-        : "failed";
-  await recordMetric({
-    ticket: input.ticket.id,
-    runId,
-    stage: "synthesis",
-    engine: route.spec,
-    attempt: input.attempt,
-    ok: outcome !== "failed",
-    outcome,
-    costUsd,
-    durationMs,
-    humanSummary: summary ? "summary-present" : "summary-missing",
-  });
-  await saveArtifact(
-    input.ticket.id,
-    runId,
-    `synthesis-attempt-${input.attempt}.md`,
-    artifactHeader({
-      jobId: runId,
-      ticket: input.ticket.id,
-      step: "synthesis",
-      attempt: input.attempt,
-      outcome,
-      ...signatureMeta(signature),
-      engine: route.spec,
-      costUsd,
-    }) + report
-  );
-  return {
-    kind: "synthesis",
-    outcome,
-    report,
-    errorCode: outcome === "failed"
-      ? result.ok ? "SYNTHESIS_CONTRACT_MISSING" : "SYNTHESIS_ENGINE_FAILED"
-      : undefined,
-    signature: signatureLine(signature),
-    costUsd,
-    costSource,
-    durationMs,
-    plan: outcome === "success" ? report : undefined,
-    questions: verdict.questions ? formatClarifyQuestions(verdict.questions) : undefined,
-    files: verdict.files,
-    domain: verdict.domain,
-    changedFiles: [],
-    scopeWarnings: [],
-  };
+  try {
+    return await withBaseCheckout(runtime, input.ticket, "synthesis", runId, signal, async (base) => {
+      const result = await route.engine.run({
+        role: "plan",
+        model: route.model,
+        effort: route.effort,
+        instructions: synthesisInstructions,
+        context: [
+          planContext(input),
+          input.triageSummary ? `# Klasyfikacja triage\n${input.triageSummary}` : "",
+          briefsContext(input.briefs),
+        ].filter(Boolean).join("\n\n"),
+        workspace: base.dir,
+        budget: { minutes: JOB_BUDGET_MINUTES.synthesis },
+        signal,
+      });
+      const durationMs = Date.now() - startedAt;
+      const { costUsd, costSource } = effectiveCost(result, durationMs);
+      const report = result.transcript ?? result.report;
+      const summary = humanSummaryOf(report);
+      const verdict = parsePlanVerdict(report);
+      const outcome = !result.ok || verdict.source === "missing"
+        ? "failed"
+        : verdict.ok
+          ? "success"
+          : verdict.questions
+            ? "questions"
+            : "failed";
+      await recordMetric({
+        ticket: input.ticket.id,
+        runId,
+        stage: "synthesis",
+        engine: route.spec,
+        attempt: input.attempt,
+        ok: outcome !== "failed",
+        outcome,
+        costUsd,
+        durationMs,
+        baseSha: base.sha,
+        humanSummary: summary ? "summary-present" : "summary-missing",
+      });
+      await saveArtifact(
+        input.ticket.id,
+        runId,
+        `synthesis-attempt-${input.attempt}.md`,
+        artifactHeader({
+          jobId: runId,
+          ticket: input.ticket.id,
+          sha: base.sha,
+          step: "synthesis",
+          attempt: input.attempt,
+          outcome,
+          ...signatureMeta(signature),
+          engine: route.spec,
+          costUsd,
+        }) + report
+      );
+      return {
+        kind: "synthesis",
+        outcome,
+        report,
+        errorCode: outcome === "failed"
+          ? result.ok ? "SYNTHESIS_CONTRACT_MISSING" : "SYNTHESIS_ENGINE_FAILED"
+          : undefined,
+        signature: signatureLine(signature),
+        costUsd,
+        costSource,
+        durationMs,
+        plan: outcome === "success" ? report : undefined,
+        questions: verdict.questions ? formatClarifyQuestions(verdict.questions) : undefined,
+        files: verdict.files,
+        domain: verdict.domain,
+        baseSha: base.sha,
+        changedFiles: [],
+        scopeWarnings: [],
+      };
+    });
+  } catch (error) {
+    if (!(error instanceof BaseCheckoutUnavailableError)) throw error;
+    return baseUnavailableOutput(
+      input,
+      runId,
+      "synthesis",
+      "synthesis",
+      `synthesis-attempt-${input.attempt}.md`,
+      route,
+      signature,
+      startedAt,
+      error
+    );
+  }
 }
 
 const critiqueInstructions = [
@@ -614,72 +825,94 @@ async function runCritique(
     };
   }
   const signature = buildSignature("critique", route);
-  const result = await route.engine.run({
-    role: "plan",
-    model: route.model,
-    effort: route.effort,
-    instructions: critiqueInstructions,
-    context: [
-      `# Ticket ${input.ticket.id}: ${input.ticket.title}`,
-      input.ticket.description,
-      `# Plan do krytyki\n${input.plan}`,
-      input.planFiles.length ? `# Zadeklarowane files\n${input.planFiles.join("\n")}` : "",
-      input.briefs?.recon ? `# Brief RECON (do cross-checku files)\n${input.briefs.recon}` : "",
-    ].filter(Boolean).join("\n\n"),
-    workspace: (await runtime.project(input.ticket.project)).repo,
-    budget: { minutes: JOB_BUDGET_MINUTES.critique },
-    signal,
-  });
-  const durationMs = Date.now() - startedAt;
-  const { costUsd, costSource } = effectiveCost(result, durationMs);
-  const report = result.transcript ?? result.report;
-  const critiqueMeaning = critiqueMeaningOf(report);
-  const verdict = parseCritiqueVerdict(report);
-  const critiqueVerdict = !result.ok || verdict.source === "missing" ? "unavailable" : verdict.verdict;
-  await recordMetric({
-    ticket: input.ticket.id,
-    runId,
-    stage: "critique",
-    engine: route.spec,
-    attempt: input.attempt,
-    ok: critiqueVerdict !== "unavailable",
-    outcome: critiqueVerdict,
-    costUsd,
-    durationMs,
-  });
-  await saveArtifact(
-    input.ticket.id,
-    runId,
-    `critique-attempt-${input.attempt}.md`,
-    artifactHeader({
-      jobId: runId,
-      ticket: input.ticket.id,
-      step: "critique",
-      attempt: input.attempt,
-      outcome: critiqueVerdict,
-      ...signatureMeta(signature),
-      engine: route.spec,
-      costUsd,
-    }) + report
-  );
-  return {
-    kind: "critique",
-    outcome: critiqueVerdict === "unavailable" ? "failed" : "success",
-    report,
-    errorCode: critiqueVerdict === "unavailable"
-      ? result.ok ? "CRITIQUE_VERDICT_MISSING" : "CRITIQUE_ENGINE_FAILED"
-      : undefined,
-    signature: signatureLine(signature),
-    costUsd,
-    costSource,
-    durationMs,
-    critiqueVerdict,
-    critiqueIssues: critiqueVerdict === "issues" ? clip(verdict.issues, CRITIQUE_CLIP_CHARS) : undefined,
-    critiqueMeaning,
-    files: [],
-    changedFiles: [],
-    scopeWarnings: [],
-  };
+  try {
+    return await withBaseCheckout(runtime, input.ticket, "critique", runId, signal, async (base) => {
+      const result = await route.engine.run({
+        role: "plan",
+        model: route.model,
+        effort: route.effort,
+        instructions: critiqueInstructions,
+        context: [
+          `# Ticket ${input.ticket.id}: ${input.ticket.title}`,
+          input.ticket.description,
+          `# Plan do krytyki\n${input.plan}`,
+          input.planFiles.length ? `# Zadeklarowane files\n${input.planFiles.join("\n")}` : "",
+          input.briefs?.recon ? `# Brief RECON (do cross-checku files)\n${input.briefs.recon}` : "",
+        ].filter(Boolean).join("\n\n"),
+        workspace: base.dir,
+        budget: { minutes: JOB_BUDGET_MINUTES.critique },
+        signal,
+      });
+      const durationMs = Date.now() - startedAt;
+      const { costUsd, costSource } = effectiveCost(result, durationMs);
+      const report = result.transcript ?? result.report;
+      const critiqueMeaning = critiqueMeaningOf(report);
+      const verdict = parseCritiqueVerdict(report);
+      const critiqueVerdict = !result.ok || verdict.source === "missing" ? "unavailable" : verdict.verdict;
+      await recordMetric({
+        ticket: input.ticket.id,
+        runId,
+        stage: "critique",
+        engine: route.spec,
+        attempt: input.attempt,
+        ok: critiqueVerdict !== "unavailable",
+        outcome: critiqueVerdict,
+        costUsd,
+        durationMs,
+        baseSha: base.sha,
+      });
+      await saveArtifact(
+        input.ticket.id,
+        runId,
+        `critique-attempt-${input.attempt}.md`,
+        artifactHeader({
+          jobId: runId,
+          ticket: input.ticket.id,
+          sha: base.sha,
+          step: "critique",
+          attempt: input.attempt,
+          outcome: critiqueVerdict,
+          ...signatureMeta(signature),
+          engine: route.spec,
+          costUsd,
+        }) + report
+      );
+      return {
+        kind: "critique",
+        outcome: critiqueVerdict === "unavailable" ? "failed" : "success",
+        report,
+        errorCode: critiqueVerdict === "unavailable"
+          ? result.ok ? "CRITIQUE_VERDICT_MISSING" : "CRITIQUE_ENGINE_FAILED"
+          : undefined,
+        signature: signatureLine(signature),
+        costUsd,
+        costSource,
+        durationMs,
+        critiqueVerdict,
+        critiqueIssues: critiqueVerdict === "issues"
+          ? clip(verdict.issues, CRITIQUE_CLIP_CHARS)
+          : undefined,
+        critiqueMeaning,
+        baseSha: base.sha,
+        files: [],
+        changedFiles: [],
+        scopeWarnings: [],
+      };
+    });
+  } catch (error) {
+    if (!(error instanceof BaseCheckoutUnavailableError)) throw error;
+    return baseUnavailableOutput(
+      input,
+      runId,
+      "critique",
+      "critique",
+      `critique-attempt-${input.attempt}.md`,
+      route,
+      signature,
+      startedAt,
+      error
+    );
+  }
 }
 
 async function runBuild(
@@ -1015,6 +1248,7 @@ async function runReview(
       outcome: reviewVerdict,
       costUsd,
       durationMs,
+      baseSha: input.headSha,
     });
     await saveArtifact(
       input.ticket.id,
@@ -1040,6 +1274,7 @@ async function runReview(
       durationMs,
       files: input.planFiles,
       headSha: input.headSha,
+      baseSha: input.headSha,
       changedFiles: [],
       scopeWarnings: [],
       reviewVerdict,

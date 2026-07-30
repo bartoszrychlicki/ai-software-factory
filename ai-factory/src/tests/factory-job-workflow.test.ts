@@ -1,18 +1,19 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { chmod, mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createTestGitRepo, useTestWorktrees } from "./git-fixture";
 
 test("Mastra uruchamia factoryJob jako jeden zakończony job planowania bez suspend/resume", async () => {
   const root = await mkdtemp(join(tmpdir(), "factory-job-workflow-"));
-  const repo = join(root, "repo");
+  const repo = createTestGitRepo(root, "repo");
   const fakeClaude = join(root, "fake-claude");
   const previousFactoryRoot = process.env.FACTORY_ROOT;
   const previousClaudeBin = process.env.CLAUDE_BIN;
+  const restoreWorktrees = useTestWorktrees(root);
 
   try {
-    await mkdir(repo);
     await writeFile(join(root, "package.json"), JSON.stringify({ name: "factory-job-harness" }));
     await writeFile(join(root, "projects.yaml"), [
       "harness:",
@@ -70,6 +71,7 @@ test("Mastra uruchamia factoryJob jako jeden zakończony job planowania bez susp
     else process.env.FACTORY_ROOT = previousFactoryRoot;
     if (previousClaudeBin === undefined) delete process.env.CLAUDE_BIN;
     else process.env.CLAUDE_BIN = previousClaudeBin;
+    restoreWorktrees();
     await rm(root, { recursive: true, force: true });
   }
 });

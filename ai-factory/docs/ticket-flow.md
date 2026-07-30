@@ -63,6 +63,22 @@ Linear jest projekcją uproszczoną: `Todo`, `In Progress`, `In Review`, `Done`,
 `👤 ⛔ Zablokowany`, `Canceled`. Zdarzenia GitHub i SQLite pozostają źródłem
 prawdy nawet po ręcznym przestawieniu Lineara.
 
+## Workspace jobów
+
+| Job | Workspace | Zapisana baza |
+|---|---|---|
+| `triage`, `research`, `synthesis`, `critique`, `plan` | osobny detached checkout świeżo pobranego `origin/<default>` per job | `sha` w nagłówku artefaktu oraz `baseSha` w wyniku i metryce |
+| `review` | osobny detached checkout dokładnego PR head SHA | ten sam SHA jako `sha`/`baseSha` |
+| `build` | ticketowy worktree od świeżego `origin/<default>` lub opublikowanej gałęzi w trybie `/fix` | bez zmian w BAR-196 |
+
+Operacje `worktree add/remove/prune` są serializowane per repozytorium, ale
+sama krótka faza przygotowania checkoutów startuje przez to sekwencyjnie; po
+jej zakończeniu joby pracują równolegle w rozłącznych katalogach. Planowanie
+nigdy nie wykonuje `checkout`, `reset` ani `stash` we współdzielonym repo
+człowieka i nie widzi jego niezacommitowanych zmian. Nieudany fetch ma jedną
+próbę ponowienia, a potem kończy job kodem `*_BASE_UNAVAILABLE` zamiast używać
+starego refa.
+
 ## Recovery
 
 Każdy efekt ma stabilny idempotency key. Po restarcie poller:
