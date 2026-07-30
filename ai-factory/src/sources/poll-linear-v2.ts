@@ -72,7 +72,7 @@ import { notify } from "../pipeline/notify";
 import { parseSignatureLine, POLLER_SIGNATURE } from "../pipeline/signature";
 import { progressComment, type ProgressCommentContext } from "../pipeline/progress";
 import { resolveRoute } from "../pipeline/routing";
-import { extendedStatusName } from "./state-map";
+import { extendedStatusName, LINEAR_STATE_MAP } from "./state-map";
 
 const POLL_INTERVAL_MS = Number(process.env.FACTORY_POLL_INTERVAL_MS ?? 60_000);
 const marker = (ticketId: string) => `[linear:${ticketId}:v2]`;
@@ -676,7 +676,18 @@ async function dispatchExternal(
   const source = sourceFor(deps, run);
   const project = await getProject(run.project);
   if (command.kind === "linear-status") {
-    await source.setStateByName(run.ticketId, String(command.payload.state));
+    // Stan końcowy ustawiony przez człowieka jest ostateczny (BAR-127/BAR-185):
+    // payload komendy powstał przed jego decyzją, więc czytamy stan świeżo tuż
+    // przed mutacją. Lista wyłącznie z mapy stanów — bez drugiej kopii w kodzie.
+    const currentState = await source.getStateName(run.ticketId);
+    if (LINEAR_STATE_MAP.terminal.includes(currentState)) {
+      console.log(
+        `[${run.ticketId}] pomijam zapis stanu ${String(command.payload.state)} — ` +
+          `ticket w stanie końcowym (${currentState}).`
+      );
+    } else {
+      await source.setStateByName(run.ticketId, String(command.payload.state));
+    }
   } else if (command.kind === "linear-comment") {
     const requestedProgress = command.payload.progress;
     if (requestedProgress === "milestones" || requestedProgress === "verbose") {
@@ -1325,10 +1336,11 @@ export async function reconcileRun(deps: PollerDependencies, run: LifecycleRun):
   await processCommands(deps, run);
   let current = deps.store.getRun(run.ticketId);
   if (!current || current.status === "done") return;
-  current = await detectInputChange(deps, current);
   const source = sourceFor(deps, current);
+  // Decyzja człowieka o zamknięciu ticketu ma pierwszeństwo przed KAŻDĄ ścieżką
+  // mogącą wygenerować nowe przejście blokujące (input-changed, PR, zombie).
   const linearState = await source.getStateName(current.ticketId).catch(() => undefined);
-  if (linearState === "Canceled") {
+  if (linearState === "Canceled" || linearState === "Duplicate") {
     const ticketId = current.ticketId;
     for (const command of deps.store.outstandingCommands().filter((item) => item.ticketId === ticketId)) {
       if (!command.externalId) continue;
@@ -1338,6 +1350,7 @@ export async function reconcileRun(deps: PollerDependencies, run: LifecycleRun):
     applyDecision(deps, current.ticketId, reduceLifecycle(current, { type: "cancel" }));
     return;
   }
+  current = await detectInputChange(deps, current);
   if (linearState === "Done" && !current.mergedSha && current.planDomain !== "ops") {
     if (current.prUrl) {
       await reconcilePullRequest(deps, current);
