@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -13,7 +13,7 @@ import {
 import { reduceLifecycle, type CoordinatorDecision } from "../pipeline/coordinator";
 import { runPreflight } from "../pipeline/preflight";
 import { buildCommentContextSnapshot } from "../sources/comment-context";
-import { LinearSource } from "../sources/linear";
+import type { LinearSource } from "../sources/linear";
 import {
   extendedRequiredStateNames,
   extendedStatusName,
@@ -22,7 +22,7 @@ import {
   applyDecision,
   dispatchOutbox,
   reconcileRun,
-  writeLinearState,
+  writeClaimState,
   type PollerDependencies,
 } from "../sources/poll-linear-v2";
 
@@ -272,101 +272,54 @@ test("nieterminalny stan przyjmuje prostą i rozszerzoną projekcję", async () 
   }
 });
 
-test("claim używa projekcji projektu, a poller ma jeden korytarz zapisu", async () => {
-  for (const extended of [false, true]) {
-    const store = new LifecycleStore(":memory:");
-    const claims: (string | undefined)[] = [];
-    const writes: string[] = [];
-    let linearState = "Todo";
-    const source = {
-      async getStateName() { return linearState; },
-      async claim(_id: string, preferredStateName?: string) {
-        claims.push(preferredStateName);
-        linearState = preferredStateName ?? "In Progress";
-      },
-      async setStateByName(_id: string, state: string) {
-        writes.push(state);
-        linearState = state;
-      },
-    } as unknown as LinearSource;
-    try {
-      const deps = depsFor(store, { extended, source });
-      const run = store.createRun(
-        extended ? "BAR-CLAIM-EXTENDED" : "BAR-CLAIM-SIMPLE",
-        "demo",
-        manifest
-      );
-      const target = extended ? "🧠 Planowanie" : "In Progress";
-
-      assert.equal(await writeLinearState(deps, run, target, undefined, true), "written");
-      assert.deepEqual(claims, [extended ? "🧠 Planowanie" : undefined]);
-
-      if (extended) {
-        linearState = "Todo";
-        assert.equal(await writeLinearState(deps, run, "🔨 Build"), "written");
-        assert.deepEqual(writes, ["🔨 Build"]);
-      }
-    } finally {
-      store.close();
-    }
-  }
-
-  const sourceCode = await readFile(
-    new URL("../sources/poll-linear-v2.ts", import.meta.url),
-    "utf8"
-  );
-  const writerStart = sourceCode.indexOf("export async function writeLinearState(");
-  const writerEnd = sourceCode.indexOf("\nasync function dispatchExternal", writerStart);
-  assert.ok(writerStart >= 0 && writerEnd > writerStart);
-  const outsideWriter = sourceCode.slice(0, writerStart) + sourceCode.slice(writerEnd);
-  assert.doesNotMatch(outsideWriter, /\.setStateByName\(|\.claim\(/);
-});
-
-test("LinearSource.claim wybiera dokładny stan extended i zachowuje fallback prosty", async () => {
-  const originalFetch = globalThis.fetch;
-  const stateIds: string[] = [];
-  globalThis.fetch = (async (_input, init) => {
-    const request = JSON.parse(String(init?.body)) as {
-      query: string;
-      variables?: { input?: { stateId?: string } };
-    };
-    if (request.query.includes("issueUpdate")) {
-      stateIds.push(String(request.variables?.input?.stateId));
-      return new Response(JSON.stringify({ data: { issueUpdate: { success: true } } }));
-    }
-    return new Response(JSON.stringify({
-      data: {
-        issue: {
-          id: "issue-id",
-          identifier: "BAR-CLAIM",
-          title: "Claim",
-          description: "",
-          url: "https://linear.test/BAR-CLAIM",
-          priorityLabel: null,
-          labels: { nodes: [] },
-          state: { id: "todo", name: "Todo", type: "unstarted" },
-          team: {
-            states: {
-              nodes: [
-                { id: "started-first", name: "Started", type: "started" },
-                { id: "in-progress", name: "In Progress", type: "started" },
-                { id: "planning", name: "🧠 Planowanie", type: "started" },
-              ],
-            },
-          },
-        },
-      },
-    }));
-  }) as typeof fetch;
-
+test("claim i re-claim używają projekcji projektu z fallbackiem po typie", async () => {
+  const store = new LifecycleStore(":memory:");
+  const claims: string[] = [];
+  const writes: string[] = [];
+  let failExactState = false;
+  const source = {
+    async claim(id: string) {
+      claims.push(id);
+    },
+    async setStateByName(_id: string, state: string) {
+      writes.push(state);
+      if (failExactState) throw new Error("Brak stanu w teamie");
+    },
+  } as unknown as LinearSource;
   try {
-    const source = new LinearSource("test-key", "demo");
-    await source.claim("BAR-CLAIM", "🧠 Planowanie");
-    await source.claim("BAR-CLAIM");
-    assert.deepEqual(stateIds, ["planning", "in-progress"]);
-    await assert.rejects(source.claim("BAR-CLAIM", "Brakujący"), /Brak stanu "Brakujący"/);
+    const extendedDeps = depsFor(store, { extended: true, source });
+    const newRun = store.createRun("BAR-CLAIM-NEW", "demo", manifest);
+    await writeClaimState(extendedDeps, source, newRun);
+    assert.deepEqual(writes, ["🧠 Planowanie"]);
+    assert.deepEqual(claims, []);
+
+    const existing = store.createRun("BAR-CLAIM-EXISTING", "demo", manifest);
+    const mergeRun = store.transition(existing.ticketId, {
+      stage: "merge",
+      status: "waiting_human",
+      actor: "test",
+      reason: "ready-to-merge",
+    });
+    await writeClaimState(extendedDeps, source, mergeRun);
+    assert.deepEqual(writes, ["🧠 Planowanie", "👤 ✅ PR do merge"]);
+    assert.deepEqual(claims, []);
+
+    const simpleRun = store.createRun("BAR-CLAIM-SIMPLE", "simple", manifest);
+    const simpleDeps: PollerDependencies = {
+      ...extendedDeps,
+      sources: new Map([["simple", source]]),
+      extendedStatuses: undefined,
+    };
+    await writeClaimState(simpleDeps, source, simpleRun);
+    assert.deepEqual(claims, ["BAR-CLAIM-SIMPLE"]);
+
+    failExactState = true;
+    const fallback = store.createRun("BAR-CLAIM-FALLBACK", "demo", manifest);
+    await writeClaimState(extendedDeps, source, fallback);
+    assert.deepEqual(writes.at(-1), "🧠 Planowanie");
+    assert.deepEqual(claims, ["BAR-CLAIM-SIMPLE", "BAR-CLAIM-FALLBACK"]);
   } finally {
-    globalThis.fetch = originalFetch;
+    store.close();
   }
 });
 

@@ -472,7 +472,7 @@ export class LifecycleStore {
     `).all() as Record<string, unknown>[]).map((row) => this.hydrateRun(row));
   }
 
-  transitionCount(ticketId: string): number {
+  countTransitions(ticketId: string): number {
     const row = this.db.prepare(`
       SELECT COUNT(*) AS count
       FROM lifecycle_transitions

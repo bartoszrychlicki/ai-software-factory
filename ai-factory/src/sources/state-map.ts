@@ -55,8 +55,17 @@ export const LINEAR_STATE_MAP: StateMap = {
 };
 
 /** Czy stan jest końcową decyzją człowieka, której fabryka nie może nadpisać. */
-export function isTerminalState(map: StateMap, stateName: string): boolean {
-  return map.terminal.includes(stateName);
+export function isTerminalState(map: StateMap, stateName?: string): boolean {
+  return !!stateName && map.terminal.includes(stateName);
+}
+
+/** Terminalna decyzja człowieka i odpowiadająca jej ścieżka lifecycle. */
+export function terminalHumanDecision(
+  stateName?: string
+): "cancel" | "premature-done" | undefined {
+  if (stateName === "Canceled" || stateName === "Duplicate") return "cancel";
+  if (stateName === "Done") return "premature-done";
+  return undefined;
 }
 
 export interface ExtendedStatusRun {

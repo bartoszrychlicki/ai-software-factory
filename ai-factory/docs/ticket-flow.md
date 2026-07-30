@@ -65,17 +65,19 @@ prawdy nawet po ręcznym przestawieniu Lineara.
 
 ### Kto pisze stan w Linear
 
-Poller v2 zapisuje stan wyłącznie przez `writeLinearState`. Bezpośrednio przed
-mutacją pobiera świeży stan issue. Jeśli człowiek ustawił stan terminalny
-`Done`, `Canceled` albo `Duplicate`, fabryka nie nadpisuje go żadną oczekującą
-projekcją z outboxa. Dozwolone pozostaje własne przejście fabryki ze stanu
-nieterminalnego do terminalnego: `Done` po smoke albo `Canceled` po obsłużeniu
-zdarzenia anulowania.
+Komenda `linear-status` bezpośrednio przed mutacją pobiera świeży stan issue.
+Jeśli człowiek ustawił stan terminalny `Done`, `Canceled` albo `Duplicate`,
+fabryka nie nadpisuje go żadną oczekującą projekcją z outboxa. Dozwolone
+pozostaje własne przejście fabryki ze stanu nieterminalnego do terminalnego:
+`Done` po smoke albo `Canceled` po obsłużeniu zdarzenia anulowania. Stara
+komenda, której payload nie odpowiada już bieżącej projekcji runu, kończy się
+jako superseded i nie cofa karty do poprzedniej fazy.
 
-Claim również przechodzi przez ten guard. Projekt z `statuses: extended`
-zaczyna od `🧠 Planowanie`, a projekt z projekcją prostą zachowuje
-`In Progress`. Nowsza oczekująca projekcja statusu unieważnia starszą, żeby
-opóźniona komenda nie cofnęła karty do poprzedniej fazy.
+`Canceled` i `Duplicate` kończą run przez zdarzenie cancel (`done/CANCELED`);
+przedwczesne `Done` zachowuje stan karty i blokuje run jako `PREMATURE_DONE`.
+Przy `statuses: extended` claim i re-claim zapisują dokładną projekcję fazy
+(nowy run zaczyna od `🧠 Planowanie`), z fallbackiem do claimu po typie stanu.
+Projekt z projekcją prostą nadal używa claimu do `In Progress`.
 
 ## Recovery
 

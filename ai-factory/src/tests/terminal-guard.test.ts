@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -16,7 +16,6 @@ import {
   applyDecision,
   dispatchOutbox,
   reconcileRun,
-  writeLinearState,
   type PollerDependencies,
 } from "../sources/poll-linear-v2";
 
@@ -35,8 +34,9 @@ function fakeLinear(ticketId: string, manifest: TicketManifestV2, initialState: 
   const control = {
     state: initialState,
     writes: [] as string[],
-    claims: [] as (string | undefined)[],
+    claims: [] as string[],
     comments: [] as string[],
+    incomingComments: [] as { id: string; body: string; createdAt: string }[],
     stateReads: 0,
     ticketReads: 0,
     commentReads: 0,
@@ -53,13 +53,13 @@ function fakeLinear(ticketId: string, manifest: TicketManifestV2, initialState: 
       control.writes.push(state);
       control.state = state;
     },
-    async claim(_id: string, preferredStateName?: string) {
-      control.claims.push(preferredStateName);
-      control.state = preferredStateName ?? "In Progress";
+    async claim(id: string) {
+      control.claims.push(id);
+      control.state = "In Progress";
     },
     async listComments() {
       control.commentReads += 1;
-      return [];
+      return control.incomingComments;
     },
     async getTicket() {
       control.ticketReads += 1;
@@ -123,6 +123,13 @@ test("aktywny run respektuje ręczne Canceled i zwalnia slot w jednym reconcile"
       actor: "test",
       reason: "builder-running",
     });
+    store.enqueue({
+      key: `${ticketId}:g1:linear-status:t3:stale-blocked`,
+      ticketId,
+      kind: "linear-status",
+      stage: "build",
+      payload: { state: "👤 ⛔ Zablokowany" },
+    });
 
     await reconcileRun(deps, store.getRun(ticketId)!);
 
@@ -131,17 +138,22 @@ test("aktywny run respektuje ręczne Canceled i zwalnia slot w jednym reconcile"
       ["done", "CANCELED"]
     );
     assert.equal(store.listActive().some((run) => run.ticketId === ticketId), false);
-    assert.equal(control.commentReads, 0, "Canceled musi być sprawdzone przed komendami");
+    assert.equal(control.commentReads, 1, "processCommands pozostaje pierwszym krokiem reconcile");
     assert.equal(control.ticketReads, 0, "Canceled musi być sprawdzone przed zmianą inputu");
 
     finishCommentCommands(store, ticketId);
-    const [status] = statusCommands(store, ticketId);
-    assert.equal(status?.payload.state, "Canceled");
+    const statuses = statusCommands(store, ticketId);
+    assert.deepEqual(statuses.map((command) => command.payload.state), [
+      "👤 ⛔ Zablokowany",
+      "Canceled",
+    ]);
     await dispatchOutbox(deps);
 
     assert.deepEqual(control.writes, []);
-    assert.equal(store.getCommand(status.key)?.state, "done");
-    assert.equal(store.getCommand(status.key)?.lastError, "skipped-terminal");
+    assert.deepEqual(
+      statuses.map((command) => store.getCommand(command.key)?.lastError),
+      ["superseded", "noop"]
+    );
   } finally {
     store.close();
   }
@@ -199,9 +211,9 @@ test("BAR-185: blocked + zamknięty PR + Canceled kończy run bez re-blokowania 
     assert.equal(store.listActive().some((run) => run.ticketId === ticketId), false);
     assert.equal(existsSync(ghMarker), false, "reconcilePullRequest nie może wystartować po Canceled");
 
-    const transitions = store.transitionCount(ticketId);
-    for (const active of store.listActive()) await reconcileRun(deps, active);
-    assert.equal(store.transitionCount(ticketId), transitions);
+    const transitions = store.countTransitions(ticketId);
+    await reconcileRun(deps, store.getRun(ticketId)!);
+    assert.equal(store.countTransitions(ticketId), transitions);
     assert.equal(store.getRun(ticketId)?.errorCode, "CANCELED");
   } finally {
     store.close();
@@ -243,6 +255,37 @@ test("przedwczesne Done blokuje run bez nadpisywania Done w Linear", async () =>
     await dispatchOutbox(deps);
     assert.deepEqual(control.writes, []);
     assert.equal(control.state, "Done");
+  } finally {
+    store.close();
+  }
+});
+
+test("Duplicate kończy aktywny run jak Canceled i zwalnia slot", async () => {
+  const store = new LifecycleStore(":memory:");
+  const ticketId = "BAR-DUPLICATE";
+  const manifest = manifestFor(ticketId);
+  const { source, control } = fakeLinear(ticketId, manifest, "Duplicate");
+  const deps = depsFor(store, source, { extended: true });
+  try {
+    store.createRun(ticketId, "demo", manifest);
+    store.transition(ticketId, {
+      stage: "review",
+      status: "running",
+      actor: "test",
+      reason: "review-running",
+    });
+
+    await reconcileRun(deps, store.getRun(ticketId)!);
+
+    assert.deepEqual(
+      [store.getRun(ticketId)?.status, store.getRun(ticketId)?.errorCode],
+      ["done", "CANCELED"]
+    );
+    assert.equal(store.listActive().some((run) => run.ticketId === ticketId), false);
+    finishCommentCommands(store, ticketId);
+    await dispatchOutbox(deps);
+    assert.deepEqual(control.writes, []);
+    assert.equal(control.state, "Duplicate");
   } finally {
     store.close();
   }
@@ -297,62 +340,289 @@ test("powtórzone identyczne SCOPE_BLOCKED ma nowy klucz i ponownie zapisuje sta
   }
 });
 
-test("writeLinearState obsługuje zapis, terminal, no-op, supersession i błąd odczytu", async () => {
+test("stara projekcja jest superseded przy nowszej done i przy obu pending", async () => {
   const store = new LifecycleStore(":memory:");
-  const ticketId = "BAR-WRITER";
+  const ticketId = "BAR-SUPERSESSION";
   const manifest = manifestFor(ticketId);
-  const { source, control } = fakeLinear(ticketId, manifest, "In Progress");
+  const { source, control } = fakeLinear(ticketId, manifest, "Todo");
   const deps = depsFor(store, source, { extended: true });
   try {
-    const run = store.createRun(ticketId, "demo", manifest);
-
-    assert.equal(await writeLinearState(deps, run, "Done"), "written");
-    assert.deepEqual(control.writes, ["Done"]);
-
-    for (const terminalState of ["Done", "Canceled", "Duplicate"]) {
-      control.state = terminalState;
-      assert.equal(
-        await writeLinearState(deps, run, "👤 ⛔ Zablokowany"),
-        "skipped-terminal",
-        terminalState
-      );
-    }
-
-    control.state = "🧠 Planowanie";
-    assert.equal(
-      await writeLinearState(deps, run, "🧠 Planowanie"),
-      "skipped-noop"
-    );
-
-    control.state = "Todo";
-    const currentKey = `${ticketId}:g1:linear-status:t2:old`;
-    const newerKey = `${ticketId}:g1:linear-status:t3:new`;
-    store.enqueue({
-      key: currentKey,
-      ticketId,
-      kind: "linear-status",
-      stage: "plan",
-      payload: { state: "In Progress" },
+    store.createRun(ticketId, "demo", manifest);
+    store.transition(ticketId, {
+      stage: "review",
+      status: "running",
+      actor: "test",
+      reason: "review-running",
     });
+
+    const oldBeforeDone = `${ticketId}:g1:linear-status:t2:old-before-done`;
+    const newerDone = `${ticketId}:g1:linear-status:t3:newer-done`;
     store.enqueue({
-      key: newerKey,
+      key: oldBeforeDone,
       ticketId,
       kind: "linear-status",
       stage: "build",
       payload: { state: "🔨 Build" },
     });
-    assert.equal(
-      await writeLinearState(deps, run, "In Progress", currentKey),
-      "skipped-superseded"
-    );
+    store.enqueue({
+      key: newerDone,
+      ticketId,
+      kind: "linear-status",
+      stage: "review",
+      payload: { state: "👀 Code review" },
+    });
+    store.markCommand(newerDone, "done");
 
-    control.failStateRead = true;
-    await assert.rejects(
-      writeLinearState(deps, run, "In Review"),
-      /Linear read failed/
-    );
-    assert.deepEqual(control.writes, ["Done"]);
+    await dispatchOutbox(deps);
+
+    assert.equal(store.getCommand(oldBeforeDone)?.lastError, "superseded");
+    assert.equal(control.stateReads, 0, "supersesja nie wymaga odczytu Lineara");
+    assert.deepEqual(control.writes, []);
+
+    const oldPending = `${ticketId}:g1:linear-status:t4:old-pending`;
+    const newerPending = `${ticketId}:g1:linear-status:t5:newer-pending`;
+    store.enqueue({
+      key: oldPending,
+      ticketId,
+      kind: "linear-status",
+      stage: "build",
+      payload: { state: "🔨 Build" },
+    });
+    store.enqueue({
+      key: newerPending,
+      ticketId,
+      kind: "linear-status",
+      stage: "review",
+      payload: { state: "👀 Code review" },
+    });
+
+    await dispatchOutbox(deps);
+
+    assert.equal(store.getCommand(oldPending)?.lastError, "superseded");
+    assert.equal(store.getCommand(newerPending)?.state, "done");
+    assert.deepEqual(control.writes, ["👀 Code review"]);
   } finally {
     store.close();
   }
+});
+
+test("processCommands obsługuje /score dla done runu z otwartym PR-em", async () => {
+  const root = await mkdtemp(join(tmpdir(), "factory-score-done-"));
+  const previousRoot = process.env.FACTORY_ROOT;
+  const store = new LifecycleStore(":memory:");
+  const ticketId = "BAR-DONE-SCORE";
+  const manifest = manifestFor(ticketId);
+  const { source, control } = fakeLinear(ticketId, manifest, "Done");
+  const deps = depsFor(store, source);
+  try {
+    await writeFile(join(root, "package.json"), "{}");
+    process.env.FACTORY_ROOT = root;
+    store.createRun(ticketId, "demo", manifest);
+    store.transition(ticketId, {
+      stage: "merge",
+      status: "done",
+      actor: "test",
+      reason: "done-with-open-pr",
+      patch: { prUrl: "https://github.test/o/r/pull/194" },
+    });
+    control.incomingComments.push({
+      id: "score-comment",
+      body: "/score 5 regresja pokryta",
+      createdAt: "2026-07-30T12:00:00.000Z",
+    });
+    assert.equal(store.listActive().some((run) => run.ticketId === ticketId), true);
+
+    await reconcileRun(deps, store.getRun(ticketId)!);
+
+    assert.equal(store.isCommentProcessed("score-comment"), true);
+    assert.equal(store.getRun(ticketId)?.score, 5);
+    assert.equal(control.stateReads, 0, "done wraca po processCommands bez reconcile PR");
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  } finally {
+    store.close();
+    if (previousRoot === undefined) delete process.env.FACTORY_ROOT;
+    else process.env.FACTORY_ROOT = previousRoot;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("cancelActiveJobs zatrzymuje run-job i run-tests przez właściwe killery", async () => {
+  const store = new LifecycleStore(":memory:");
+  const ticketId = "BAR-CANCEL-JOBS";
+  const manifest = manifestFor(ticketId);
+  const { source } = fakeLinear(ticketId, manifest, "Canceled");
+  const canceledRuns: string[] = [];
+  const killedPids: number[] = [];
+  const deps = depsFor(store, source);
+  deps.mastra = {
+    async cancelRun(runId: string) {
+      canceledRuns.push(runId);
+    },
+  } as PollerDependencies["mastra"];
+  deps.killProcessGroup = (pid) => killedPids.push(pid);
+  try {
+    store.createRun(ticketId, "demo", manifest);
+    store.transition(ticketId, {
+      stage: "test",
+      status: "running",
+      actor: "test",
+      reason: "jobs-running",
+    });
+    const jobKey = `${ticketId}:g1:job`;
+    const testsKey = `${ticketId}:g1:tests`;
+    store.enqueue({
+      key: jobKey,
+      ticketId,
+      kind: "run-job",
+      stage: "build",
+      payload: { kind: "build", attempt: 1 },
+    });
+    store.enqueue({
+      key: testsKey,
+      ticketId,
+      kind: "run-tests",
+      stage: "test",
+      payload: { attempt: 1 },
+    });
+    store.markCommand(jobKey, "dispatched", { externalId: "mastra-run-194" });
+    store.markCommand(testsKey, "dispatched", { externalId: "4194" });
+
+    await reconcileRun(deps, store.getRun(ticketId)!);
+
+    assert.deepEqual(canceledRuns, ["mastra-run-194"]);
+    assert.deepEqual(killedPids, [4194]);
+    assert.equal(store.getRun(ticketId)?.errorCode, "CANCELED");
+  } finally {
+    store.close();
+  }
+});
+
+function stripCommentsAndStrings(source: string): string {
+  let result = "";
+  let state: "code" | "line" | "block" | "single" | "double" | "template" | "regex" = "code";
+  let previousSignificant = "";
+  let regexCharClass = false;
+  const templateExpressionDepths: number[] = [];
+  for (let index = 0; index < source.length; index += 1) {
+    const char = source[index];
+    const next = source[index + 1];
+    if (state === "code") {
+      if (char === "{" && templateExpressionDepths.length) {
+        templateExpressionDepths[templateExpressionDepths.length - 1] += 1;
+        result += char;
+        previousSignificant = char;
+      } else if (char === "}" && templateExpressionDepths.length) {
+        const depthIndex = templateExpressionDepths.length - 1;
+        templateExpressionDepths[depthIndex] -= 1;
+        if (templateExpressionDepths[depthIndex] === 0) {
+          templateExpressionDepths.pop();
+          state = "template";
+          result += " ";
+        } else {
+          result += char;
+          previousSignificant = char;
+        }
+      } else if (char === "/" && next === "/") {
+        state = "line";
+        result += "  ";
+        index += 1;
+      } else if (char === "/" && next === "*") {
+        state = "block";
+        result += "  ";
+        index += 1;
+      } else if (char === "'") {
+        state = "single";
+        result += " ";
+      } else if (char === "\"") {
+        state = "double";
+        result += " ";
+      } else if (char === "`") {
+        state = "template";
+        result += " ";
+      } else if (char === "/" && "([{:;,=!?&|+-*%^~<>".includes(previousSignificant)) {
+        state = "regex";
+        regexCharClass = false;
+        result += " ";
+      } else {
+        result += char;
+        if (!/\s/.test(char)) previousSignificant = char;
+      }
+      continue;
+    }
+    if (state === "template") {
+      if (char === "\\") {
+        result += "  ";
+        index += 1;
+      } else if (char === "$" && next === "{") {
+        templateExpressionDepths.push(1);
+        state = "code";
+        result += "  ";
+        index += 1;
+        previousSignificant = "{";
+      } else if (char === "`") {
+        state = "code";
+        result += " ";
+      } else {
+        result += char === "\n" ? "\n" : " ";
+      }
+      continue;
+    }
+    if (state === "regex") {
+      if (char === "\\") {
+        result += "  ";
+        index += 1;
+      } else if (char === "[") {
+        regexCharClass = true;
+        result += " ";
+      } else if (char === "]") {
+        regexCharClass = false;
+        result += " ";
+      } else if (char === "/" && !regexCharClass) {
+        state = "code";
+        previousSignificant = "/";
+        result += " ";
+      } else {
+        result += char === "\n" ? "\n" : " ";
+      }
+      continue;
+    }
+    if (state === "line" && char === "\n") {
+      state = "code";
+      result += "\n";
+    } else if (state === "block" && char === "*" && next === "/") {
+      state = "code";
+      result += "  ";
+      index += 1;
+    } else if (
+      (state === "single" && char === "'") ||
+      (state === "double" && char === "\"")
+    ) {
+      state = "code";
+      result += " ";
+    } else if (
+      (state === "single" || state === "double") &&
+      char === "\\"
+    ) {
+      result += "  ";
+      index += 1;
+    } else {
+      result += char === "\n" ? "\n" : " ";
+    }
+  }
+  return result;
+}
+
+test("poller v2 ma tylko zatwierdzone call-site'y zapisu stanu Lineara", async () => {
+  const sourceCode = await readFile(
+    new URL("../sources/poll-linear-v2.ts", import.meta.url),
+    "utf8"
+  );
+  const code = stripCommentsAndStrings(sourceCode);
+  const callSites = (pattern: RegExp) => code.match(pattern)?.length ?? 0;
+  const setStateLines = [...code.matchAll(/\.setStateByName\s*\(/g)].map(
+    (match) => sourceCode.slice(0, match.index).split("\n").length
+  );
+
+  assert.equal(callSites(/\.setStateByName\s*\(/g), 2, `linie: ${setStateLines.join(", ")}`);
+  assert.equal(callSites(/\.claim\s*\(/g), 1);
 });
