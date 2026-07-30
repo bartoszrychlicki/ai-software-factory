@@ -15,9 +15,11 @@ export type Stage =
   | "synthesis"
   | "critique";
 
+type RouteSpec = string | string[];
+
 interface RoutingFile {
-  defaults?: Record<string, string>;
-  projects?: Record<string, Record<string, string>>;
+  defaults?: Record<string, RouteSpec>;
+  projects?: Record<string, Record<string, RouteSpec>>;
 }
 
 export interface Route {
@@ -36,6 +38,34 @@ function parseSpec(spec: string): { engineName: string; model?: string; effort?:
   if (!modelPart) return { engineName };
   const [model, effort] = modelPart.split("@");
   return { engineName, model: model || undefined, effort: effort || undefined };
+}
+
+function normalizeSpecs(value: unknown, context: string): string[] {
+  const specs = typeof value === "string"
+    ? [value]
+    : Array.isArray(value)
+      ? value
+      : undefined;
+  if (!specs) {
+    throw new Error(`${context}: oczekiwano specyfikacji silnika albo listy specyfikacji.`);
+  }
+  if (!specs.length) {
+    throw new Error(`${context}: lista specyfikacji nie może być pusta.`);
+  }
+  if (specs.length > 2) {
+    throw new Error(
+      `${context}: maksymalnie dwie specyfikacje (główna + jeden zapas) — ` +
+      "kaskada jest świadomie niewspierana."
+    );
+  }
+  if (specs.some((spec) => typeof spec !== "string" || !spec.trim())) {
+    throw new Error(`${context}: każda specyfikacja musi być niepustym stringiem.`);
+  }
+  const normalized = specs.map((spec) => (spec as string).trim());
+  if (new Set(normalized).size !== normalized.length) {
+    throw new Error(`${context}: zapas identyczny z głównym jest niedozwolony.`);
+  }
+  return normalized;
 }
 
 /**
@@ -57,17 +87,17 @@ async function loadRoutingConfig(): Promise<RoutingFile> {
     );
   }
 
-  const defaults = mergeSection(base.defaults, local.defaults, `${localPath}: defaults`) as Record<string, string>;
+  const defaults = mergeSection(base.defaults, local.defaults, `${localPath}: defaults`) as Record<string, RouteSpec>;
   const baseProjects = ensureMapping(base.projects, `${basePath}: projects`);
   const localProjects = ensureMapping(local.projects, `${localPath}: projects`);
-  const projects = { ...baseProjects } as Record<string, Record<string, string>>;
+  const projects = { ...baseProjects } as Record<string, Record<string, RouteSpec>>;
   for (const [projectKey, override] of Object.entries(localProjects)) {
     if (override === null || override === undefined) continue; // pusty stub sekcji = brak nadpisań
     projects[projectKey] = mergeSection(
       baseProjects[projectKey],
       override,
       `${localPath}: projects.${projectKey}`
-    ) as Record<string, string>;
+    ) as Record<string, RouteSpec>;
   }
   return { defaults, projects };
 }
@@ -87,13 +117,16 @@ export interface RouteOptions {
  * 2. projects.<projekt>.<etap[.domena]> w routing.yaml,
  * 3. defaults.<etap.domena>,
  * 4. defaults.<etap>.
+ *
+ * Wynik jest uporządkowany: główny, potem opcjonalny zapas. Wywołujący może
+ * przejść na zapas wyłącznie po rozpoznanej awarii infrastruktury silnika.
  */
-export async function resolveRoute(
+export async function resolveRouteCandidates(
   stage: Stage,
   ticket: { project: string; labels?: string[] },
   domain?: string,
   options: RouteOptions = {}
-): Promise<Route> {
+): Promise<Route[]> {
   const cfg = await loadRoutingConfig();
 
   // label wybiera BUILDERA; role read-only (plan/verify/review) idą wg configu —
@@ -101,18 +134,23 @@ export async function resolveRoute(
   const label = stage === "build" ? (ticket.labels ?? []).find((l) => l.startsWith("engine:")) : undefined;
   const projectCfg = cfg.projects?.[ticket.project];
 
-  let spec =
+  let value: RouteSpec | undefined =
     label?.slice("engine:".length) ??
     (domain ? projectCfg?.[`${stage}.${domain}`] : undefined) ??
     projectCfg?.[stage] ??
     (domain ? cfg.defaults?.[`${stage}.${domain}`] : undefined) ??
     cfg.defaults?.[stage];
 
-  if (!spec) {
+  if (!value) {
     throw new Error(`Brak routingu dla etapu "${stage}" (projekt: ${ticket.project}) w routing.yaml`);
   }
 
-  if (options.excludeEngine && parseSpec(spec).engineName === options.excludeEngine) {
+  let context = label
+    ? `Routing label ${label}`
+    : `Routing ${ticket.project}.${domain ? `${stage}.${domain}` : stage}`;
+  let specs = normalizeSpecs(value, context);
+
+  if (options.excludeEngine && parseSpec(specs[0]).engineName === options.excludeEngine) {
     const diverse = projectCfg?.[`${stage}.diverse`] ?? cfg.defaults?.[`${stage}.diverse`];
     if (!diverse) {
       throw new Error(
@@ -120,19 +158,39 @@ export async function resolveRoute(
         `a routing.yaml nie ma fallbacku "${stage}.diverse".`
       );
     }
-    if (parseSpec(diverse).engineName === options.excludeEngine) {
-      throw new Error(`Routing ${stage}.diverse wskazuje wykluczony silnik "${options.excludeEngine}".`);
-    }
-    spec = diverse;
+    value = diverse;
+    context = `Routing ${stage}.diverse`;
+    specs = normalizeSpecs(value, context);
   }
 
-  const { engineName, model, effort } = parseSpec(spec);
-  const engine = engines[engineName];
-  if (!engine) {
-    throw new Error(
-      `Nieznany silnik "${engineName}" w routingu (dostępne: ${Object.keys(engines).join(", ")})`
-    );
+  const candidates: Route[] = [];
+  for (const spec of specs) {
+    const { engineName, model, effort } = parseSpec(spec);
+    const engine = engines[engineName];
+    if (!engine) {
+      throw new Error(
+        `Nieznany silnik "${engineName}" w routingu (dostępne: ${Object.keys(engines).join(", ")})`
+      );
+    }
+    const cliVersion = engine.version ? await engine.version() : undefined;
+    candidates.push({ engine, model, effort, spec, cliVersion });
   }
-  const cliVersion = engine.version ? await engine.version() : undefined;
-  return { engine, model, effort, spec, cliVersion };
+
+  const allowed = options.excludeEngine
+    ? candidates.filter((candidate) => candidate.engine.name !== options.excludeEngine)
+    : candidates;
+  if (!allowed.length) {
+    throw new Error(`Routing ${stage}.diverse wskazuje wykluczony silnik "${options.excludeEngine}".`);
+  }
+  return allowed;
+}
+
+/** Kompatybilny wrapper dla wywołujących, którzy znają tylko jedną trasę. */
+export async function resolveRoute(
+  stage: Stage,
+  ticket: { project: string; labels?: string[] },
+  domain?: string,
+  options: RouteOptions = {}
+): Promise<Route> {
+  return (await resolveRouteCandidates(stage, ticket, domain, options))[0];
 }

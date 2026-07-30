@@ -1,5 +1,11 @@
 # Routing: etap[.domena] -> silnik[/model]
 # Rozstrzyganie: label engine:* na tickecie > projects.<projekt> > defaults.<etap.domena> > defaults.<etap>
+# Wartość wpisu: skalar (brak zapasu) albo lista 1–2 specyfikacji:
+#   plan:
+#     - claude-code/claude-fable-5@high   # główny
+#     - claude-code/claude-opus-5@high    # zapas (tylko przy AWARII silnika głównego)
+# Zapas NIE rusza przy wyniku merytorycznym (BLOCKED, brak werdyktu, uwagi recenzji)
+# ani przy wyczerpanym budżecie ticketu. Maksymalnie jedno przejście na próbę etapu.
 defaults:
   plan: claude-code/sonnet
   build: codex              # bez modelu = default CLI

@@ -2317,3 +2317,185 @@ test("notyfikacje: plan-ready przechodzi przez lejek applyDecision dokładnie ra
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("fallback planu zapisuje degradację i renderuje ją na bramce", () => {
+  const run: LifecycleRun = {
+    ticketId: "BAR-FB-GATE",
+    project: "harness",
+    generation: 1,
+    stage: "plan",
+    status: "running",
+    manifest,
+    planFiles: [],
+    clarifyRound: 0,
+    critiqueRound: 0,
+    fixRound: 0,
+    createdAt: "x",
+    updatedAt: "x",
+  };
+  const decision = reduceLifecycle(run, {
+    type: "job-finished",
+    attempt: 1,
+    output: {
+      ...planOutput,
+      signature: "ai-factory · fallback@1.0 · backup-model@high · planner",
+      engineFallback: {
+        from: "primary/primary-model@high",
+        to: "fallback/backup-model@high",
+        reason: "failed to lookup address information",
+      },
+    },
+  });
+  const degradations = decision.transition.patch?.degradations ?? [];
+  assert.match(degradations.join("\n"), /plan wykonany silnikiem zapasowym fallback\/backup-model@high/);
+  assert.match(String(decision.commands[0].payload.body), /Degradacje/);
+  assert.match(String(decision.commands[0].payload.body), /failed to lookup address information/);
+});
+
+test("fallback buildu dodaje jawny komentarz Linear z podpisem użytego modelu", () => {
+  const run: LifecycleRun = {
+    ticketId: "BAR-FB-BUILD-COMMENT",
+    project: "harness",
+    generation: 1,
+    stage: "build",
+    status: "running",
+    manifest,
+    plan: "plan",
+    planFiles: ["src/a.ts"],
+    clarifyRound: 0,
+    critiqueRound: 0,
+    fixRound: 0,
+    createdAt: "x",
+    updatedAt: "x",
+  };
+  const signature = "ai-factory · fallback@1.0 · backup-model@high · builder";
+  const decision = reduceLifecycle(run, {
+    type: "job-finished",
+    attempt: 2,
+    output: {
+      kind: "build",
+      outcome: "success",
+      report: "build",
+      signature,
+      durationMs: 2,
+      files: ["src/a.ts"],
+      branch: "agent/BAR-FB-BUILD-COMMENT",
+      workspaceDir: "/tmp/worktree",
+      headSha: "a".repeat(40),
+      changedFiles: ["src/a.ts"],
+      scopeWarnings: [],
+      engineFallback: {
+        from: "primary/primary-model@high",
+        to: "fallback/backup-model@high",
+        reason: "failed to connect to websocket",
+      },
+    },
+  });
+  const comment = decision.commands.find((command) => command.kind === "linear-comment");
+  assert.ok(comment);
+  assert.match(String(comment.payload.body), /^⚠️ build wykonany silnikiem zapasowym/);
+  assert.equal(comment.payload.signature, signature);
+  assert.match((decision.transition.patch?.degradations ?? []).join("\n"), /websocket/);
+});
+
+test("job-finished bez fallbacku nie zmienia degradacji", () => {
+  const run: LifecycleRun = {
+    ticketId: "BAR-FB-NONE",
+    project: "harness",
+    generation: 1,
+    stage: "plan",
+    status: "running",
+    manifest,
+    planFiles: [],
+    clarifyRound: 0,
+    critiqueRound: 0,
+    fixRound: 0,
+    degradations: ["istniejąca degradacja"],
+    createdAt: "x",
+    updatedAt: "x",
+  };
+  const decision = reduceLifecycle(run, {
+    type: "job-finished",
+    attempt: 1,
+    output: planOutput,
+  });
+  assert.equal(decision.transition.patch?.degradations, undefined);
+});
+
+test("poller pozwala na fallback tylko przy headroomie budżetu ticketu", async () => {
+  const root = await mkdtemp(join(tmpdir(), "factory-fallback-budget-headroom-"));
+  const previousRoot = process.env.FACTORY_ROOT;
+  const store = new LifecycleStore(join(root, "registry.db"));
+  const captured = new Map<string, boolean>();
+  try {
+    await writeHarnessFixture(root, [
+      "  budget:",
+      "    maxUsd: 100",
+      "    maxMinutes: 25",
+    ]);
+    process.env.FACTORY_ROOT = root;
+    const mastra = {
+      async getRun(runId: string) {
+        throw new MastraHttpError(404, `/workflows/factoryJob/runs/${runId}`, "missing");
+      },
+      async createRun() {},
+      async startRun(_runId: string, inputData: Record<string, unknown>) {
+        const inputTicket = inputData.ticket as { id?: string };
+        captured.set(String(inputTicket.id), inputData.allowEngineFallback === true);
+      },
+    };
+    const deps: PollerDependencies = {
+      store,
+      mastra: mastra as unknown as PollerDependencies["mastra"],
+      sources: new Map(),
+      notifier: async () => {},
+    };
+
+    for (const id of ["BAR-FB-ROOM", "BAR-FB-TIGHT"]) {
+      store.createRun(id, "harness", { ...manifest, inputHash: `hash-${id}` });
+      store.transition(id, {
+        stage: "plan",
+        status: "running",
+        actor: "test",
+        reason: "budget-fixture",
+      });
+      if (id === "BAR-FB-TIGHT") {
+        store.startAttempt(id, "build", 1, `historic-${id}`);
+        store.finishAttempt(id, "build", 1, {
+          status: "success",
+          outcome: "committed",
+          costUsd: 0,
+          durationMs: 10 * 60_000,
+        });
+      }
+      store.enqueue({
+        key: `${id}:g1:job:plan:plan:a1`,
+        ticketId: id,
+        kind: "run-job",
+        stage: "plan",
+        payload: {
+          kind: "plan",
+          attempt: 1,
+          ticket: {
+            id,
+            title: manifest.title,
+            description: manifest.description,
+            project: "harness",
+            labels: [],
+            inputHash: `hash-${id}`,
+          },
+          planFiles: [],
+        },
+      });
+    }
+
+    await dispatchOutbox(deps);
+    assert.equal(captured.get("BAR-FB-ROOM"), true);
+    assert.equal(captured.get("BAR-FB-TIGHT"), false);
+  } finally {
+    store.close();
+    if (previousRoot === undefined) delete process.env.FACTORY_ROOT;
+    else process.env.FACTORY_ROOT = previousRoot;
+    await rm(root, { recursive: true, force: true });
+  }
+});

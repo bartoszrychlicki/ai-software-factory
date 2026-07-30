@@ -315,7 +315,58 @@ function assertStage(run: LifecycleRun, expected: LifecycleStage, event: string)
   }
 }
 
+type JobFinishedEvent = Extract<CoordinatorEvent, { type: "job-finished" }>;
+
+function engineFallbackNote(event: JobFinishedEvent): string | undefined {
+  const fallback = event.output.engineFallback;
+  if (!fallback) return undefined;
+  const reason = fallback.reason.replace(/\s+/g, " ").trim();
+  return `⚠️ ${event.output.kind} wykonany silnikiem zapasowym ${fallback.to}, ` +
+    `bo ${reason} (główny: ${fallback.from})`;
+}
+
+function annotateEngineFallback(
+  run: LifecycleRun,
+  event: JobFinishedEvent,
+  decision: CoordinatorDecision
+): CoordinatorDecision {
+  const note = engineFallbackNote(event);
+  if (!note) return decision;
+  const current = decision.transition.patch?.degradations ?? run.degradations ?? [];
+  const degradations = current.includes(note) ? current : [...current, note];
+  decision.transition.patch = {
+    ...decision.transition.patch,
+    degradations,
+  };
+  if (event.output.kind === "build" || event.output.kind === "review") {
+    decision.commands = [
+      ...decision.commands,
+      linearComment(
+        run,
+        `engine-fallback:${event.output.kind}:${event.attempt}`,
+        note,
+        event.output.kind,
+        event.output.signature
+      ),
+    ];
+  }
+  return decision;
+}
+
+function reduceJobFinished(run: LifecycleRun, event: JobFinishedEvent): CoordinatorDecision {
+  return reduceLifecycleCore(run, event);
+}
+
 export function reduceLifecycle(run: LifecycleRun, event: CoordinatorEvent): CoordinatorDecision {
+  if (event.type !== "job-finished") return reduceLifecycleCore(run, event);
+  const note = engineFallbackNote(event);
+  const annotatedRun = note && !(run.degradations ?? []).includes(note)
+    ? { ...run, degradations: [...(run.degradations ?? []), note] }
+    : run;
+  return annotateEngineFallback(run, event, reduceJobFinished(annotatedRun, event));
+}
+
+function reduceLifecycleCore(run: LifecycleRun, event: CoordinatorEvent): CoordinatorDecision {
   if (event.type === "cancel") {
     return {
       transition: {

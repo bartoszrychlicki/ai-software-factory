@@ -8,7 +8,7 @@ import {
   removeCheckout,
 } from "./workspace";
 import { getProject } from "./projects";
-import { resolveRoute } from "./routing";
+import { resolveRoute, resolveRouteCandidates } from "./routing";
 import { artifactHeader, saveArtifact } from "./artifacts";
 import {
   buildSignature,
@@ -29,9 +29,12 @@ import {
 import { changeManifest } from "./quality";
 import { auditScope, changedFilesInWorkspace } from "./scope";
 import { critiqueMeaningOf, humanSummaryOf } from "./human-summary";
+import { classifyEngineFailure } from "./failure-classes";
 import type { Route, Stage } from "./routing";
 import type { ProjectConfig } from "./projects";
 import type { ActionSignature } from "./signature";
+import type { EngineRunResult } from "../engines/types";
+import type { MetricRow } from "./metrics";
 
 const ticketSchema = z.object({
   id: z.string(),
@@ -74,6 +77,8 @@ export const factoryJobInputSchema = z.object({
   critique: z.string().optional(),
   /** Harness syntezy — krytyka wyklucza go w routingu (dywersyfikacja). */
   synthesisHarness: z.string().optional(),
+  /** Poller wyłącza zapas, gdy budżet ticketu nie ma miejsca na drugą próbę. */
+  allowEngineFallback: z.boolean().optional(),
 });
 
 export const factoryJobOutputSchema = z.object({
@@ -110,9 +115,18 @@ export const factoryJobOutputSchema = z.object({
   critiqueIssues: z.string().optional(),
   /** Jedno zdanie dla autora ticketu; tekst prezentacyjny poza kontraktem `factory`. */
   critiqueMeaning: z.string().optional(),
+  engineFallback: z.object({
+    from: z.string(),
+    to: z.string(),
+    reason: z.string(),
+  }).optional(),
 });
 
-export type FactoryJobInput = z.infer<typeof factoryJobInputSchema>;
+type ParsedFactoryJobInput = z.infer<typeof factoryJobInputSchema>;
+/** Bezpośredni wywołujący mogą pominąć pole; schema/runtime stosują default true. */
+export type FactoryJobInput = Omit<ParsedFactoryJobInput, "allowEngineFallback"> & {
+  allowEngineFallback?: boolean;
+};
 export type FactoryJobOutput = z.infer<typeof factoryJobOutputSchema>;
 
 /** Budżety wall-clock jobów; poller liczy z nich lease stall-detection. */
@@ -160,13 +174,198 @@ export interface FactoryJobRuntime {
     domain?: string,
     options?: { excludeEngine?: string }
   ): Promise<Route>;
+  routeCandidates?(
+    stage: Stage,
+    ticket: { project: string; labels?: string[] },
+    domain?: string,
+    options?: { excludeEngine?: string }
+  ): Promise<Route[]>;
   project(key: string): Promise<ProjectConfig>;
 }
 
 const defaultRuntime: FactoryJobRuntime = {
   route: resolveRoute,
+  routeCandidates: resolveRouteCandidates,
   project: getProject,
 };
+
+type EngineFallback = NonNullable<FactoryJobOutput["engineFallback"]>;
+type FallbackDecision = NonNullable<MetricRow["fallbackDecision"]>;
+
+interface EngineAttempt {
+  result: EngineRunResult;
+  route: Route;
+  signature: ActionSignature;
+  fallback?: EngineFallback;
+  fallbackDecision?: FallbackDecision;
+  costUsd: number;
+  durationMs: number;
+  costSource: NonNullable<FactoryJobOutput["costSource"]>;
+  /** Koszt/czas wyłącznie faktycznie użytego, finalnego kandydata. */
+  finalCostUsd: number;
+  finalDurationMs: number;
+  /** `true`, gdy helper zapisał już finalną metrykę engine-fail. */
+  finalFailureMetricRecorded: boolean;
+}
+
+async function jobRouteCandidates(
+  runtime: FactoryJobRuntime,
+  stage: Stage,
+  ticket: FactoryJobInput["ticket"],
+  domain?: string,
+  options?: { excludeEngine?: string }
+): Promise<Route[]> {
+  return runtime.routeCandidates
+    ? runtime.routeCandidates(stage, ticket, domain, options)
+    : [await runtime.route(stage, ticket, domain, options)];
+}
+
+function fallbackMetricFields(attempt: EngineAttempt): {
+  engineFallback?: string;
+  fallbackReason?: string;
+} {
+  return attempt.fallback
+    ? {
+        engineFallback: `${attempt.fallback.from} → ${attempt.fallback.to}`,
+        fallbackReason: attempt.fallback.reason,
+      }
+    : {};
+}
+
+function fallbackArtifactFields(attempt: EngineAttempt): { engineFallback?: string } {
+  return attempt.fallback
+    ? { engineFallback: `${attempt.fallback.from} → ${attempt.fallback.to}` }
+    : {};
+}
+
+/**
+ * Jedna próba główna i najwyżej jedna zapasowa. Zapas uruchamia wyłącznie
+ * allowlista awarii infrastruktury; wynik pracy i brak headroomu budżetu
+ * kończą się na głównym silniku.
+ */
+async function runEngineWithFallback(
+  stage: Stage,
+  candidates: Route[],
+  allowFallback: boolean,
+  ctx: {
+    ticket: string;
+    runId: string;
+    metricStage: MetricRow["stage"];
+    attempt: number;
+    baseSha?: string;
+  },
+  invoke: (route: Route) => Promise<EngineRunResult>,
+  beforeFallback?: () => Promise<void>
+): Promise<EngineAttempt> {
+  const primary = candidates[0];
+  if (!primary) throw new Error(`Routing ${stage} nie zwrócił głównego kandydata.`);
+
+  const runOne = async (route: Route) => {
+    const startedAt = Date.now();
+    const result = await invoke(route);
+    const durationMs = Date.now() - startedAt;
+    return { result, durationMs, ...effectiveCost(result, durationMs) };
+  };
+
+  const first = await runOne(primary);
+  if (first.result.ok) {
+    return {
+      result: first.result,
+      route: primary,
+      signature: buildSignature(stage, primary),
+      costUsd: first.costUsd,
+      durationMs: first.durationMs,
+      costSource: first.costSource,
+      finalCostUsd: first.costUsd,
+      finalDurationMs: first.durationMs,
+      finalFailureMetricRecorded: false,
+    };
+  }
+
+  const decision: FallbackDecision = !allowFallback
+    ? "budget"
+    : !candidates[1]
+      ? "no-candidate"
+      : classifyEngineFailure(first.result.report) === "work"
+        ? "not-infra"
+        : "used";
+  await recordMetric({
+    ticket: ctx.ticket,
+    runId: ctx.runId,
+    stage: ctx.metricStage,
+    engine: primary.spec,
+    attempt: ctx.attempt,
+    ok: false,
+    outcome: "engine-fail",
+    costUsd: first.costUsd,
+    durationMs: first.durationMs,
+    baseSha: ctx.baseSha,
+    fallbackDecision: decision,
+  });
+
+  if (decision !== "used") {
+    return {
+      result: first.result,
+      route: primary,
+      signature: buildSignature(stage, primary),
+      fallbackDecision: decision,
+      costUsd: first.costUsd,
+      durationMs: first.durationMs,
+      costSource: first.costSource,
+      finalCostUsd: first.costUsd,
+      finalDurationMs: first.durationMs,
+      finalFailureMetricRecorded: true,
+    };
+  }
+
+  const fallbackRoute = candidates[1];
+  await beforeFallback?.();
+  const fallback: EngineFallback = {
+    from: primary.spec,
+    to: fallbackRoute.spec,
+    reason: first.result.report.slice(0, 200),
+  };
+  const second = await runOne(fallbackRoute);
+  if (!second.result.ok) {
+    await recordMetric({
+      ticket: ctx.ticket,
+      runId: ctx.runId,
+      stage: ctx.metricStage,
+      engine: fallbackRoute.spec,
+      attempt: ctx.attempt,
+      ok: false,
+      outcome: "engine-fail",
+      costUsd: second.costUsd,
+      durationMs: second.durationMs,
+      baseSha: ctx.baseSha,
+      ...fallbackMetricFields({
+        result: second.result,
+        route: fallbackRoute,
+        signature: buildSignature(stage, fallbackRoute),
+        fallback,
+        costUsd: first.costUsd + second.costUsd,
+        durationMs: first.durationMs + second.durationMs,
+        costSource: second.costSource,
+        finalCostUsd: second.costUsd,
+        finalDurationMs: second.durationMs,
+        finalFailureMetricRecorded: true,
+      }),
+    });
+  }
+  return {
+    result: second.result,
+    route: fallbackRoute,
+    signature: buildSignature(stage, fallbackRoute),
+    fallback,
+    fallbackDecision: "used",
+    costUsd: first.costUsd + second.costUsd,
+    durationMs: first.durationMs + second.durationMs,
+    costSource: second.costSource,
+    finalCostUsd: second.costUsd,
+    finalDurationMs: second.durationMs,
+    finalFailureMetricRecorded: !second.result.ok,
+  };
+}
 
 type ReadOnlyJobKind = "plan" | "triage" | "research" | "synthesis" | "critique";
 type ReadOnlyMetricStage =
@@ -318,23 +517,30 @@ async function runPlan(
   signal?: AbortSignal,
   runtime: FactoryJobRuntime = defaultRuntime
 ): Promise<FactoryJobOutput> {
-  const route = await runtime.route("plan", input.ticket);
-  const signature = buildSignature("plan", route);
+  const candidates = await jobRouteCandidates(runtime, "plan", input.ticket);
+  const primaryRoute = candidates[0];
+  const primarySignature = buildSignature("plan", primaryRoute);
   const startedAt = Date.now();
   try {
     return await withBaseCheckout(runtime, input.ticket, "plan", runId, signal, async (base) => {
-      const result = await route.engine.run({
-        role: "plan",
-        model: route.model,
-        effort: route.effort,
-        instructions: planInstructions,
-        context: planContext(input),
-        workspace: base.dir,
-        budget: { minutes: JOB_BUDGET_MINUTES.plan },
-        signal,
-      });
-      const durationMs = Date.now() - startedAt;
-      const { costUsd, costSource } = effectiveCost(result, durationMs);
+      const engineAttempt = await runEngineWithFallback(
+        "plan",
+        candidates,
+        input.allowEngineFallback !== false,
+        { ticket: input.ticket.id, runId, metricStage: "plan", attempt: input.attempt, baseSha: base.sha },
+        (route) => route.engine.run({
+          role: "plan",
+          model: route.model,
+          effort: route.effort,
+          instructions: planInstructions,
+          context: planContext(input),
+          workspace: base.dir,
+          budget: { minutes: JOB_BUDGET_MINUTES.plan },
+          signal,
+        })
+      );
+      const { result, route, signature } = engineAttempt;
+      const { costUsd, costSource, durationMs } = engineAttempt;
       const report = result.transcript ?? result.report;
       const summary = humanSummaryOf(report);
       const verdict = parsePlanVerdict(report);
@@ -346,20 +552,23 @@ async function runPlan(
             ? "questions"
             : "failed";
       const questions = verdict.questions ? formatClarifyQuestions(verdict.questions) : undefined;
-      await recordMetric({
-        ticket: input.ticket.id,
-        runId,
-        stage: "plan",
-        engine: route.spec,
-        attempt: input.attempt,
-        ok: outcome !== "failed",
-        outcome,
-        costUsd,
-        durationMs,
-        baseSha: base.sha,
-        resumed: false,
-        humanSummary: summary ? "summary-present" : "summary-missing",
-      });
+      if (!engineAttempt.finalFailureMetricRecorded) {
+        await recordMetric({
+          ticket: input.ticket.id,
+          runId,
+          stage: "plan",
+          engine: route.spec,
+          attempt: input.attempt,
+          ok: outcome !== "failed",
+          outcome,
+          costUsd: engineAttempt.finalCostUsd,
+          durationMs: engineAttempt.finalDurationMs,
+          baseSha: base.sha,
+          resumed: false,
+          humanSummary: summary ? "summary-present" : "summary-missing",
+          ...fallbackMetricFields(engineAttempt),
+        });
+      }
       await saveArtifact(
         input.ticket.id,
         runId,
@@ -374,6 +583,7 @@ async function runPlan(
           ...signatureMeta(signature),
           engine: route.spec,
           costUsd,
+          ...fallbackArtifactFields(engineAttempt),
         }) + report
       );
       return {
@@ -392,6 +602,7 @@ async function runPlan(
         files: verdict.files,
         domain: verdict.domain,
         baseSha: base.sha,
+        engineFallback: engineAttempt.fallback,
         changedFiles: [],
         scopeWarnings: [],
       };
@@ -404,8 +615,8 @@ async function runPlan(
       "plan",
       "plan",
       `plan-attempt-${input.attempt}.md`,
-      route,
-      signature,
+      primaryRoute,
+      primarySignature,
       startedAt,
       error
     );
@@ -431,23 +642,30 @@ async function runTriage(
   signal?: AbortSignal,
   runtime: FactoryJobRuntime = defaultRuntime
 ): Promise<FactoryJobOutput> {
-  const route = await runtime.route("triage", input.ticket);
-  const signature = buildSignature("triage", route);
+  const candidates = await jobRouteCandidates(runtime, "triage", input.ticket);
+  const primaryRoute = candidates[0];
+  const primarySignature = buildSignature("triage", primaryRoute);
   const startedAt = Date.now();
   try {
     return await withBaseCheckout(runtime, input.ticket, "triage", runId, signal, async (base) => {
-      const result = await route.engine.run({
-        role: "plan",
-        model: route.model,
-        effort: route.effort,
-        instructions: triageInstructions,
-        context: planContext(input),
-        workspace: base.dir,
-        budget: { minutes: JOB_BUDGET_MINUTES.triage },
-        signal,
-      });
-      const durationMs = Date.now() - startedAt;
-      const { costUsd, costSource } = effectiveCost(result, durationMs);
+      const engineAttempt = await runEngineWithFallback(
+        "triage",
+        candidates,
+        input.allowEngineFallback !== false,
+        { ticket: input.ticket.id, runId, metricStage: "triage", attempt: input.attempt, baseSha: base.sha },
+        (route) => route.engine.run({
+          role: "plan",
+          model: route.model,
+          effort: route.effort,
+          instructions: triageInstructions,
+          context: planContext(input),
+          workspace: base.dir,
+          budget: { minutes: JOB_BUDGET_MINUTES.triage },
+          signal,
+        })
+      );
+      const { result, route, signature } = engineAttempt;
+      const { costUsd, costSource, durationMs } = engineAttempt;
       const report = result.transcript ?? result.report;
       const verdict = parseTriageVerdict(report);
       const outcome = !result.ok || verdict.source === "missing"
@@ -455,18 +673,21 @@ async function runTriage(
         : verdict.questions
           ? "questions"
           : "success";
-      await recordMetric({
-        ticket: input.ticket.id,
-        runId,
-        stage: "triage",
-        engine: route.spec,
-        attempt: input.attempt,
-        ok: outcome !== "failed",
-        outcome,
-        costUsd,
-        durationMs,
-        baseSha: base.sha,
-      });
+      if (!engineAttempt.finalFailureMetricRecorded) {
+        await recordMetric({
+          ticket: input.ticket.id,
+          runId,
+          stage: "triage",
+          engine: route.spec,
+          attempt: input.attempt,
+          ok: outcome !== "failed",
+          outcome,
+          costUsd: engineAttempt.finalCostUsd,
+          durationMs: engineAttempt.finalDurationMs,
+          baseSha: base.sha,
+          ...fallbackMetricFields(engineAttempt),
+        });
+      }
       await saveArtifact(
         input.ticket.id,
         runId,
@@ -481,6 +702,7 @@ async function runTriage(
           ...signatureMeta(signature),
           engine: route.spec,
           costUsd,
+          ...fallbackArtifactFields(engineAttempt),
         }) + report
       );
       return {
@@ -499,6 +721,7 @@ async function runTriage(
         triageSummary: verdict.summary,
         domain: verdict.domain,
         baseSha: base.sha,
+        engineFallback: engineAttempt.fallback,
         files: [],
         changedFiles: [],
         scopeWarnings: [],
@@ -512,8 +735,8 @@ async function runTriage(
       "triage",
       "triage",
       `triage-attempt-${input.attempt}.md`,
-      route,
-      signature,
+      primaryRoute,
+      primarySignature,
       startedAt,
       error
     );
@@ -552,42 +775,52 @@ async function runResearch(
 ): Promise<FactoryJobOutput> {
   const role = input.researchRole;
   if (!role) throw new Error("Research wymaga researchRole (recon | solution-a | solution-b).");
-  const route = await runtime.route("research", input.ticket, role);
-  const signature = buildSignature("research", route);
+  const candidates = await jobRouteCandidates(runtime, "research", input.ticket, role);
+  const primaryRoute = candidates[0];
+  const primarySignature = buildSignature("research", primaryRoute);
   const startedAt = Date.now();
   const stage = `research-${role}` as const;
   const artifactName = `${stage}-attempt-${input.attempt}.md`;
   try {
     return await withBaseCheckout(runtime, input.ticket, stage, runId, signal, async (base) => {
-      const result = await route.engine.run({
-        role: "plan",
-        model: route.model,
-        effort: route.effort,
-        instructions: researchInstructions[role],
-        context: [
-          planContext(input),
-          input.triageSummary ? `# Klasyfikacja triage\n${input.triageSummary}` : "",
-        ].filter(Boolean).join("\n\n"),
-        workspace: base.dir,
-        budget: { minutes: JOB_BUDGET_MINUTES.research },
-        signal,
-      });
-      const durationMs = Date.now() - startedAt;
-      const { costUsd, costSource } = effectiveCost(result, durationMs);
+      const engineAttempt = await runEngineWithFallback(
+        "research",
+        candidates,
+        input.allowEngineFallback !== false,
+        { ticket: input.ticket.id, runId, metricStage: stage, attempt: input.attempt, baseSha: base.sha },
+        (route) => route.engine.run({
+          role: "plan",
+          model: route.model,
+          effort: route.effort,
+          instructions: researchInstructions[role],
+          context: [
+            planContext(input),
+            input.triageSummary ? `# Klasyfikacja triage\n${input.triageSummary}` : "",
+          ].filter(Boolean).join("\n\n"),
+          workspace: base.dir,
+          budget: { minutes: JOB_BUDGET_MINUTES.research },
+          signal,
+        })
+      );
+      const { result, route, signature } = engineAttempt;
+      const { costUsd, costSource, durationMs } = engineAttempt;
       const brief = (result.transcript ?? result.report).trim();
       const outcome = result.ok && brief ? "success" : "failed";
-      await recordMetric({
-        ticket: input.ticket.id,
-        runId,
-        stage,
-        engine: route.spec,
-        attempt: input.attempt,
-        ok: outcome === "success",
-        outcome,
-        costUsd,
-        durationMs,
-        baseSha: base.sha,
-      });
+      if (!engineAttempt.finalFailureMetricRecorded) {
+        await recordMetric({
+          ticket: input.ticket.id,
+          runId,
+          stage,
+          engine: route.spec,
+          attempt: input.attempt,
+          ok: outcome === "success",
+          outcome,
+          costUsd: engineAttempt.finalCostUsd,
+          durationMs: engineAttempt.finalDurationMs,
+          baseSha: base.sha,
+          ...fallbackMetricFields(engineAttempt),
+        });
+      }
       await saveArtifact(
         input.ticket.id,
         runId,
@@ -602,6 +835,7 @@ async function runResearch(
           ...signatureMeta(signature),
           engine: route.spec,
           costUsd,
+          ...fallbackArtifactFields(engineAttempt),
         }) + (brief || result.report)
       );
       return {
@@ -618,6 +852,7 @@ async function runResearch(
         researchRole: role,
         brief: outcome === "success" ? clip(brief, BRIEF_CLIP_CHARS) : undefined,
         baseSha: base.sha,
+        engineFallback: engineAttempt.fallback,
         files: [],
         changedFiles: [],
         scopeWarnings: [],
@@ -631,8 +866,8 @@ async function runResearch(
       "research",
       stage,
       artifactName,
-      route,
-      signature,
+      primaryRoute,
+      primarySignature,
       startedAt,
       error
     );
@@ -670,27 +905,34 @@ async function runSynthesis(
   signal?: AbortSignal,
   runtime: FactoryJobRuntime = defaultRuntime
 ): Promise<FactoryJobOutput> {
-  const route = await runtime.route("synthesis", input.ticket);
-  const signature = buildSignature("synthesis", route);
+  const candidates = await jobRouteCandidates(runtime, "synthesis", input.ticket);
+  const primaryRoute = candidates[0];
+  const primarySignature = buildSignature("synthesis", primaryRoute);
   const startedAt = Date.now();
   try {
     return await withBaseCheckout(runtime, input.ticket, "synthesis", runId, signal, async (base) => {
-      const result = await route.engine.run({
-        role: "plan",
-        model: route.model,
-        effort: route.effort,
-        instructions: synthesisInstructions,
-        context: [
-          planContext(input),
-          input.triageSummary ? `# Klasyfikacja triage\n${input.triageSummary}` : "",
-          briefsContext(input.briefs),
-        ].filter(Boolean).join("\n\n"),
-        workspace: base.dir,
-        budget: { minutes: JOB_BUDGET_MINUTES.synthesis },
-        signal,
-      });
-      const durationMs = Date.now() - startedAt;
-      const { costUsd, costSource } = effectiveCost(result, durationMs);
+      const engineAttempt = await runEngineWithFallback(
+        "synthesis",
+        candidates,
+        input.allowEngineFallback !== false,
+        { ticket: input.ticket.id, runId, metricStage: "synthesis", attempt: input.attempt, baseSha: base.sha },
+        (route) => route.engine.run({
+          role: "plan",
+          model: route.model,
+          effort: route.effort,
+          instructions: synthesisInstructions,
+          context: [
+            planContext(input),
+            input.triageSummary ? `# Klasyfikacja triage\n${input.triageSummary}` : "",
+            briefsContext(input.briefs),
+          ].filter(Boolean).join("\n\n"),
+          workspace: base.dir,
+          budget: { minutes: JOB_BUDGET_MINUTES.synthesis },
+          signal,
+        })
+      );
+      const { result, route, signature } = engineAttempt;
+      const { costUsd, costSource, durationMs } = engineAttempt;
       const report = result.transcript ?? result.report;
       const summary = humanSummaryOf(report);
       const verdict = parsePlanVerdict(report);
@@ -701,19 +943,22 @@ async function runSynthesis(
           : verdict.questions
             ? "questions"
             : "failed";
-      await recordMetric({
-        ticket: input.ticket.id,
-        runId,
-        stage: "synthesis",
-        engine: route.spec,
-        attempt: input.attempt,
-        ok: outcome !== "failed",
-        outcome,
-        costUsd,
-        durationMs,
-        baseSha: base.sha,
-        humanSummary: summary ? "summary-present" : "summary-missing",
-      });
+      if (!engineAttempt.finalFailureMetricRecorded) {
+        await recordMetric({
+          ticket: input.ticket.id,
+          runId,
+          stage: "synthesis",
+          engine: route.spec,
+          attempt: input.attempt,
+          ok: outcome !== "failed",
+          outcome,
+          costUsd: engineAttempt.finalCostUsd,
+          durationMs: engineAttempt.finalDurationMs,
+          baseSha: base.sha,
+          humanSummary: summary ? "summary-present" : "summary-missing",
+          ...fallbackMetricFields(engineAttempt),
+        });
+      }
       await saveArtifact(
         input.ticket.id,
         runId,
@@ -728,6 +973,7 @@ async function runSynthesis(
           ...signatureMeta(signature),
           engine: route.spec,
           costUsd,
+          ...fallbackArtifactFields(engineAttempt),
         }) + report
       );
       return {
@@ -746,6 +992,7 @@ async function runSynthesis(
         files: verdict.files,
         domain: verdict.domain,
         baseSha: base.sha,
+        engineFallback: engineAttempt.fallback,
         changedFiles: [],
         scopeWarnings: [],
       };
@@ -758,8 +1005,8 @@ async function runSynthesis(
       "synthesis",
       "synthesis",
       `synthesis-attempt-${input.attempt}.md`,
-      route,
-      signature,
+      primaryRoute,
+      primarySignature,
       startedAt,
       error
     );
@@ -787,9 +1034,9 @@ async function runCritique(
 ): Promise<FactoryJobOutput> {
   if (!input.plan) throw new Error("Krytyka wymaga planu z syntezy.");
   const startedAt = Date.now();
-  let route: Route;
+  let candidates: Route[];
   try {
-    route = await runtime.route("critique", input.ticket, undefined, {
+    candidates = await jobRouteCandidates(runtime, "critique", input.ticket, undefined, {
       excludeEngine: input.synthesisHarness,
     });
   } catch (error) {
@@ -824,43 +1071,53 @@ async function runCritique(
       scopeWarnings: [],
     };
   }
-  const signature = buildSignature("critique", route);
+  const primaryRoute = candidates[0];
+  const primarySignature = buildSignature("critique", primaryRoute);
   try {
     return await withBaseCheckout(runtime, input.ticket, "critique", runId, signal, async (base) => {
-      const result = await route.engine.run({
-        role: "plan",
-        model: route.model,
-        effort: route.effort,
-        instructions: critiqueInstructions,
-        context: [
-          `# Ticket ${input.ticket.id}: ${input.ticket.title}`,
-          input.ticket.description,
-          `# Plan do krytyki\n${input.plan}`,
-          input.planFiles.length ? `# Zadeklarowane files\n${input.planFiles.join("\n")}` : "",
-          input.briefs?.recon ? `# Brief RECON (do cross-checku files)\n${input.briefs.recon}` : "",
-        ].filter(Boolean).join("\n\n"),
-        workspace: base.dir,
-        budget: { minutes: JOB_BUDGET_MINUTES.critique },
-        signal,
-      });
-      const durationMs = Date.now() - startedAt;
-      const { costUsd, costSource } = effectiveCost(result, durationMs);
+      const engineAttempt = await runEngineWithFallback(
+        "critique",
+        candidates,
+        input.allowEngineFallback !== false,
+        { ticket: input.ticket.id, runId, metricStage: "critique", attempt: input.attempt, baseSha: base.sha },
+        (route) => route.engine.run({
+          role: "plan",
+          model: route.model,
+          effort: route.effort,
+          instructions: critiqueInstructions,
+          context: [
+            `# Ticket ${input.ticket.id}: ${input.ticket.title}`,
+            input.ticket.description,
+            `# Plan do krytyki\n${input.plan}`,
+            input.planFiles.length ? `# Zadeklarowane files\n${input.planFiles.join("\n")}` : "",
+            input.briefs?.recon ? `# Brief RECON (do cross-checku files)\n${input.briefs.recon}` : "",
+          ].filter(Boolean).join("\n\n"),
+          workspace: base.dir,
+          budget: { minutes: JOB_BUDGET_MINUTES.critique },
+          signal,
+        })
+      );
+      const { result, route, signature } = engineAttempt;
+      const { costUsd, costSource, durationMs } = engineAttempt;
       const report = result.transcript ?? result.report;
       const critiqueMeaning = critiqueMeaningOf(report);
       const verdict = parseCritiqueVerdict(report);
       const critiqueVerdict = !result.ok || verdict.source === "missing" ? "unavailable" : verdict.verdict;
-      await recordMetric({
-        ticket: input.ticket.id,
-        runId,
-        stage: "critique",
-        engine: route.spec,
-        attempt: input.attempt,
-        ok: critiqueVerdict !== "unavailable",
-        outcome: critiqueVerdict,
-        costUsd,
-        durationMs,
-        baseSha: base.sha,
-      });
+      if (!engineAttempt.finalFailureMetricRecorded) {
+        await recordMetric({
+          ticket: input.ticket.id,
+          runId,
+          stage: "critique",
+          engine: route.spec,
+          attempt: input.attempt,
+          ok: critiqueVerdict !== "unavailable",
+          outcome: critiqueVerdict,
+          costUsd: engineAttempt.finalCostUsd,
+          durationMs: engineAttempt.finalDurationMs,
+          baseSha: base.sha,
+          ...fallbackMetricFields(engineAttempt),
+        });
+      }
       await saveArtifact(
         input.ticket.id,
         runId,
@@ -875,6 +1132,7 @@ async function runCritique(
           ...signatureMeta(signature),
           engine: route.spec,
           costUsd,
+          ...fallbackArtifactFields(engineAttempt),
         }) + report
       );
       return {
@@ -894,6 +1152,7 @@ async function runCritique(
           : undefined,
         critiqueMeaning,
         baseSha: base.sha,
+        engineFallback: engineAttempt.fallback,
         files: [],
         changedFiles: [],
         scopeWarnings: [],
@@ -907,8 +1166,8 @@ async function runCritique(
       "critique",
       "critique",
       `critique-attempt-${input.attempt}.md`,
-      route,
-      signature,
+      primaryRoute,
+      primarySignature,
       startedAt,
       error
     );
@@ -924,8 +1183,9 @@ async function runBuild(
   if (!input.plan) throw new Error("Build wymaga zatwierdzonego planu.");
   const project = await runtime.project(input.ticket.project);
   const domain = input.planDomain ?? resolveDomain(input.ticket.labels, input.plan);
-  const route = await runtime.route("build", input.ticket, domain);
-  const signature = buildSignature("build", route);
+  const candidates = await jobRouteCandidates(runtime, "build", input.ticket, domain);
+  const primaryRoute = candidates[0];
+  const primarySignature = buildSignature("build", primaryRoute);
   const defaultBranch = project.default_branch ?? "main";
   const continueBranch = input.buildBase === "continue-branch";
   if (continueBranch && (!input.headSha || !input.branch)) {
@@ -936,7 +1196,7 @@ async function runBuild(
         "FIX_BASE_INVALID: /fix wymaga SHA i nazwy ostatnio opublikowanej gałęzi. " +
         "Zamknij PR i użyj /replan.",
       errorCode: "FIX_BASE_INVALID",
-      signature: signatureLine(signature),
+      signature: signatureLine(primarySignature),
       costUsd: 0,
       durationMs: 0,
       files: input.planFiles,
@@ -1000,7 +1260,7 @@ async function runBuild(
         `${message}\n\nBuilder nie został uruchomiony. ` +
         "Zamknij poprzedni PR i użyj /replan.",
       errorCode: "FIX_BASE_DIVERGED",
-      signature: signatureLine(signature),
+      signature: signatureLine(primarySignature),
       costUsd: 0,
       durationMs: Date.now() - workspaceStartedAt,
       files: input.planFiles,
@@ -1010,50 +1270,50 @@ async function runBuild(
       scopeWarnings: [],
     };
   }
-  const startedAt = Date.now();
   const feedback = input.feedback
     ? `\n\n# Raport zatrzymanego etapu do jawnej poprawki\n${input.feedback.slice(0, 16_000)}`
     : "";
-  const result = await route.engine.run({
-    role: "build",
-    model: route.model,
-    effort: route.effort,
-    instructions: [
-      "Zaimplementuj dokładnie zatwierdzony plan w bieżącym worktree.",
-      "Nie commituj i nie publikuj zmian; checkpoint tworzy fabryka.",
-      "Zwykły dodatkowy plik jest dozwolony, ale opisz go w raporcie.",
-      "Nie zapisuj sekretów, kluczy ani lokalnych plików .env.",
-      continueBranch
-        ? "Worktree zawiera już opublikowaną pracę tego PR-a — popraw ją w miejscu, nie odtwarzaj planu od zera."
-        : "",
-    ].filter(Boolean).join("\n"),
-    context: [
-      `# Ticket ${input.ticket.id}: ${input.ticket.title}`,
-      input.ticket.description,
-      `# Zatwierdzony plan\n${input.plan}`,
-      input.briefs?.recon
-        ? `# Brief RECON (mapa kodu z researchu — pliki, wzorce, testy okolicy)\n${clip(input.briefs.recon, 16_000)}`
-        : "",
-      feedback,
-    ].filter(Boolean).join("\n\n"),
-    workspace: workspace.dir,
-    budget: { minutes: JOB_BUDGET_MINUTES.build },
-    signal,
-  });
-  const durationMs = Date.now() - startedAt;
-  const { costUsd, costSource } = effectiveCost(result, durationMs);
+  const engineAttempt = await runEngineWithFallback(
+    "build",
+    candidates,
+    input.allowEngineFallback !== false,
+    { ticket: input.ticket.id, runId, metricStage: "build", attempt: input.attempt },
+    (route) => route.engine.run({
+      role: "build",
+      model: route.model,
+      effort: route.effort,
+      instructions: [
+        "Zaimplementuj dokładnie zatwierdzony plan w bieżącym worktree.",
+        "Nie commituj i nie publikuj zmian; checkpoint tworzy fabryka.",
+        "Zwykły dodatkowy plik jest dozwolony, ale opisz go w raporcie.",
+        "Nie zapisuj sekretów, kluczy ani lokalnych plików .env.",
+        continueBranch
+          ? "Worktree zawiera już opublikowaną pracę tego PR-a — popraw ją w miejscu, nie odtwarzaj planu od zera."
+          : "",
+      ].filter(Boolean).join("\n"),
+      context: [
+        `# Ticket ${input.ticket.id}: ${input.ticket.title}`,
+        input.ticket.description,
+        `# Zatwierdzony plan\n${input.plan}`,
+        input.briefs?.recon
+          ? `# Brief RECON (mapa kodu z researchu — pliki, wzorce, testy okolicy)\n${clip(input.briefs.recon, 16_000)}`
+          : "",
+        feedback,
+      ].filter(Boolean).join("\n\n"),
+      workspace: workspace.dir,
+      budget: { minutes: JOB_BUDGET_MINUTES.build },
+      signal,
+    }),
+    async () => {
+      // Padnięty builder mógł zostawić częściową pracę. Zapas zaczyna od
+      // czystego checkpointu; bez -x, żeby nie kasować node_modules/cache.
+      await execFileControlled("git", ["-C", workspace.dir, "reset", "--hard"], { signal });
+      await execFileControlled("git", ["-C", workspace.dir, "clean", "-fd"], { signal });
+    }
+  );
+  const { result, route, signature } = engineAttempt;
+  const { costUsd, costSource, durationMs } = engineAttempt;
   if (!result.ok) {
-    await recordMetric({
-      ticket: input.ticket.id,
-      runId,
-      stage: "build",
-      engine: route.spec,
-      attempt: input.attempt,
-      ok: false,
-      outcome: "engine-fail",
-      costUsd,
-      durationMs,
-    });
     await saveArtifact(
       input.ticket.id,
       runId,
@@ -1065,6 +1325,9 @@ async function runBuild(
         attempt: input.attempt,
         outcome: "engine-fail",
         ...signatureMeta(signature),
+        engine: route.spec,
+        costUsd,
+        ...fallbackArtifactFields(engineAttempt),
       }) + result.report
     );
     return {
@@ -1080,6 +1343,7 @@ async function runBuild(
       branch: workspace.branch,
       workspaceDir: workspace.dir,
       headSha: workspace.checkpointSha,
+      engineFallback: engineAttempt.fallback,
       changedFiles: [],
       scopeWarnings: [],
     };
@@ -1100,6 +1364,7 @@ async function runBuild(
       branch: workspace.branch,
       workspaceDir: workspace.dir,
       headSha: workspace.checkpointSha,
+      engineFallback: engineAttempt.fallback,
       changedFiles: [],
       scopeWarnings: [],
     };
@@ -1120,6 +1385,7 @@ async function runBuild(
       branch: workspace.branch,
       workspaceDir: workspace.dir,
       headSha: workspace.checkpointSha,
+      engineFallback: engineAttempt.fallback,
       changedFiles,
       scopeWarnings: audit.warnings,
     };
@@ -1153,8 +1419,9 @@ async function runBuild(
     attempt: input.attempt,
     ok: true,
     outcome: "committed",
-    costUsd,
-    durationMs,
+    costUsd: engineAttempt.finalCostUsd,
+    durationMs: engineAttempt.finalDurationMs,
+    ...fallbackMetricFields(engineAttempt),
   });
   await saveArtifact(
     input.ticket.id,
@@ -1168,6 +1435,9 @@ async function runBuild(
       attempt: input.attempt,
       outcome: "committed",
       ...signatureMeta(signature),
+      engine: route.spec,
+      costUsd,
+      ...fallbackArtifactFields(engineAttempt),
       warnings: audit.warnings.length,
     }) + result.report
   );
@@ -1183,6 +1453,7 @@ async function runBuild(
     branch: workspace.branch,
     workspaceDir: workspace.dir,
     headSha,
+    engineFallback: engineAttempt.fallback,
     changedFiles,
     scopeWarnings: audit.warnings,
   };
@@ -1196,41 +1467,45 @@ async function runReview(
 ): Promise<FactoryJobOutput> {
   if (!input.headSha) throw new Error("Review wymaga dokładnego PR head SHA.");
   const project = await runtime.project(input.ticket.project);
-  const route = await runtime.route("review", input.ticket, input.planDomain, {
+  const candidates = await jobRouteCandidates(runtime, "review", input.ticket, input.planDomain, {
     excludeEngine: input.buildHarness,
   });
-  const signature = buildSignature("review", route);
   const checkout = await createCheckout(project.repo, input.headSha, `${input.ticket.id}-review-${runId}`);
-  const startedAt = Date.now();
   try {
     const manifest = await changeManifest(checkout.dir, project.default_branch ?? "main");
-    const result = await route.engine.run({
-      role: "review",
-      model: route.model,
-      effort: route.effort,
-      instructions: [
-        "Wykonaj advisory code review dokładnego SHA. Nie zmieniaj plików.",
-        "Zwróć konkretne uwagi z priorytetem. Ten job nigdy nie uruchamia buildera.",
-        verdictInstruction("review"),
-      ].join("\n"),
-      context: [
-        `# Ticket ${input.ticket.id}: ${input.ticket.title}`,
-        `# SHA\n${input.headSha}`,
-        `# Zatwierdzony plan\n${input.plan ?? "(brak)"}`,
-        input.briefs?.["solution-b"]
-          ? `# Brief ryzyk z researchu (edge case'y, strategia testów)\n${clip(input.briefs["solution-b"], 8_000)}`
-          : "",
-        input.critique
-          ? `# Uwagi krytyka planu (advisory — sprawdź, czy zaadresowane)\n${clip(input.critique, CRITIQUE_CLIP_CHARS)}`
-          : "",
-        `# Zmiany\n${manifest.nameStatus}\n\n${manifest.diffStat}`,
-      ].filter(Boolean).join("\n\n"),
-      workspace: checkout.dir,
-      budget: { minutes: JOB_BUDGET_MINUTES.review },
-      signal,
-    });
-    const durationMs = Date.now() - startedAt;
-    const { costUsd, costSource } = effectiveCost(result, durationMs);
+    const engineAttempt = await runEngineWithFallback(
+      "review",
+      candidates,
+      input.allowEngineFallback !== false,
+      { ticket: input.ticket.id, runId, metricStage: "review", attempt: input.attempt, baseSha: input.headSha },
+      (route) => route.engine.run({
+        role: "review",
+        model: route.model,
+        effort: route.effort,
+        instructions: [
+          "Wykonaj advisory code review dokładnego SHA. Nie zmieniaj plików.",
+          "Zwróć konkretne uwagi z priorytetem. Ten job nigdy nie uruchamia buildera.",
+          verdictInstruction("review"),
+        ].join("\n"),
+        context: [
+          `# Ticket ${input.ticket.id}: ${input.ticket.title}`,
+          `# SHA\n${input.headSha}`,
+          `# Zatwierdzony plan\n${input.plan ?? "(brak)"}`,
+          input.briefs?.["solution-b"]
+            ? `# Brief ryzyk z researchu (edge case'y, strategia testów)\n${clip(input.briefs["solution-b"], 8_000)}`
+            : "",
+          input.critique
+            ? `# Uwagi krytyka planu (advisory — sprawdź, czy zaadresowane)\n${clip(input.critique, CRITIQUE_CLIP_CHARS)}`
+            : "",
+          `# Zmiany\n${manifest.nameStatus}\n\n${manifest.diffStat}`,
+        ].filter(Boolean).join("\n\n"),
+        workspace: checkout.dir,
+        budget: { minutes: JOB_BUDGET_MINUTES.review },
+        signal,
+      })
+    );
+    const { result, route, signature } = engineAttempt;
+    const { costUsd, costSource, durationMs } = engineAttempt;
     const report = result.transcript ?? result.report;
     const verdict = parseReviewVerdict(report);
     const reviewVerdict = !result.ok || verdict.source === "missing"
@@ -1238,18 +1513,21 @@ async function runReview(
       : verdict.needsFix
         ? "advisory-fix"
         : "lgtm";
-    await recordMetric({
-      ticket: input.ticket.id,
-      runId,
-      stage: "review",
-      engine: route.spec,
-      attempt: input.attempt,
-      ok: reviewVerdict !== "unavailable",
-      outcome: reviewVerdict,
-      costUsd,
-      durationMs,
-      baseSha: input.headSha,
-    });
+    if (!engineAttempt.finalFailureMetricRecorded) {
+      await recordMetric({
+        ticket: input.ticket.id,
+        runId,
+        stage: "review",
+        engine: route.spec,
+        attempt: input.attempt,
+        ok: reviewVerdict !== "unavailable",
+        outcome: reviewVerdict,
+        costUsd: engineAttempt.finalCostUsd,
+        durationMs: engineAttempt.finalDurationMs,
+        baseSha: input.headSha,
+        ...fallbackMetricFields(engineAttempt),
+      });
+    }
     await saveArtifact(
       input.ticket.id,
       runId,
@@ -1261,13 +1539,18 @@ async function runReview(
         step: "review",
         outcome: reviewVerdict,
         ...signatureMeta(signature),
+        engine: route.spec,
+        costUsd,
+        ...fallbackArtifactFields(engineAttempt),
       }) + report
     );
     return {
       kind: "review",
       outcome: reviewVerdict === "unavailable" ? "failed" : "success",
       report,
-      errorCode: reviewVerdict === "unavailable" ? "REVIEW_VERDICT_MISSING" : undefined,
+      errorCode: reviewVerdict === "unavailable"
+        ? result.ok ? "REVIEW_VERDICT_MISSING" : "REVIEW_ENGINE_FAILED"
+        : undefined,
       signature: signatureLine(signature),
       costUsd,
       costSource,
@@ -1275,6 +1558,7 @@ async function runReview(
       files: input.planFiles,
       headSha: input.headSha,
       baseSha: input.headSha,
+      engineFallback: engineAttempt.fallback,
       changedFiles: [],
       scopeWarnings: [],
       reviewVerdict,

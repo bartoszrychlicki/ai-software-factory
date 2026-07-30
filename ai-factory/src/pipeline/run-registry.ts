@@ -1,6 +1,7 @@
 import { readFileSync, writeFileSync, renameSync, openSync, fsyncSync, closeSync, existsSync, readdirSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { findUpFile } from "./projects";
+import { isInfraFailureMessage } from "./failure-classes";
 
 /**
  * Rejestr runów: TRWAŁY stan fabryki per ticket.
@@ -394,7 +395,8 @@ export function markDecisionStep(
  * - plan-gate: bramka planu (ticket zrobiony / pytania) — tanie i pożądane,
  *   nie nabija serii bezpiecznika i NIE unieważnia zatwierdzonego planu,
  * - verify: merytoryczna porażka po próbach — plan wymaga przemyślenia,
- * - budget / infra: nic nie mówi o jakości planu — reuse jak najbardziej,
+ * - budget / infra: nic nie mówi o jakości planu — reuse jak najbardziej;
+ *   wzorce infrastruktury współdzieli z bramką fallbacku silnika,
  * - rejected: decyzja człowieka.
  */
 export type FailureReason =
@@ -411,6 +413,9 @@ export function classifyFailure(message: string): FailureReason {
   if (/budżet ticketu wyczerpany/i.test(message)) return "budget";
   if (/plan bez werdyktu ok|nie oddał bloku|niejasności blokujące|Pytania do autora|JUŻ ISTNIEJE|już istnieje/i.test(message)) return "plan-gate";
   if (/BLOCKED po \d+\/\d+ próbach|konflikt semantyczny|konflikt z /i.test(message)) return "verify";
+  if (isInfraFailureMessage(message)) return "infra";
+  // Legacy finalizacja runu zachowuje dotychczasowy domyślny powód "infra".
+  // Bramka wydatku na fallback jest ostrzejsza: nieznany tekst = "work".
   return "infra";
 }
 

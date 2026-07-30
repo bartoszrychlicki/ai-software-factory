@@ -87,8 +87,25 @@ br-budget:
 # routing.local.yaml
 projects:
   br-budget:
-    verify: claude-code/claude-opus-5@high
+    verify:
+      - claude-code/claude-opus-5@high   # primary
+      - codex/gpt-5.6-sol@high           # one infrastructure-only fallback
 ```
+
+Each routing value may be a scalar (the existing behavior, with no fallback)
+or a YAML list containing a primary and one backup specification. The backup
+runs only when the primary adapter returns a recognized infrastructure failure
+such as a process start error, timeout, network/authentication error, exhausted
+quota, or provider outage. A negative work result (`BLOCKED`, missing verdict,
+review comments, empty research) never switches models. Unknown error messages
+also fail closed without a second charge.
+
+There is at most one switch per stage attempt, and the poller disables it when
+the ticket budget lacks headroom. Both engine attempts count toward ticket
+usage. A switch is visible in `runs/metrics.jsonl` (`engineFallback` and
+`fallbackReason`), in the stage artifact and actual-model signature, and as a
+⚠️ degradation at the Linear gate (or an immediate Linear comment for build
+and review).
 
 Commit substantive changes shared by all hosts to the base files; `.local` is
 only for per-machine differences. Tests read the committed YAML files through a
@@ -161,6 +178,8 @@ this input hash.
 - `src/pipeline/preflight.ts` — read-only dependency checks before claim;
 - `src/pipeline/process-control.ts` — AbortSignal and TERM/KILL for the process
   group;
+- `src/pipeline/failure-classes.ts` — fail-closed allowlist separating engine
+  infrastructure failures from negative work results;
 - `src/pipeline/legacy-migration.ts` — read-only import of an approved plan,
   checkpoint, and explicitly linked PR from the v1 registry;
 - `src/pipeline/scope.ts` — warnings for ordinary deviations and blocking of
@@ -173,8 +192,10 @@ for reading/migration tests, but they are not connected to the runtime.
 
 ## Guarantees
 
-- Build creates one checkpoint. A missing CLI final response, timeout, or login
-  error stops the stage without automatically starting a second builder.
+- Build creates one checkpoint. A configured backup may run once after a known
+  infrastructure failure; before a backup builder starts, its worktree is reset
+  to the original checkpoint. Negative or unknown results never bypass the
+  primary model.
 - Tests and E2E run without AI on a fresh checkout of the exact SHA, in a
   separate detached process (`test-runner.ts`), so they do not block the poller
   loop and survive its restart.
@@ -201,7 +222,8 @@ for reading/migration tests, but they are not connected to the runtime.
   reviewer's comment exists before the PR leaves draft.
 - `Done` for a code ticket requires the merge of the exact tracked PR. A smoke
   FAIL blocks an already merged ticket without automatic rollback.
-- The budget is shared by all short jobs for the ticket; cost is counted even
+- The budget is shared by all short jobs for the ticket; both primary and
+  fallback attempts count, and cost is counted even
   for engines without a report (a Codex token estimate or a time-based estimate
   — `cost_source` in stage_attempts).
 - The circuit breaker (a series of failures / hourly cost) pauses claims for new
