@@ -72,10 +72,12 @@ prawdy nawet po ręcznym przestawieniu Lineara.
 | `build` | ticketowy worktree od świeżego `origin/<default>` lub opublikowanej gałęzi w trybie `/fix` | bez zmian w BAR-196 |
 
 Operacje `worktree add/remove/prune` są serializowane per repozytorium, ale
-same joby pracują równolegle w rozłącznych katalogach. Planowanie nigdy nie
-wykonuje `checkout`, `reset` ani `stash` we współdzielonym repo człowieka i nie
-widzi jego niezacommitowanych zmian. Nieudany fetch ma jedną próbę ponowienia,
-a potem kończy job kodem `*_BASE_UNAVAILABLE` zamiast używać starego refa.
+sama krótka faza przygotowania checkoutów startuje przez to sekwencyjnie; po
+jej zakończeniu joby pracują równolegle w rozłącznych katalogach. Planowanie
+nigdy nie wykonuje `checkout`, `reset` ani `stash` we współdzielonym repo
+człowieka i nie widzi jego niezacommitowanych zmian. Nieudany fetch ma jedną
+próbę ponowienia, a potem kończy job kodem `*_BASE_UNAVAILABLE` zamiast używać
+starego refa.
 
 ## Recovery
 

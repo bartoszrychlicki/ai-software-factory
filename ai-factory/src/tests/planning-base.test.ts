@@ -9,6 +9,7 @@ import {
   readdirSync,
   realpathSync,
   rmSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -266,6 +267,36 @@ test("seria jobów nie zostawia katalogów ani rejestracji worktree", async () =
   });
 });
 
+test("nowy job sprząta osierocony checkout bazowy starszy niż sześć godzin", async () => {
+  await withFixture(async ({ repo, worktreesRoot, freshSha }) => {
+    const staleDir = join(
+      worktreesRoot,
+      basename(repo),
+      "BAR-OLD-plan-orphaned-run"
+    );
+    execFileSync(
+      "git",
+      ["-C", repo, "worktree", "add", "--detach", staleDir, freshSha]
+    );
+    const staleAt = new Date(Date.now() - 7 * 60 * 60 * 1_000);
+    utimesSync(staleDir, staleAt, staleAt);
+
+    const output = await executeFactoryJobInput(
+      { kind: "plan", attempt: 1, ticket: ticket(), planFiles: [] },
+      "cleanup-stale",
+      undefined,
+      runtimeFor(repo)
+    );
+
+    assert.equal(output.outcome, "success");
+    assert.equal(existsSync(staleDir), false);
+    const registered = git(repo, "worktree", "list", "--porcelain")
+      .split("\n")
+      .filter((line) => line.startsWith("worktree "));
+    assert.deepEqual(registered, [`worktree ${realpathSync(repo)}`]);
+  });
+});
+
 test("fetch niemożliwy zatrzymuje planowanie bez dotykania lokalnego repo", async () => {
   await withFixture(async ({ factoryRoot, remote, repo }) => {
     const beforeHead = git(repo, "rev-parse", "HEAD");
@@ -297,6 +328,31 @@ test("fetch niemożliwy zatrzymuje planowanie bez dotykania lokalnego repo", asy
     assert.equal(git(repo, "rev-parse", "HEAD"), beforeHead);
     assert.equal(readFileSync(join(repo, "observed.txt"), "utf8"), beforeContent);
     assert.equal(git(repo, "status", "--porcelain=v1", "--untracked-files=all"), beforeStatus);
+  });
+});
+
+test("anulowanie podczas retry fetchu nie jest raportowane jako BASE_UNAVAILABLE", async () => {
+  await withFixture(async ({ remote, repo }) => {
+    rmSync(remote, { recursive: true, force: true });
+    const controller = new AbortController();
+    const abort = setTimeout(() => controller.abort(), 100);
+    try {
+      await assert.rejects(
+        executeFactoryJobInput(
+          { kind: "plan", attempt: 1, ticket: ticket(), planFiles: [] },
+          "plan-aborted-fetch",
+          controller.signal,
+          runtimeFor(repo)
+        ),
+        (error: unknown) => {
+          assert.doesNotMatch(String(error), /BASE_UNAVAILABLE/);
+          assert.equal(controller.signal.aborted, true);
+          return true;
+        }
+      );
+    } finally {
+      clearTimeout(abort);
+    }
   });
 });
 

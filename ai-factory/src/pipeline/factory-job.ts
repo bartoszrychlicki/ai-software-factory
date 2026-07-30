@@ -214,6 +214,15 @@ async function withBaseCheckout<T>(
       signal
     );
   } catch (error) {
+    const terminationReason = (error as { terminationReason?: unknown } | null)
+      ?.terminationReason;
+    if (
+      signal?.aborted ||
+      terminationReason === "abort" ||
+      (error instanceof Error && error.name === "AbortError")
+    ) {
+      throw error;
+    }
     throw new BaseCheckoutUnavailableError(error);
   }
 

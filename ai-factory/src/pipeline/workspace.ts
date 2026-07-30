@@ -1,14 +1,17 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { homedir } from "node:os";
-import { join, basename } from "node:path";
-import { rm } from "node:fs/promises";
+import { join, basename, resolve } from "node:path";
+import { readdir, rm, stat } from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
 import { execFileControlled } from "./process-control";
 
 const exec = promisify(execFile);
-const BASE_FETCH_TIMEOUT_MS = 60_000;
+const GIT_NETWORK_TIMEOUT_MS = 60_000;
 const BASE_FETCH_RETRY_DELAY_MS = 2_000;
+const STALE_BASE_CHECKOUT_AGE_MS = 6 * 60 * 60 * 1_000;
+const BASE_CHECKOUT_NAME_PATTERN =
+  /-(?:plan|triage|research-(?:recon|solution-a|solution-b)|synthesis|critique)-/;
 
 const repoLocks = new Map<string, Promise<void>>();
 
@@ -17,22 +20,56 @@ const repoLocks = new Map<string, Promise<void>>();
  * Sam job działa już poza blokadą, we własnym katalogu.
  */
 async function withRepoLock<T>(repoPath: string, fn: () => Promise<T>): Promise<T> {
-  const previous = repoLocks.get(repoPath) ?? Promise.resolve();
+  const lockKey = resolve(repoPath);
+  const previous = repoLocks.get(lockKey) ?? Promise.resolve();
   let release!: () => void;
   const gate = new Promise<void>((resolve) => {
     release = resolve;
   });
   const tail = previous.then(() => gate);
-  repoLocks.set(repoPath, tail);
+  repoLocks.set(lockKey, tail);
 
   await previous;
   try {
     return await fn();
   } finally {
     release();
-    if (repoLocks.get(repoPath) === tail) {
-      repoLocks.delete(repoPath);
+    if (repoLocks.get(lockKey) === tail) {
+      repoLocks.delete(lockKey);
     }
+  }
+}
+
+function gitNetwork(
+  repoPath: string,
+  args: readonly string[],
+  signal?: AbortSignal
+): Promise<{ stdout: string; stderr: string }> {
+  return execFileControlled("git", ["-C", repoPath, ...args], {
+    env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+    signal,
+    timeoutMs: GIT_NETWORK_TIMEOUT_MS,
+  });
+}
+
+async function cleanupStaleBaseCheckouts(repoPath: string): Promise<void> {
+  const repoWorktreesDir = join(worktreesRoot(), basename(repoPath));
+  const entries = await readdir(repoWorktreesDir, { withFileTypes: true }).catch(() => []);
+  let removedAny = false;
+
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !BASE_CHECKOUT_NAME_PATTERN.test(entry.name)) continue;
+    const dir = join(repoWorktreesDir, entry.name);
+    const info = await stat(dir).catch(() => undefined);
+    if (!info || Date.now() - info.mtimeMs < STALE_BASE_CHECKOUT_AGE_MS) continue;
+
+    await exec("git", ["-C", repoPath, "worktree", "remove", "--force", dir]).catch(() => {});
+    await rm(dir, { recursive: true, force: true });
+    removedAny = true;
+  }
+
+  if (removedAny) {
+    await exec("git", ["-C", repoPath, "worktree", "prune"]).catch(() => {});
   }
 }
 
@@ -108,14 +145,14 @@ async function createWorkspaceUnlocked(
         "FIX_BASE_INVALID: /fix wymaga opublikowanego SHA poprzedniego checkpointu."
       );
     }
-    await exec("git", ["-C", repoPath, "fetch", "origin", branch]).catch(() => {
+    await gitNetwork(repoPath, ["fetch", "origin", branch]).catch(() => {
       throw new Error(
         `FIX_BASE_MISSING: zdalna gałąź ${branch} nie istnieje; zamknij PR i użyj /replan.`
       );
     });
-    const remoteTip = await exec(
-      "git",
-      ["-C", repoPath, "ls-remote", "--heads", "origin", branch]
+    const remoteTip = await gitNetwork(
+      repoPath,
+      ["ls-remote", "--heads", "origin", branch]
     ).then(({ stdout }) => stdout.trim().split(/\s+/)[0] || undefined);
     if (!remoteTip) {
       throw new Error(
@@ -156,7 +193,7 @@ async function createWorkspaceUnlocked(
 
   // BAZA zawsze = świeży origin/<default>. Checkpoint jest zmianą kandydata,
   // nie bazą: nakładamy go na aktualny main i odrzucamy przy konflikcie.
-  await exec("git", ["-C", repoPath, "fetch", "origin", defaultBranch]).catch(() => {});
+  await gitNetwork(repoPath, ["fetch", "origin", defaultBranch]).catch(() => {});
   const base = await exec("git", ["-C", repoPath, "rev-parse", "--verify", `origin/${defaultBranch}`])
     .then(() => `origin/${defaultBranch}`)
     .catch(() => defaultBranch);
@@ -225,27 +262,27 @@ export async function createBaseCheckout(
   signal?: AbortSignal
 ): Promise<{ dir: string; sha: string }> {
   return withRepoLock(repoPath, async () => {
+    await cleanupStaleBaseCheckouts(repoPath);
     let fetchError: unknown;
     for (let attempt = 1; attempt <= 2; attempt += 1) {
       try {
-        await execFileControlled(
-          "git",
-          ["-C", repoPath, "fetch", "origin", defaultBranch],
-          {
-            env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
-            signal,
-            timeoutMs: BASE_FETCH_TIMEOUT_MS,
-          }
-        );
+        await gitNetwork(repoPath, ["fetch", "origin", defaultBranch], signal);
         fetchError = undefined;
         break;
       } catch (error) {
-        fetchError = error;
-        if (attempt < 2 && !signal?.aborted) {
-          await delay(BASE_FETCH_RETRY_DELAY_MS, undefined, { signal });
+        const terminationReason = (error as { terminationReason?: unknown } | null)
+          ?.terminationReason;
+        if (signal?.aborted || terminationReason === "abort") {
+          signal?.throwIfAborted();
+          throw error;
         }
+        fetchError = error;
+      }
+      if (attempt < 2) {
+        await delay(BASE_FETCH_RETRY_DELAY_MS, undefined, { signal });
       }
     }
+    signal?.throwIfAborted();
     if (fetchError) {
       const detail = fetchError instanceof Error ? fetchError.message : String(fetchError);
       const stderr = (fetchError as { stderr?: unknown } | null)?.stderr;
