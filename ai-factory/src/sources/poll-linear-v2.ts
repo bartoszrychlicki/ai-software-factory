@@ -79,6 +79,7 @@ const POLL_INTERVAL_MS = Number(process.env.FACTORY_POLL_INTERVAL_MS ?? 60_000);
 const marker = (ticketId: string) => `[linear:${ticketId}:v2]`;
 const reportedPreflight = new Map<string, string>();
 const reportedWarnings = new Map<string, string>();
+const rejectedBareCommands = new Set<string>();
 
 export interface TestRunnerSpawn extends TestRunnerInput {
   resultPath: string;
@@ -1222,6 +1223,8 @@ async function processCommands(deps: PollerDependencies, run: LifecycleRun): Pro
       if (isCommandAttempt(comment.body)) enqueueUnknownCommandHint(deps, run, comment);
       continue;
     }
+    const bareRejectionKey = `${run.ticketId}:g${run.generation}:${comment.id}`;
+    if (parsed.form === "bare" && rejectedBareCommands.has(bareRejectionKey)) continue;
     if (parsed.kind === "score") {
       await recordScore(deps, run, source, comment.id, parsed.payload);
       continue;
@@ -1278,13 +1281,17 @@ async function processCommands(deps: PollerDependencies, run: LifecycleRun): Pro
       }
       if (event.type === "replan") {
         event.nextAttempts = followUpAttempts(deps.store, run.ticketId);
-        await cancelActiveJobs(deps, run.ticketId);
       }
-      applyDecision(deps, run.ticketId, reduceLifecycle(run, event));
+      const decision = reduceLifecycle(run, event);
+      if (event.type === "replan") await cancelActiveJobs(deps, run.ticketId);
+      applyDecision(deps, run.ticketId, decision);
       deps.store.markCommentProcessed(run.ticketId, comment.id, parsed.kind);
       return;
     } catch (error) {
-      if (parsed.form === "bare") continue;
+      if (parsed.form === "bare") {
+        rejectedBareCommands.add(bareRejectionKey);
+        continue;
+      }
       await source.comment(
         run.ticketId,
         `ℹ️ Komenda \`${comment.body.split(/\s+/)[0]}\` jest teraz niedozwolona: ${error instanceof Error ? error.message : error}\n\n${marker(run.ticketId)}`
@@ -1469,7 +1476,13 @@ async function claimReady(deps: PollerDependencies): Promise<void> {
         continue;
       }
       const comments = await source.listComments(ticket.id);
-      const snapshot = buildCommentContextSnapshot(ticket.id, ticket.title, ticket.description, comments);
+      const snapshot = buildCommentContextSnapshot(
+        ticket.id,
+        ticket.title,
+        ticket.description,
+        comments,
+        { executedCommandIds: deps.store.processedCommandIds(ticket.id) }
+      );
       const run = deps.store.createRun(ticket.id, projectKey, {
         title: ticket.title,
         description: ticket.description,

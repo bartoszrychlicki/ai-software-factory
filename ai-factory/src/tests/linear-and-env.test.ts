@@ -34,13 +34,18 @@ test("adapter silnika nie dziedziczy sekretów aplikacji", () => {
 
 test("bramka ops przyjmuje ruch do Weryfikacji i ścisłą komendę /done", () => {
   assert.equal(decisionOfState(LINEAR_STATE_MAP, "ops-checklist", "🧪 Weryfikacja"), "done");
-  assert.deepEqual(parseCommand("/done"), { kind: "done", payload: undefined });
+  assert.deepEqual(parseCommand("/done"), {
+    kind: "done",
+    payload: undefined,
+    form: "slash",
+  });
 });
 
 test("operator może wydać wyłącznie ścisłą komendę /restart", () => {
   assert.deepEqual(parseCommand("/restart utracony run"), {
     kind: "restart",
     payload: "utracony run",
+    form: "slash",
   });
   assert.equal(parseCommand("proszę /restart"), undefined);
   assert.equal(parseCommand("/restartuj"), undefined);

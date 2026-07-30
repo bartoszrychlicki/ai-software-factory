@@ -118,7 +118,7 @@ decyzją workflow.
 - `retry` albo `/retry` — ponawia wyłącznie zatrzymany etap;
 - `replan <powód>` albo `/replan <powód>` — unieważnia plan i tworzy nową
   generację;
-- `restart` albo `/restart` — tymczasowy alias `replan`;
+- `restart <powód>` albo `/restart [powód]` — tymczasowy alias `replan`;
 - `done` albo `/done` — potwierdza ręczne wykonanie zatwierdzonej checklisty
   ops;
 - `score 1-5 [komentarz]` albo `/score 1-5 [komentarz]` — ocena jakości wyniku
@@ -130,6 +130,8 @@ ważne dla bieżącej bramki: approval, otwartych pytań, checklisty ops, blokad
 albo aktywnego runu; `score` działa przy runie aktywnym lub Done. W innym
 kontekście komentarz pozostaje zwykłą treścią autora i nie dostaje hintu.
 Nie ma fuzzy matchingu ani tolerancji literówek.
+Goły `restart` wymaga powodu; `/restart` bez powodu pozostaje dozwolony dla
+zgodności z dotychczasowym sterowaniem.
 
 Gołe komendy omijają konflikt z edytorem Lineara, w którym wpisanie `/` otwiera
 modal formatowania (incydent BAR-183 #2).

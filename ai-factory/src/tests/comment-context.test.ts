@@ -109,3 +109,30 @@ test("zwykły komentarz i ścieżka pliku pozostają treścią planistyczną", (
   assert.equal(ordinary.comments[0]?.body, "Dodaj też test regresji");
   assert.equal(filePath.comments[0]?.body, "/src/x.ts wymaga poprawki");
 });
+
+test("wykonane gołe komendy są wycinane po ID, a payload answer zostaje treścią", () => {
+  const comments = [
+    {
+      id: "comment-approve",
+      body: "approve",
+      createdAt: "2026-07-30T08:00:00.000Z",
+    },
+    {
+      id: "comment-answer",
+      body: "answer 1A, 2B",
+      createdAt: "2026-07-30T08:01:00.000Z",
+    },
+  ];
+
+  assert.deepEqual(
+    extractRelevantComments(
+      comments,
+      "BAR-185",
+      new Set(["comment-approve", "comment-answer"])
+    ),
+    [{
+      body: "1A, 2B",
+      createdAt: "2026-07-30T08:01:00.000Z",
+    }]
+  );
+});

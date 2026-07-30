@@ -506,8 +506,16 @@ test("rezerwacja budżetu: job w toku blokuje start kolejnego przy limicie (fan-
 });
 
 test("komendy /score: ścisła walidacja i parsowanie payloadu", () => {
-  assert.deepEqual(parseCommand("/score 4 solidny plan"), { kind: "score", payload: "4 solidny plan" });
-  assert.deepEqual(parseCommand("/score 5"), { kind: "score", payload: "5" });
+  assert.deepEqual(parseCommand("/score 4 solidny plan"), {
+    kind: "score",
+    payload: "4 solidny plan",
+    form: "slash",
+  });
+  assert.deepEqual(parseCommand("/score 5"), {
+    kind: "score",
+    payload: "5",
+    form: "slash",
+  });
   assert.equal(parseCommand("/score"), undefined);
   assert.equal(parseCommand("/score 9"), undefined);
   assert.equal(parseCommand("/score świetne"), undefined);

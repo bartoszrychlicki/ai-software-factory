@@ -67,9 +67,22 @@ test("isCommandAttempt odróżnia ścisły token komendy od treści i ścieżek"
   assert.equal(isCommandAttempt("/anwser cokolwiek"), true);
   assert.equal(isCommandAttempt("  /approve tak"), true);
   assert.equal(isCommandAttempt("/score 9"), true);
+  assert.equal(isCommandAttempt("/`approve`"), true);
   assert.equal(isCommandAttempt("/src/x.ts wymaga poprawki"), false);
   assert.equal(isCommandAttempt("Sprawdź /answer w dokumentacji"), false);
   assert.equal(isCommandAttempt("https://example.test/path"), false);
+});
+
+test("hint dla autoformatu Lineara używa bezpiecznego code spanu bez trzech backticków", () => {
+  const hint = unknownCommandHint({
+    firstToken: "/`approve`",
+    stage: "approval",
+    status: "waiting_human",
+  });
+
+  assert.match(hint, /`` \/`approve` ``/);
+  assert.doesNotMatch(hint, /```/);
+  assert.match(hint, /`approve`.*`\/approve`/);
 });
 
 test("krótka sygnatura joba AI ma format nagłówka pierwszej linii", () => {

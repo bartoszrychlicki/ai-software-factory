@@ -63,13 +63,11 @@ function finalize(
   const [, ...rest] = trimmed.split(/\s+/);
   const payload = rest.join(" ").trim() || trimmed.slice(first.length).trim();
   if (["reject", "answer", "replan"].includes(kind) && !payload) return undefined;
+  if (kind === "restart" && form === "bare" && !payload) return undefined;
   if (["approve", "retry", "done"].includes(kind) && payload) return undefined;
   // score wymaga oceny 1-5 jako pierwszego tokenu payloadu; reszta = komentarz.
   if (kind === "score" && !/^[1-5](\s|$)/.test(payload)) return undefined;
-  const parsed = { kind, payload: payload || undefined } as ParsedCommand;
-  // Zachowujemy dotychczasowy enumerowalny kształt wyniku dla konsumentów v1.
-  Object.defineProperty(parsed, "form", { value: form, enumerable: false });
-  return parsed;
+  return { kind, payload: payload || undefined, form };
 }
 
 /**
@@ -151,7 +149,7 @@ export function isCommandAttempt(body: string): boolean {
 export function unknownCommandHint(input: UnknownCommandContext): string {
   const [firstToken = input.firstToken.trim()] = input.firstToken.trim().split(/\s+/);
   const formattedToken = firstToken.includes("`")
-    ? `\`\`${firstToken}\`\``
+    ? `\`\` ${firstToken} \`\``
     : `\`${firstToken}\``;
   const prefix = `ℹ️ Nieznana komenda ${formattedToken}.`;
 
@@ -202,10 +200,10 @@ export function hintFor(
   states: { approve?: string; answer?: string; done?: string }
 ): string {
   if (gate === "plan-approval") {
-    return "ℹ️ To nie jest decyzja. Zatwierdź komendą `approve` (albo `/approve`) lub odrzuć: `reject <powód>` (albo `/reject <powód>`).";
+    return "ℹ️ To nie jest decyzja. Zatwierdź wyłącznie komendą `/approve` albo odrzuć: `/reject <powód>`.";
   }
   if (gate === "ops-checklist") {
-    return "ℹ️ To nie jest potwierdzenie wykonania checklisty — użyj `done` (albo `/done`).";
+    return "ℹ️ To nie jest potwierdzenie wykonania checklisty — użyj wyłącznie komendy `/done`.";
   }
-  return "ℹ️ Odpowiedzi są wejściem dopiero po komendzie `answer <odpowiedzi>` (albo `/answer <odpowiedzi>`).";
+  return "ℹ️ Odpowiedzi są wejściem dopiero po ścisłej komendzie `/answer <odpowiedzi>`.";
 }

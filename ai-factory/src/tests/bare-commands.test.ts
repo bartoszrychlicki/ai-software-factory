@@ -1,10 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   LifecycleStore,
+  type AttemptStage,
   type LifecycleRun,
   type LifecycleStage,
   type LifecycleStatus,
@@ -20,6 +21,7 @@ import {
 } from "../sources/commands";
 import type { LinearComment, LinearSource } from "../sources/linear";
 import {
+  pollOnce,
   reconcileRun,
   sweepScores,
   type PollerDependencies,
@@ -135,12 +137,27 @@ test("parseCommand obsługuje obie ścisłe formy bez zmiany domyślnej semantyk
   assert.equal(parseCommand("reject", approval), undefined);
   assert.equal(parseCommand("retry teraz", active), undefined);
   assert.equal(parseCommand("replan", active), undefined);
-  assert.equal(parseCommand("restart", active)?.kind, "restart");
+  assert.equal(parseCommand("restart", active), undefined);
   assert.equal(parseCommand("restart stary klient", active)?.payload, "stary klient");
+  assert.equal(parseCommand("/restart")?.kind, "restart");
   assert.equal(parseCommand("score 9", active), undefined);
   assert.equal(parseCommand("score tego podejścia jest niski", active), undefined);
   assert.equal(parseCommand("score 4 solidny", active)?.payload, "4 solidny");
   assert.equal(parseCommand("done deal, róbmy tak", ALL_COMMAND_KINDS), undefined);
+});
+
+test("form jest zwykłym enumerowalnym polem i przeżywa kopiowanie oraz serializację", () => {
+  const parsed = parseCommand("approve", new Set(["approve"]));
+  assert.ok(parsed);
+  assert.deepEqual(parsed, {
+    kind: "approve",
+    payload: undefined,
+    form: "bare",
+  });
+  assert.equal(Object.keys(parsed ?? {}).includes("form"), true);
+  assert.equal(({ ...parsed }).form, "bare");
+  assert.equal(JSON.parse(JSON.stringify(parsed)).form, "bare");
+  assert.equal(structuredClone(parsed).form, "bare");
 });
 
 test("bareCommandsFor odzwierciedla guardy approval, pytań, ops, blokady i aktywnego runu", () => {
@@ -217,6 +234,151 @@ test("approve bez ukośnika przechodzi pełną ścieżkę processCommands i nie 
     }
   } finally {
     store.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("reopen liczy claim i detectInputChange z tego samego zbioru wykonanych komend", async () => {
+  const root = await mkdtemp(join(tmpdir(), "factory-bare-reopen-"));
+  const bin = join(root, "bin");
+  const store = new LifecycleStore(join(root, "registry.db"));
+  const previousRoot = process.env.FACTORY_ROOT;
+  const previousPath = process.env.PATH;
+  const ticketId = "BAR-REOPEN";
+  const comments: LinearComment[] = [{
+    id: "comment-approve-reopen",
+    body: "approve",
+    createdAt: "2026-07-30T10:00:00.000Z",
+  }];
+  let ready = false;
+  try {
+    const gitRoot = join(process.cwd(), "..");
+    await mkdir(bin);
+    await writeFile(join(root, "package.json"), "{}");
+    await writeFile(join(root, "projects.yaml"), [
+      "harness:",
+      `  repo: ${JSON.stringify(gitRoot)}`,
+      "  checks:",
+      "    - \"true\"",
+    ].join("\n"));
+    await writeFile(join(root, "routing.yaml"), [
+      "defaults:",
+      "  plan: codex",
+      "  build: codex",
+      "  review: codex",
+    ].join("\n"));
+    for (const executable of ["codex", "gh"]) {
+      const path = join(bin, executable);
+      await writeFile(path, [
+        "#!/bin/sh",
+        `if [ "$1" = "--version" ]; then echo "${executable} 1.0.0"; fi`,
+        "exit 0",
+      ].join("\n"));
+      await chmod(path, 0o755);
+    }
+    process.env.FACTORY_ROOT = root;
+    process.env.PATH = `${bin}:${previousPath ?? ""}`;
+
+    const source = {
+      async listComments() {
+        return comments;
+      },
+      async getTicket() {
+        return {
+          id: ticketId,
+          source: "linear",
+          ...ticket,
+          stateName: "In Progress",
+          url: `https://linear.test/${ticketId}`,
+        };
+      },
+      async getStateName() {
+        return "In Progress";
+      },
+      async listStateNames() {
+        return ["Todo", "In Progress", "In Review", "Done", "Canceled", "👤 ⛔ Zablokowany"];
+      },
+      async listReady() {
+        return ready
+          ? [{
+            id: ticketId,
+            source: "linear",
+            ...ticket,
+            stateName: "Todo",
+            url: `https://linear.test/${ticketId}`,
+          }]
+          : [];
+      },
+      async claim() {
+        ready = false;
+      },
+      async setStateByName() {},
+      async comment() {},
+    } as unknown as LinearSource;
+    const deps: PollerDependencies = {
+      store,
+      mastra: {
+        async serverUp() {
+          return true;
+        },
+        async getRun() {
+          return { status: "running" };
+        },
+        async createRun(runId?: string) {
+          return runId ?? "run";
+        },
+        async startRun() {},
+        async cancelRun() {},
+      } as unknown as PollerDependencies["mastra"],
+      sources: new Map([["harness", source]]),
+      notifier: async () => {},
+    };
+
+    const run = createRunAt(
+      store,
+      ticketId,
+      "harness",
+      "approval",
+      "waiting_human",
+      { plan: "plan", planFiles: ["src/a.ts"], planDomain: "backend" }
+    );
+    await reconcileRun(deps, run);
+    assert.equal(store.isCommentProcessed("comment-approve-reopen"), true);
+
+    store.transition(ticketId, {
+      stage: "smoke",
+      status: "done",
+      actor: "test",
+      reason: "fixture-done",
+      patch: { smokeStatus: "pass" },
+    });
+    for (const command of store.outstandingCommands(100)) {
+      store.markCommand(command.key, "done");
+    }
+
+    ready = true;
+    await pollOnce(deps);
+
+    const claimed = store.getRun(ticketId)!;
+    const reconciledSnapshot = buildCommentContextSnapshot(
+      ticketId,
+      ticket.title,
+      ticket.description,
+      comments,
+      { executedCommandIds: store.processedCommandIds(ticketId) }
+    );
+    assert.equal(claimed.generation, 2);
+    assert.equal(claimed.manifest.inputHash, reconciledSnapshot.effectiveInputHash);
+
+    await reconcileRun(deps, claimed);
+    assert.equal(store.getRun(ticketId)?.generation, 2);
+    assert.equal(store.getRun(ticketId)?.errorCode, undefined);
+  } finally {
+    store.close();
+    if (previousRoot === undefined) delete process.env.FACTORY_ROOT;
+    else process.env.FACTORY_ROOT = previousRoot;
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
     await rm(root, { recursive: true, force: true });
   }
 });
@@ -309,6 +471,100 @@ test("answer jest komendą tylko podczas otwartej rundy pytań", async () => {
     assert.equal(store.isCommentProcessed("comment-answer-closed"), false);
     assert.notEqual(treatedAsContent.manifest.inputHash, initialHash);
     assert.match(treatedAsContent.manifest.commentContext ?? "", /answer 1A, 2B/);
+  } finally {
+    store.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("odrzucona goła komenda pozostaje treścią i nie powtarza efektów w kolejnych cyklach", async () => {
+  const root = await mkdtemp(join(tmpdir(), "factory-bare-rejected-"));
+  const store = new LifecycleStore(join(root, "registry.db"));
+  const ticketId = "BAR-REJECTED-BARE";
+  const comments: LinearComment[] = [{
+    id: "comment-retry-rejected",
+    body: "retry",
+    createdAt: "2026-07-30T10:00:00.000Z",
+  }];
+  let nextAttemptCalls = 0;
+  let getTicketCalls = 0;
+  let commentCalls = 0;
+  let cancelCalls = 0;
+  const originalNextAttempt = store.nextAttempt.bind(store);
+  store.nextAttempt = (id: string, stage: AttemptStage) => {
+    nextAttemptCalls += 1;
+    return originalNextAttempt(id, stage);
+  };
+  try {
+    const inputHash = buildCommentContextSnapshot(
+      ticketId,
+      ticket.title,
+      ticket.description,
+      comments
+    ).effectiveInputHash;
+    store.createRun(ticketId, "harness", { ...ticket, inputHash });
+    store.transition(ticketId, {
+      stage: "approval",
+      status: "blocked",
+      actor: "test",
+      reason: "rejected-plan",
+      patch: {
+        plan: "plan",
+        planFiles: ["src/a.ts"],
+        blockedStage: "approval",
+        errorCode: "PLAN_REJECTED",
+      },
+    });
+    const source = {
+      async listComments() {
+        return comments;
+      },
+      async getTicket() {
+        getTicketCalls += 1;
+        return {
+          id: ticketId,
+          source: "linear",
+          ...ticket,
+          stateName: "In Progress",
+          url: `https://linear.test/${ticketId}`,
+        };
+      },
+      async getStateName() {
+        return "In Progress";
+      },
+      async comment() {
+        commentCalls += 1;
+      },
+    } as unknown as LinearSource;
+    const deps: PollerDependencies = {
+      store,
+      mastra: {
+        async cancelRun() {
+          cancelCalls += 1;
+        },
+      } as unknown as PollerDependencies["mastra"],
+      sources: new Map([["harness", source]]),
+      notifier: async () => {},
+    };
+
+    await reconcileRun(deps, store.getRun(ticketId)!);
+    const nextAttemptCallsAfterFirstCycle = nextAttemptCalls;
+    await reconcileRun(deps, store.getRun(ticketId)!);
+
+    assert.equal(store.isCommentProcessed("comment-retry-rejected"), false);
+    assert.deepEqual(
+      [store.getRun(ticketId)?.generation, store.getRun(ticketId)?.status],
+      [1, "blocked"]
+    );
+    assert.equal(commentCalls, 0);
+    assert.equal(cancelCalls, 0);
+    assert.ok(nextAttemptCallsAfterFirstCycle > 0);
+    assert.equal(
+      nextAttemptCalls,
+      nextAttemptCallsAfterFirstCycle,
+      "drugi cykl ma pominąć odrzuconą komendę przed budową eventu"
+    );
+    assert.equal(getTicketCalls, 2, "pozostaje wyłącznie zwykły odczyt detectInputChange per cykl");
   } finally {
     store.close();
     await rm(root, { recursive: true, force: true });

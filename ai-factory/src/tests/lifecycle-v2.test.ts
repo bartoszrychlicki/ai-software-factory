@@ -574,18 +574,28 @@ test("komentarze wynikające z joba zachowują podpis jego faktycznej roli", () 
 });
 
 test("ścisłe komendy odrzucają brak wymaganej treści i nadmiarowe argumenty", () => {
-  assert.deepEqual(parseCommand("/approve"), { kind: "approve", payload: undefined });
+  assert.deepEqual(parseCommand("/approve"), {
+    kind: "approve",
+    payload: undefined,
+    form: "slash",
+  });
   assert.equal(parseCommand("/approve proszę"), undefined);
   assert.deepEqual(parseCommand("/reject plan jest zbyt szeroki"), {
     kind: "reject",
     payload: "plan jest zbyt szeroki",
+    form: "slash",
   });
   assert.equal(parseCommand("/reject"), undefined);
   assert.equal(parseCommand("/retry teraz"), undefined);
-  assert.deepEqual(parseCommand("/restart"), { kind: "restart", payload: undefined });
+  assert.deepEqual(parseCommand("/restart"), {
+    kind: "restart",
+    payload: undefined,
+    form: "slash",
+  });
   assert.deepEqual(parseCommand("/restart stary klient"), {
     kind: "restart",
     payload: "stary klient",
+    form: "slash",
   });
   assert.equal(parseCommand("/replan"), undefined);
 });

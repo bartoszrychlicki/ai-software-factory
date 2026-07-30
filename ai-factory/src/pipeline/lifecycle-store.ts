@@ -840,6 +840,10 @@ export class LifecycleStore {
     ).get(commentId);
   }
 
+  /**
+   * Wykonane komendy są trwałe per ticket również po reopenie runu. Claim
+   * i późniejszy reconcile muszą wycinać z inputu dokładnie te same komentarze.
+   */
   processedCommandIds(ticketId: string): Set<string> {
     const rows = this.db.prepare(`
       SELECT comment_id FROM lifecycle_processed_comments
