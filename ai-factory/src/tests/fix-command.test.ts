@@ -126,6 +126,8 @@ test("/fix przechodzi pełną ścieżkę na tym samym planie, branchu i PR oraz 
       command.kind === "run-job" && command.payload.kind === "build"
     )!;
     assert.equal(buildCommand.payload.headSha, oldSha);
+    assert.equal(buildCommand.payload.buildBase, "continue-branch");
+    assert.equal(buildCommand.payload.branch, branch);
     assert.match(String(buildCommand.payload.feedback), /claimReady pomija executedCommandIds/);
     assert.match(String(buildCommand.payload.feedback), /Zachowaj istniejący kontrakt/);
 
@@ -199,6 +201,8 @@ test("/fix przechodzi pełną ścieżkę na tym samym planie, branchu i PR oraz 
       [run.stage, run.status, run.headSha, run.testedSha, run.reviewStatus],
       ["test", "pending", externalSha, undefined, "pending"]
     );
+    assert.equal(run.testedSha, undefined);
+    assert.equal(run.reviewStatus, "pending");
     assert.equal(
       store.getCommand(reviewCommand.key)?.lastError,
       "canceled-by-replan"
@@ -278,6 +282,11 @@ test("drugi /fix przechodzi, trzeci odsyła do /replan, a nowa generacja resetuj
     commentId: "comment-fix-2",
   });
   assert.equal(second.transition.patch?.fixRound, 2);
+  const secondBuild = second.commands.find((command) =>
+    command.kind === "run-job" && command.payload.kind === "build"
+  );
+  assert.equal(secondBuild?.payload.buildBase, "continue-branch");
+  assert.equal(secondBuild?.payload.branch, "agent/BAR-FIX-UNIT");
 
   assert.throws(
     () => reduceLifecycle(mergeGateRun({ fixRound: 2 }), {

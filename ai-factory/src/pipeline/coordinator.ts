@@ -581,6 +581,8 @@ export function reduceLifecycle(run: LifecycleRun, event: CoordinatorEvent): Coo
   }
 
   if (event.type === "fix") {
+    // /fix kontynuuje opublikowaną gałąź: cherry-pick na świeży main przepisałby
+    // SHA i został poprawnie odrzucony przez BRANCH_DIVERGED (BAR-199).
     if (run.mergedSha) {
       throw new Error("PR jest już zmergowany — praca jest w main; /fix nic nie poprawi.");
     }
@@ -646,7 +648,12 @@ export function reduceLifecycle(run: LifecycleRun, event: CoordinatorEvent): Coo
           "build",
           "build",
           event.nextAttempt ?? 1,
-          { feedback, headSha: run.headSha },
+          {
+            feedback,
+            headSha: run.headSha,
+            buildBase: "continue-branch",
+            branch: run.branch,
+          },
           `:fix:${event.commentId}`
         ),
         {

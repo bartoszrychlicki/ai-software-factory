@@ -52,6 +52,10 @@ export const factoryJobInputSchema = z.object({
   planDomain: z.string().optional(),
   feedback: z.string().optional(),
   headSha: z.string().optional(),
+  /** Baza buildera: świeży main z cherry-pickiem albo opublikowana gałąź (/fix). */
+  buildBase: z.enum(["fresh-main", "continue-branch"]).default("fresh-main").optional(),
+  /** Dokładna nazwa opublikowanej gałęzi — wymagana dla continue-branch. */
+  branch: z.string().optional(),
   /** Harness buildera tego ticketu — review wyklucza go w routingu (dywersyfikacja). */
   buildHarness: z.string().optional(),
   /** Rola joba research (wymagana dla kind=research). */
@@ -690,6 +694,23 @@ async function runBuild(
   const route = await runtime.route("build", input.ticket, domain);
   const signature = buildSignature("build", route);
   const defaultBranch = project.default_branch ?? "main";
+  const continueBranch = input.buildBase === "continue-branch";
+  if (continueBranch && (!input.headSha || !input.branch)) {
+    return {
+      kind: "build",
+      outcome: "failed",
+      report:
+        "FIX_BASE_INVALID: /fix wymaga SHA i nazwy ostatnio opublikowanej gałęzi. " +
+        "Zamknij PR i użyj /replan.",
+      errorCode: "FIX_BASE_INVALID",
+      signature: signatureLine(signature),
+      costUsd: 0,
+      durationMs: 0,
+      files: input.planFiles,
+      changedFiles: [],
+      scopeWarnings: [],
+    };
+  }
   let checkpointRef: string | undefined;
   if (input.headSha) {
     const verified = await execFileControlled(
@@ -723,13 +744,39 @@ async function runBuild(
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "")
     .slice(0, 30);
-  const workspace = await createWorkspace(
-    project.repo,
-    input.ticket.id,
-    slug,
-    defaultBranch,
-    checkpointRef
-  );
+  const workspaceStartedAt = Date.now();
+  let workspace: Awaited<ReturnType<typeof createWorkspace>>;
+  try {
+    workspace = await createWorkspace(
+      project.repo,
+      input.ticket.id,
+      slug,
+      defaultBranch,
+      checkpointRef,
+      continueBranch
+        ? { mode: "continue-branch", branch: input.branch }
+        : {}
+    );
+  } catch (error) {
+    if (!continueBranch) throw error;
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      kind: "build",
+      outcome: "failed",
+      report:
+        `${message}\n\nBuilder nie został uruchomiony. ` +
+        "Zamknij poprzedni PR i użyj /replan.",
+      errorCode: "FIX_BASE_DIVERGED",
+      signature: signatureLine(signature),
+      costUsd: 0,
+      durationMs: Date.now() - workspaceStartedAt,
+      files: input.planFiles,
+      branch: input.branch,
+      headSha: input.headSha,
+      changedFiles: [],
+      scopeWarnings: [],
+    };
+  }
   const startedAt = Date.now();
   const feedback = input.feedback
     ? `\n\n# Raport zatrzymanego etapu do jawnej poprawki\n${input.feedback.slice(0, 16_000)}`
@@ -743,7 +790,10 @@ async function runBuild(
       "Nie commituj i nie publikuj zmian; checkpoint tworzy fabryka.",
       "Zwykły dodatkowy plik jest dozwolony, ale opisz go w raporcie.",
       "Nie zapisuj sekretów, kluczy ani lokalnych plików .env.",
-    ].join("\n"),
+      continueBranch
+        ? "Worktree zawiera już opublikowaną pracę tego PR-a — popraw ją w miejscu, nie odtwarzaj planu od zera."
+        : "",
+    ].filter(Boolean).join("\n"),
     context: [
       `# Ticket ${input.ticket.id}: ${input.ticket.title}`,
       input.ticket.description,
