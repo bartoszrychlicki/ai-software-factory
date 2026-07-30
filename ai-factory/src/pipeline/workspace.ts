@@ -3,8 +3,12 @@ import { promisify } from "node:util";
 import { homedir } from "node:os";
 import { join, basename } from "node:path";
 import { rm } from "node:fs/promises";
+import { setTimeout as delay } from "node:timers/promises";
+import { execFileControlled } from "./process-control";
 
 const exec = promisify(execFile);
+const BASE_FETCH_TIMEOUT_MS = 60_000;
+const BASE_FETCH_RETRY_DELAY_MS = 2_000;
 
 const repoLocks = new Map<string, Promise<void>>();
 
@@ -217,31 +221,53 @@ export async function removeWorkspace(ws: Workspace): Promise<void> {
 export async function createBaseCheckout(
   repoPath: string,
   defaultBranch: string,
-  name: string
+  name: string,
+  signal?: AbortSignal
 ): Promise<{ dir: string; sha: string }> {
   return withRepoLock(repoPath, async () => {
     let fetchError: unknown;
     for (let attempt = 1; attempt <= 2; attempt += 1) {
       try {
-        await exec("git", ["-C", repoPath, "fetch", "origin", defaultBranch]);
+        await execFileControlled(
+          "git",
+          ["-C", repoPath, "fetch", "origin", defaultBranch],
+          {
+            env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+            signal,
+            timeoutMs: BASE_FETCH_TIMEOUT_MS,
+          }
+        );
         fetchError = undefined;
         break;
       } catch (error) {
         fetchError = error;
+        if (attempt < 2 && !signal?.aborted) {
+          await delay(BASE_FETCH_RETRY_DELAY_MS, undefined, { signal });
+        }
       }
     }
     if (fetchError) {
+      const detail = fetchError instanceof Error ? fetchError.message : String(fetchError);
+      const stderr = (fetchError as { stderr?: unknown } | null)?.stderr;
+      const stderrDetail = typeof stderr === "string" && stderr.trim()
+        ? `\nstderr: ${stderr.trim()}`
+        : "";
       throw new Error(
-        `BASE_UNAVAILABLE: nie udało się pobrać origin/${defaultBranch} po 2 próbach.`
+        `BASE_UNAVAILABLE: nie udało się pobrać origin/${defaultBranch} po 2 próbach. ` +
+          `Przyczyna: ${detail}${stderrDetail}`,
+        { cause: fetchError }
       );
     }
 
     const sha = await exec(
       "git",
       ["-C", repoPath, "rev-parse", "--verify", `origin/${defaultBranch}^{commit}`]
-    ).then(({ stdout }) => stdout.trim()).catch(() => {
+    ).then(({ stdout }) => stdout.trim()).catch((error) => {
+      const detail = error instanceof Error ? error.message : String(error);
       throw new Error(
-        `BASE_UNAVAILABLE: brak poprawnego refa origin/${defaultBranch} po udanym fetchu.`
+        `BASE_UNAVAILABLE: brak poprawnego refa origin/${defaultBranch} po udanym fetchu. ` +
+          `Przyczyna: ${detail}`,
+        { cause: error }
       );
     });
     const dir = join(worktreesRoot(), basename(repoPath), name);
@@ -277,5 +303,6 @@ export async function removeCheckout(repoPath: string, dir: string): Promise<voi
   await withRepoLock(repoPath, async () => {
     await exec("git", ["-C", repoPath, "worktree", "remove", "--force", dir]).catch(() => {});
     await rm(dir, { recursive: true, force: true }).catch(() => {});
+    await exec("git", ["-C", repoPath, "worktree", "prune"]).catch(() => {});
   });
 }

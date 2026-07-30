@@ -267,7 +267,7 @@ test("seria jobów nie zostawia katalogów ani rejestracji worktree", async () =
 });
 
 test("fetch niemożliwy zatrzymuje planowanie bez dotykania lokalnego repo", async () => {
-  await withFixture(async ({ remote, repo }) => {
+  await withFixture(async ({ factoryRoot, remote, repo }) => {
     const beforeHead = git(repo, "rev-parse", "HEAD");
     const beforeContent = readFileSync(join(repo, "observed.txt"), "utf8");
     const beforeStatus = git(repo, "status", "--porcelain=v1", "--untracked-files=all");
@@ -286,10 +286,35 @@ test("fetch niemożliwy zatrzymuje planowanie bez dotykania lokalnego repo", asy
     assert.equal(output.outcome, "failed");
     assert.equal(output.errorCode, "PLAN_BASE_UNAVAILABLE");
     assert.match(output.report, /BASE_UNAVAILABLE/);
+    assert.match(output.report, /does not appear to be a git repository|repository .* does not exist/);
+    const artifact = readFileSync(
+      join(factoryRoot, "runs", "BAR-196-TEST", "plan-no-origin", "plan-attempt-1.md"),
+      "utf8"
+    );
+    assert.match(artifact, /does not appear to be a git repository|repository .* does not exist/);
     assert.equal(output.costUsd, 0);
     assert.equal(engineRuns, 0);
     assert.equal(git(repo, "rev-parse", "HEAD"), beforeHead);
     assert.equal(readFileSync(join(repo, "observed.txt"), "utf8"), beforeContent);
     assert.equal(git(repo, "status", "--porcelain=v1", "--untracked-files=all"), beforeStatus);
+  });
+});
+
+test("błąd konfiguracji projektu nie jest maskowany jako niedostępność bazy", async () => {
+  await withFixture(async ({ repo }) => {
+    const runtime = runtimeFor(repo);
+    runtime.project = async () => {
+      throw new Error("PROJECT_CONFIG_INVALID: brak konfiguracji repo");
+    };
+
+    await assert.rejects(
+      executeFactoryJobInput(
+        { kind: "plan", attempt: 1, ticket: ticket(), planFiles: [] },
+        "plan-invalid-project",
+        undefined,
+        runtime
+      ),
+      /PROJECT_CONFIG_INVALID: brak konfiguracji repo/
+    );
   });
 });

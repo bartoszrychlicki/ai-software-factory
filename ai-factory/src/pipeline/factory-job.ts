@@ -181,10 +181,16 @@ type ReadOnlyMetricStage =
 class BaseCheckoutUnavailableError extends Error {
   constructor(error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
+    const stderr = (error as { stderr?: unknown } | null)?.stderr;
+    const detail = typeof stderr === "string" && stderr.trim() && !message.includes(stderr.trim())
+      ? `${message}\nstderr: ${stderr.trim()}`
+      : message;
     super(
-      message.startsWith("BASE_UNAVAILABLE:")
-        ? message
-        : "BASE_UNAVAILABLE: nie udało się przygotować świeżego checkoutu bazy."
+      detail.startsWith("BASE_UNAVAILABLE:")
+        ? detail
+        : `BASE_UNAVAILABLE: nie udało się przygotować świeżego checkoutu bazy. ` +
+          `Przyczyna: ${detail}`,
+      { cause: error }
     );
     this.name = "BaseCheckoutUnavailableError";
   }
@@ -195,16 +201,17 @@ async function withBaseCheckout<T>(
   ticket: FactoryJobInput["ticket"],
   kind: string,
   runId: string,
+  signal: AbortSignal | undefined,
   fn: (base: { dir: string; sha: string }) => Promise<T>
 ): Promise<T> {
-  let project: ProjectConfig;
+  const project = await runtime.project(ticket.project);
   let base: { dir: string; sha: string };
   try {
-    project = await runtime.project(ticket.project);
     base = await createBaseCheckout(
       project.repo,
       project.default_branch ?? "main",
-      `${ticket.id}-${kind}-${runId}`
+      `${ticket.id}-${kind}-${runId}`,
+      signal
     );
   } catch (error) {
     throw new BaseCheckoutUnavailableError(error);
@@ -306,7 +313,7 @@ async function runPlan(
   const signature = buildSignature("plan", route);
   const startedAt = Date.now();
   try {
-    return await withBaseCheckout(runtime, input.ticket, "plan", runId, async (base) => {
+    return await withBaseCheckout(runtime, input.ticket, "plan", runId, signal, async (base) => {
       const result = await route.engine.run({
         role: "plan",
         model: route.model,
@@ -419,7 +426,7 @@ async function runTriage(
   const signature = buildSignature("triage", route);
   const startedAt = Date.now();
   try {
-    return await withBaseCheckout(runtime, input.ticket, "triage", runId, async (base) => {
+    return await withBaseCheckout(runtime, input.ticket, "triage", runId, signal, async (base) => {
       const result = await route.engine.run({
         role: "plan",
         model: route.model,
@@ -542,7 +549,7 @@ async function runResearch(
   const stage = `research-${role}` as const;
   const artifactName = `${stage}-attempt-${input.attempt}.md`;
   try {
-    return await withBaseCheckout(runtime, input.ticket, stage, runId, async (base) => {
+    return await withBaseCheckout(runtime, input.ticket, stage, runId, signal, async (base) => {
       const result = await route.engine.run({
         role: "plan",
         model: route.model,
@@ -658,7 +665,7 @@ async function runSynthesis(
   const signature = buildSignature("synthesis", route);
   const startedAt = Date.now();
   try {
-    return await withBaseCheckout(runtime, input.ticket, "synthesis", runId, async (base) => {
+    return await withBaseCheckout(runtime, input.ticket, "synthesis", runId, signal, async (base) => {
       const result = await route.engine.run({
         role: "plan",
         model: route.model,
@@ -810,7 +817,7 @@ async function runCritique(
   }
   const signature = buildSignature("critique", route);
   try {
-    return await withBaseCheckout(runtime, input.ticket, "critique", runId, async (base) => {
+    return await withBaseCheckout(runtime, input.ticket, "critique", runId, signal, async (base) => {
       const result = await route.engine.run({
         role: "plan",
         model: route.model,
