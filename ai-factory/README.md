@@ -121,6 +121,14 @@ decyzją workflow.
 - `/score 1-5 [komentarz]` — ocena jakości wyniku do danych eksperymentu
   (działa także po Done, do 14 dni).
 
+Parser toleruje autoformat nazwy komendy przez edytor Lineara: otaczające
+backticki oraz znaczniki `*`, `_`, `~` i końcowa interpunkcja są zdejmowane,
+więc np. `` /`approve` ``, `/*approve*` i `/approve.` działają jak `/approve`.
+Ukośnik pozostaje wymagany, zwykła treść bez ukośnika nigdy nie jest komendą,
+a payload po tokenie komendy jest przekazywany bez zmian. Praktyczna
+wskazówka: `Escape` zamyka menu komend Lineara, które może wprowadzić ten
+autoformat.
+
 Labele `plan:solo` / `plan:deep` wymuszają ścieżkę planowania w projektach v3.
 
 Komentarz autora przed buildem zmienia input hash i wymusza nowy plan. Podczas
