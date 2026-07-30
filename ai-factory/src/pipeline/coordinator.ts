@@ -1140,7 +1140,8 @@ export function reduceLifecycle(run: LifecycleRun, event: CoordinatorEvent): Coo
           critiqueRound: 1,
           critiqueVerdict: verdict,
           critiqueReport: issues,
-          critiqueMeaning: event.output.critiqueMeaning ?? run.critiqueMeaning,
+          // Ta sama zasada co na bramce: zdanie idzie w parze ze swoimi uwagami.
+          critiqueMeaning: event.output.critiqueMeaning,
           feedback: issues,
         };
         const nextRun: LifecycleRun = { ...run, ...revisionPatch };
@@ -1168,7 +1169,12 @@ export function reduceLifecycle(run: LifecycleRun, event: CoordinatorEvent): Coo
       const gatePatch = {
         critiqueVerdict: verdict,
         critiqueReport: issues ?? run.critiqueReport,
-        critiqueMeaning: event.output.critiqueMeaning ?? run.critiqueMeaning,
+        // BEZ dziedziczenia z poprzedniej rundy: zdanie krytyka opisuje DOKŁADNIE
+        // te uwagi, które są renderowane obok niego. Odziedziczone zdanie z rundy 1
+        // stanęłoby nad uwagami rundy 2 i człowiek dostałby na bramce opis
+        // niepasujący do treści pod nim — odwrotnie do celu tej funkcji.
+        // Brak zdania = nie renderujemy go wcale (fail-open bez wprowadzania w błąd).
+        critiqueMeaning: event.output.critiqueMeaning,
         degradations,
       };
       return {

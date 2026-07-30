@@ -400,3 +400,42 @@ test("sekcje po ludzku nie zmieniają ścisłych kontraktów planu i krytyki", (
     "missing"
   );
 });
+
+test("zdanie krytyka z rundy 1 NIE przechodzi na uwagi rundy 2", () => {
+  // Regresja: dziedziczenie `?? run.critiqueMeaning` stawiało zdanie opisujące
+  // uwagi rundy 1 nad świeżymi uwagami rundy 2 — bramka mówiłaby człowiekowi
+  // co innego, niż jest pod spodem.
+  const run = runAt("critique", {
+    critiqueRound: 1,
+    critiqueMeaning: "Zdanie z rundy 1: plan pomija migrację danych.",
+    critiqueReport: "1. P1: brak migracji.",
+  });
+  const decision = reduceLifecycle(run, {
+    type: "job-finished",
+    attempt: 2,
+    output: critiqueOutput({
+      critiqueMeaning: undefined,
+      critiqueIssues: "1. P2: literówka w nazwie kolumny.",
+    }),
+  });
+  const body = String(decision.commands[0].payload.body);
+
+  assert.equal(decision.transition.patch?.critiqueMeaning, undefined);
+  assert.doesNotMatch(body, /rundy 1/);
+  assert.match(body, /literówka w nazwie kolumny/);
+});
+
+test("świeże zdanie krytyka rundy 2 zastępuje poprzednie", () => {
+  const run = runAt("critique", {
+    critiqueRound: 1,
+    critiqueMeaning: "Zdanie z rundy 1.",
+  });
+  const decision = reduceLifecycle(run, {
+    type: "job-finished",
+    attempt: 2,
+    output: critiqueOutput({ critiqueMeaning: "Zdanie z rundy 2." }),
+  });
+
+  assert.equal(decision.transition.patch?.critiqueMeaning, "Zdanie z rundy 2.");
+  assert.doesNotMatch(String(decision.commands[0].payload.body), /rundy 1/);
+});

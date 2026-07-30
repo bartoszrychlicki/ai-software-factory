@@ -117,3 +117,50 @@ test("critiqueMeaningOf spłaszcza wieloliniową sekcję do jednego zdania i cli
   assert.equal(clipped?.length, CRITIQUE_MEANING_CLIP_CHARS);
   assert.match(clipped ?? "", /…$/);
 });
+
+test("granica sekcji łapie nagłówki H4-H6 — plan nie znika z bramki", () => {
+  // Węższy wzorzec (#{1,3}) nie dopasowywał H4, więc streszczenie wchłaniało
+  // podsekcję aż do najbliższego H2, a stripSection wycinał ją z planu.
+  for (const naglowek of ["#### Detal", "##### Głębiej", "###### Najgłębiej"]) {
+    const report = [
+      "## Podsumowanie dla człowieka",
+      "",
+      "Streszczenie produktowe.",
+      "",
+      naglowek,
+      "",
+      "Techniczny szczegół, który MUSI zostać w planie.",
+    ].join("\n");
+
+    assert.equal(humanSummaryOf(report), "Streszczenie produktowe.");
+    assert.match(stripSection(report, HUMAN_SUMMARY_HEADING), /MUSI zostać w planie/);
+  }
+});
+
+test("granica sekcji łapie linię poziomą", () => {
+  for (const separator of ["---", "***", "___"]) {
+    const report = [
+      "## Podsumowanie dla człowieka",
+      "",
+      "Streszczenie produktowe.",
+      "",
+      separator,
+      "",
+      "Treść po separatorze zostaje w planie.",
+    ].join("\n");
+
+    assert.equal(humanSummaryOf(report), "Streszczenie produktowe.");
+    assert.match(stripSection(report, HUMAN_SUMMARY_HEADING), /po separatorze/);
+  }
+});
+
+test("myślnik listy nie jest mylony z linią poziomą", () => {
+  const report = [
+    "## Podsumowanie dla człowieka",
+    "",
+    "- pierwszy punkt",
+    "- drugi punkt",
+  ].join("\n");
+
+  assert.equal(humanSummaryOf(report), "- pierwszy punkt\n- drugi punkt");
+});

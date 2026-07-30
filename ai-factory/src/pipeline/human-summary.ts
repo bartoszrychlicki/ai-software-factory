@@ -40,7 +40,12 @@ export function extractSection(
 
   const bodyStart = headingMatch.index + headingMatch[0].length;
   const remainder = report.slice(bodyStart);
-  const boundaryMatch = /^[ \t]{0,3}(?:#{1,3}[ \t]+|```factory\b)/mi.exec(remainder);
+  // Granicą jest KAŻDY nagłówek (także H4+) i linia pozioma. Węższy wzorzec
+  // powodował, że sekcja streszczenia wchłaniała podsekcje aż do najbliższego
+  // H2 — a że stripSection wycina cały zakres z planu, a komentarz jest
+  // przycinany, treść planu znikała z bramki bez śladu.
+  const boundaryMatch = /^[ \t]{0,3}(?:#{1,6}[ \t]+|(?:-{3,}|\*{3,}|_{3,})[ \t]*$|```factory\b)/mi
+    .exec(remainder);
   const end = boundaryMatch?.index === undefined
     ? report.length
     : bodyStart + boundaryMatch.index;
