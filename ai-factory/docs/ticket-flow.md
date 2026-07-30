@@ -85,6 +85,36 @@ Registry v1 jest tylko do odczytu. Import wymaga zatwierdzonego planu,
 jednoznacznego checkpointu lub jawnie wskazanego bieżącego PR-a oraz świeżego
 odczytu Lineara/GitHuba/repo przed apply.
 
+### Sprzątanie poprzedniej generacji
+
+`/replan` oraz zmiana wejścia przed buildem atomowo enqueue'ują
+`retire-generation`, ale tylko gdy poprzednia generacja miała zapisany `prUrl`
+i niezmergowaną gałąź. Payload kopiuje stare `prUrl`, `branch` i
+`headSha` i numer generacji przed resetem rejestru. Komenda dodaje idempotentny
+komentarz i zamyka niezmergowany PR, gdy `headRefName` nadal odpowiada zapisanej
+gałęzi. `headRefOid` nie bramkuje zamknięcia: tożsamość starego PR-a wyznacza
+`prUrl`. Guard własności dopuszcza wyłącznie `agent/<ticket>-*`; PR o stanie
+`MERGED` nie jest komentowany, zamykany ani pozbawiany zdalnej gałęzi.
+
+SHA bramkuje wyłącznie usunięcie zdalnej gałęzi. Po pobraniu jej aktualnego
+tipu fabryka wykonuje `git fetch origin <branch>` i kasuje branch tylko wtedy,
+gdy `headSha` payloadu jest przodkiem zdalnego SHA. Brak `headSha` w legacy
+payloadzie, błąd fetchu lub brak ancestry bezpiecznie pomijają kasowanie.
+Wszystkie pominięcia są logowane i zapisywane w `last_error` zakończonej
+komendy jako `retire-skip`; błędy I/O pozostają retryowalne, a po dead-letterze
+fabryka dodaje komentarz operacyjny w Linear.
+
+`retire-generation` nie usuwa lokalnego worktree ani brancha. Robi to
+`createWorkspace` (`worktree remove --force` → `prune` → `branch -D`) przy
+starcie nowej generacji, a po merge osobna komenda `cleanup-workspace`.
+
+Publikacja sprawdza, czy istniejący zdalny branch jest przodkiem checkpointu.
+Rozjazd generacji zwraca czytelny `BRANCH_DIVERGED` jako błąd `terminal`
+(zero ponowień outboxu); force-push nie jest używany. Nazwy gałęzi pozostają
+deterministyczne bez numeru generacji: wersjonowanie nazw odrzucono, ponieważ
+sprzątanie i tak jest wymagane, a jeden otwarty PR na ticket utrzymuje czytelny
+przegląd.
+
 ## Komentarze postępu
 
 Każde objęte mapą przejście lifecycle atomowo enqueue'uje komentarz w tym samym
