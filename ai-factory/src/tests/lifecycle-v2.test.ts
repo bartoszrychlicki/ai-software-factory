@@ -355,6 +355,78 @@ test("literówka komendy dostaje dokładnie jeden hint bez replanu i zmiany inpu
   }
 });
 
+test("autoformatowane /approve przechodzi przez processCommands do builda", async () => {
+  const root = await mkdtemp(join(tmpdir(), "factory-formatted-approve-"));
+  const previousRoot = process.env.FACTORY_ROOT;
+  const store = new LifecycleStore(join(root, "registry.db"));
+  const ticket = {
+    id: "BAR-193",
+    title: "Parser toleruje autoformat Lineara",
+    description: "Opis",
+    labels: [] as string[],
+  };
+  const comments = [{
+    id: "comment-formatted-approve",
+    body: "/`approve`",
+    createdAt: "2026-07-30T10:00:00.000Z",
+  }];
+  try {
+    await writeHarnessFixture(root);
+    process.env.FACTORY_ROOT = root;
+    const inputHash = buildCommentContextSnapshot(
+      ticket.id,
+      ticket.title,
+      ticket.description,
+      []
+    ).effectiveInputHash;
+    store.createRun(ticket.id, "harness", { ...ticket, inputHash });
+    store.transition(ticket.id, {
+      stage: "approval",
+      status: "waiting_human",
+      actor: "test",
+      reason: "plan-ready",
+      patch: { plan: "plan", planFiles: ["src/a.ts"], planDomain: "backend" },
+    });
+    const source = {
+      async listComments() { return comments; },
+      async getTicket() {
+        return {
+          ...ticket,
+          source: "linear",
+          stateName: "In Progress",
+          url: `https://linear.test/${ticket.id}`,
+        };
+      },
+      async getStateName() { return "In Progress"; },
+    };
+    const deps: PollerDependencies = {
+      store,
+      mastra: {
+        async cancelRun() {},
+      } as unknown as PollerDependencies["mastra"],
+      sources: new Map([["harness", source as never]]),
+      notifier: async () => {},
+    };
+
+    await reconcileRun(deps, store.getRun(ticket.id)!);
+    const approved = store.getRun(ticket.id)!;
+    assert.deepEqual([approved.stage, approved.status], ["build", "running"]);
+    assert.equal(store.hasOutstandingJob(ticket.id), true);
+    assert.equal(store.isCommentProcessed("comment-formatted-approve"), true);
+    assert.equal(
+      store.outstandingCommands(100).some((command) =>
+        command.key.includes(":unknown-command:")
+      ),
+      false
+    );
+  } finally {
+    store.close();
+    if (previousRoot === undefined) delete process.env.FACTORY_ROOT;
+    else process.env.FACTORY_ROOT = previousRoot;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("sweep Done odpowiada hintem /score na nierozpoznaną próbę komendy", async () => {
   const root = await mkdtemp(join(tmpdir(), "factory-unknown-score-"));
   const previousRoot = process.env.FACTORY_ROOT;

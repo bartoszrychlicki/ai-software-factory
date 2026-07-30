@@ -8,8 +8,9 @@ export type CommandKind = DecisionKind | OperatorCommandKind;
  * przeciągnięcie karty jest niewygodne.
  *
  * To NIE jest rozpoznawanie języka naturalnego: liczy się wyłącznie pierwszy
- * token linii, dokładnie równy jednej z komend. Wszystko inne = brak decyzji
- * (i podpowiedź od fabryki), nigdy „chyba chodziło mu o…".
+ * token linii, dokładnie równy jednej z komend po zdjęciu autoformatu edytora.
+ * Wszystko inne = brak decyzji (i podpowiedź od fabryki), nigdy „chyba chodziło
+ * mu o…".
  */
 export const COMMANDS: Record<string, CommandKind> = {
   "/approve": "approve",
@@ -43,12 +44,27 @@ export function isDecisionCommand(kind: CommandKind): kind is DecisionKind {
   return DECISION_COMMANDS.has(kind as DecisionKind);
 }
 
-/** Zwraca komendę tylko dla dokładnego dopasowania pierwszego tokenu. */
+/** Zdejmuje wyłącznie autoformat otaczający token komendy zaczynający się od `/`. */
+export function normalizeCommandToken(raw: string): string {
+  if (!raw.startsWith("/")) return raw;
+  let name = raw.slice(1);
+  for (let iteration = 0; iteration < 3; iteration += 1) {
+    const normalized = name
+      .replace(/^[`*_~]+/, "")
+      .replace(/(?:[`*_~]+|[.,:;!]+)$/, "");
+    if (normalized === name) break;
+    name = normalized;
+  }
+  if (!name) return raw;
+  return `/${name}`.toLowerCase();
+}
+
+/** Zwraca komendę dla dokładnego dopasowania tokenu po zdjęciu autoformatu edytora. */
 export function parseCommand(body: string): ParsedCommand | undefined {
   const trimmed = body.trim();
   if (!trimmed.startsWith("/")) return undefined;
   const [first, ...rest] = trimmed.split(/\s+/);
-  const kind = COMMANDS[first.toLowerCase()];
+  const kind = COMMANDS[normalizeCommandToken(first)];
   if (!kind) return undefined;
   const payload = rest.join(" ").trim() || trimmed.slice(first.length).trim();
   if (["reject", "answer", "replan"].includes(kind) && !payload) return undefined;
@@ -64,12 +80,13 @@ export function parseCommand(body: string): ParsedCommand | undefined {
  */
 export function isCommandAttempt(body: string): boolean {
   const [firstToken = ""] = body.trim().split(/\s+/);
-  return /^\/[a-z][a-z-]*$/i.test(firstToken);
+  return /^\/[a-z][a-z-]*$/i.test(normalizeCommandToken(firstToken));
 }
 
 /** Podpowiedź dla ścisłej, ale nierozpoznanej próby komendy. */
 export function unknownCommandHint(input: UnknownCommandContext): string {
-  const [firstToken = input.firstToken.trim()] = input.firstToken.trim().split(/\s+/);
+  const [rawFirstToken = input.firstToken.trim()] = input.firstToken.trim().split(/\s+/);
+  const firstToken = normalizeCommandToken(rawFirstToken);
   const prefix = `ℹ️ Nieznana komenda \`${firstToken}\`.`;
 
   if (input.status === "done") {

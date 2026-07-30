@@ -77,11 +77,38 @@ test("nieudane próby komend nie zmieniają snapshotu ani effectiveInputHash", (
     "Opis",
     [{ body: "/approve tak", createdAt: "2026-07-29T10:00:00.000Z" }]
   );
+  const withFormattedUnknown = buildCommentContextSnapshot(
+    "BAR-184",
+    "Bramki odporne na literówki",
+    "Opis",
+    [{ body: "/`nieznane`", createdAt: "2026-07-29T10:00:00.000Z" }]
+  );
+  const withFormattedApprove = buildCommentContextSnapshot(
+    "BAR-184",
+    "Bramki odporne na literówki",
+    "Opis",
+    [{ body: "/`approve`", createdAt: "2026-07-29T10:00:00.000Z" }]
+  );
+  const withFormattedAnswer = buildCommentContextSnapshot(
+    "BAR-184",
+    "Bramki odporne na literówki",
+    "Opis",
+    [{ body: "/`answer` 1A", createdAt: "2026-07-29T10:00:00.000Z" }]
+  );
 
   assert.equal(withTypo.effectiveInputHash, withoutComments.effectiveInputHash);
   assert.equal(withInvalidPayload.effectiveInputHash, withoutComments.effectiveInputHash);
+  assert.equal(withFormattedUnknown.effectiveInputHash, withoutComments.effectiveInputHash);
+  assert.equal(withFormattedApprove.effectiveInputHash, withoutComments.effectiveInputHash);
+  assert.notEqual(withFormattedAnswer.effectiveInputHash, withoutComments.effectiveInputHash);
   assert.deepEqual(withTypo.comments, []);
   assert.deepEqual(withInvalidPayload.comments, []);
+  assert.deepEqual(withFormattedUnknown.comments, []);
+  assert.deepEqual(withFormattedApprove.comments, []);
+  assert.deepEqual(withFormattedAnswer.comments, [{
+    body: "1A",
+    createdAt: "2026-07-29T10:00:00.000Z",
+  }]);
 });
 
 test("zwykły komentarz i ścieżka pliku pozostają treścią planistyczną", () => {
@@ -103,9 +130,25 @@ test("zwykły komentarz i ścieżka pliku pozostają treścią planistyczną", (
     "Opis",
     [{ body: "/src/x.ts wymaga poprawki", createdAt: "2026-07-29T10:01:00.000Z" }]
   );
+  const approveWithoutSlash = buildCommentContextSnapshot(
+    "BAR-184",
+    "Bramki odporne na literówki",
+    "Opis",
+    [{ body: "approve", createdAt: "2026-07-29T10:02:00.000Z" }]
+  );
+  const scoreWithoutSlash = buildCommentContextSnapshot(
+    "BAR-184",
+    "Bramki odporne na literówki",
+    "Opis",
+    [{ body: "score 5 gwiazdek", createdAt: "2026-07-29T10:03:00.000Z" }]
+  );
 
   assert.notEqual(ordinary.effectiveInputHash, withoutComments.effectiveInputHash);
   assert.notEqual(filePath.effectiveInputHash, withoutComments.effectiveInputHash);
+  assert.notEqual(approveWithoutSlash.effectiveInputHash, withoutComments.effectiveInputHash);
+  assert.notEqual(scoreWithoutSlash.effectiveInputHash, withoutComments.effectiveInputHash);
   assert.equal(ordinary.comments[0]?.body, "Dodaj też test regresji");
   assert.equal(filePath.comments[0]?.body, "/src/x.ts wymaga poprawki");
+  assert.equal(approveWithoutSlash.comments[0]?.body, "approve");
+  assert.equal(scoreWithoutSlash.comments[0]?.body, "score 5 gwiazdek");
 });

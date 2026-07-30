@@ -2,9 +2,75 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   isCommandAttempt,
+  parseCommand,
   unknownCommandHint,
 } from "../sources/commands";
 import { signatureHeader } from "../pipeline/signature";
+
+test("parser toleruje autoformat Lineara wyłącznie na tokenie komendy", () => {
+  for (const body of [
+    "/`approve`",
+    "/*approve*",
+    "/**approve**",
+    "/_approve_",
+    "/~approve~",
+    "/approve.",
+    "/`approve`.",
+    "/approve!",
+  ]) {
+    assert.deepEqual(parseCommand(body), { kind: "approve", payload: undefined });
+  }
+
+  assert.deepEqual(parseCommand("/`reject` za szeroki"), {
+    kind: "reject",
+    payload: "za szeroki",
+  });
+  assert.deepEqual(parseCommand("/`answer` 1A"), {
+    kind: "answer",
+    payload: "1A",
+  });
+  assert.deepEqual(parseCommand("/`answer` 1`A`"), {
+    kind: "answer",
+    payload: "1`A`",
+  });
+  assert.deepEqual(parseCommand("/`score` 4 solidny plan"), {
+    kind: "score",
+    payload: "4 solidny plan",
+  });
+});
+
+test("parser nie zgaduje komend bez ukośnika ani nieznanych nazw", () => {
+  for (const body of [
+    "approve",
+    "restart fabryki pomógł",
+    "score 5 gwiazdek",
+    "/restartuj",
+    "proszę /restart",
+  ]) {
+    assert.equal(parseCommand(body), undefined);
+  }
+
+  for (const body of [
+    "approve",
+    "restart fabryki pomógł",
+    "score 5 gwiazdek",
+    "restartuj",
+    "proszę restart",
+  ]) {
+    assert.equal(isCommandAttempt(body), false);
+  }
+});
+
+test("autoformatowana nieznana komenda pozostaje próbą i ma czysty hint", () => {
+  assert.equal(isCommandAttempt("/`nieznane`"), true);
+  const hint = unknownCommandHint({
+    firstToken: "/`nieznane`",
+    stage: "approval",
+    status: "waiting_human",
+  });
+  assert.match(hint, /^ℹ️ Nieznana komenda `\/nieznane`\./);
+  assert.doesNotMatch(hint, /Nieznana komenda `\/`nieznane``\./);
+});
 
 test("hint pokazuje komendy adekwatne do approval, pytań i blokady", () => {
   assert.match(
