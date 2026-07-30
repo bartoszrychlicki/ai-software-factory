@@ -58,6 +58,7 @@ import {
 import {
   backoffAt,
   classifyDispatchError,
+  FatalDispatchError,
   maxDispatchAttempts,
 } from "../pipeline/retry-policy";
 import { runPreflight } from "../pipeline/preflight";
@@ -627,11 +628,45 @@ export async function publishDraftPullRequest(
       : "BRANCH_BEHIND: checkpoint nie zawiera aktualnego main; wymaga synchronizacji i ponownych testów exact-SHA.");
   }
 
-  await execFileControlled(
-    "git",
-    ["-C", project.repo, "push", "origin", `${sha}:refs/heads/${branch}`],
-    { timeoutMs: 120_000 }
+  const remoteBranchSha = async (): Promise<string | undefined> => {
+    const remote = await execFileControlled(
+      "git",
+      ["-C", project.repo, "ls-remote", "--heads", "origin", branch],
+      { timeoutMs: 60_000 }
+    );
+    return remote.stdout.trim().split(/\s+/)[0] || undefined;
+  };
+  const branchDiverged = (remoteSha?: string) => new FatalDispatchError(
+    `BRANCH_DIVERGED: gałąź ${branch} wskazuje inną generację ` +
+      `(${remoteSha?.slice(0, 7) ?? "nieznany commit"}) niż checkpoint (${sha.slice(0, 7)}). ` +
+      "Wymagane sprzątanie poprzedniej generacji: zamknij jej PR i usuń gałąź " +
+      "(/replan robi to automatycznie), potem /retry.",
+    "BRANCH_DIVERGED"
   );
+  const existingRemoteSha = await remoteBranchSha();
+  if (existingRemoteSha) {
+    const remoteIsAncestor = await execFileControlled(
+      "git",
+      ["-C", project.repo, "merge-base", "--is-ancestor", existingRemoteSha, sha]
+    ).then(() => true).catch(() => false);
+    if (!remoteIsAncestor) throw branchDiverged(existingRemoteSha);
+  }
+
+  try {
+    await execFileControlled(
+      "git",
+      ["-C", project.repo, "push", "origin", `${sha}:refs/heads/${branch}`],
+      { timeoutMs: 120_000 }
+    );
+  } catch (error) {
+    const details = error instanceof Error
+      ? `${error.message}\n${String((error as Error & { stderr?: string }).stderr ?? "")}`
+      : String(error);
+    if (/non-fast-forward|fetch first|rejected/i.test(details)) {
+      throw branchDiverged(await remoteBranchSha().catch(() => existingRemoteSha));
+    }
+    throw error;
+  }
   const existing = await execFileControlled(
     "gh",
     ["pr", "list", "--repo", project.github, "--head", branch, "--state", "open", "--json", "url", "--limit", "1"],
@@ -666,6 +701,21 @@ export async function publishDraftPullRequest(
   }
   if (!prUrl) throw new Error("Nie udało się odczytać URL draft PR.");
   return { prUrl, branch, sha };
+}
+
+async function cleanupLocalWorkspace(
+  repo: string,
+  workspaceDir: string | undefined,
+  branch: string | undefined
+): Promise<void> {
+  if (workspaceDir && existsSync(workspaceDir)) {
+    await execFileControlled("git", ["-C", repo, "worktree", "remove", "--force", workspaceDir])
+      .catch(() => {});
+  }
+  await execFileControlled("git", ["-C", repo, "worktree", "prune"]).catch(() => {});
+  if (branch) {
+    await execFileControlled("git", ["-C", repo, "branch", "-D", branch]).catch(() => {});
+  }
 }
 
 async function dispatchExternal(
@@ -745,13 +795,78 @@ async function dispatchExternal(
       ["pr", "comment", String(command.payload.prUrl), "--body", body],
       { cwd: project.repo, timeoutMs: 30_000 }
     );
+  } else if (command.kind === "retire-generation") {
+    const branch = String(command.payload.branch ?? "");
+    const prUrl = String(command.payload.prUrl ?? "");
+    const workspaceDir = typeof command.payload.workspaceDir === "string"
+      ? command.payload.workspaceDir
+      : undefined;
+    const generation = Number(command.payload.generation ?? run.generation);
+    if (!branch.startsWith(`agent/${run.ticketId}-`)) {
+      deps.store.markCommand(command.key, "done", { error: "branch-not-owned" });
+      return;
+    }
+
+    const viewed = await execFileControlled(
+      "gh",
+      ["pr", "view", prUrl, "--json", "state,url"],
+      { cwd: project.repo, timeoutMs: 30_000 }
+    );
+    const pr = JSON.parse(viewed.stdout) as { state?: string; url?: string };
+    if (pr.state !== "MERGED") {
+      const tag = `<!-- factory-outbox:${command.key} -->`;
+      const existing = await execFileControlled(
+        "gh",
+        ["pr", "view", prUrl, "--json", "comments"],
+        { cwd: project.repo, timeoutMs: 30_000 }
+      );
+      const comments = JSON.parse(existing.stdout) as { comments?: { body?: string }[] };
+      if (!(comments.comments ?? []).some((comment) => comment.body?.includes(tag))) {
+        const reason = String(
+          command.payload.reason ?? "zastąpione nową generacją planu"
+        );
+        const body = [
+          `♻️ ${reason.charAt(0).toUpperCase()}${reason.slice(1)} — ten PR jest zamykany, ` +
+            `prace kontynuuje generacja g${generation + 1}.`,
+          "",
+          tag,
+        ].join("\n");
+        await execFileControlled(
+          "gh",
+          ["pr", "comment", prUrl, "--body", body],
+          { cwd: project.repo, timeoutMs: 30_000 }
+        );
+      }
+      if (pr.state === "OPEN") {
+        await execFileControlled(
+          "gh",
+          ["pr", "close", prUrl],
+          { cwd: project.repo, timeoutMs: 30_000 }
+        );
+      }
+      await execFileControlled(
+        "git",
+        ["-C", project.repo, "push", "origin", "--delete", branch],
+        { timeoutMs: 120_000 }
+      ).catch((error) => {
+        const details = error instanceof Error
+          ? `${error.message}\n${String((error as Error & { stderr?: string }).stderr ?? "")}`
+          : String(error);
+        if (/remote ref does not exist|unable to delete/i.test(details)) return;
+        throw error;
+      });
+    }
+    await cleanupLocalWorkspace(project.repo, workspaceDir, branch);
   } else if (command.kind === "cleanup-workspace") {
     // Cleanup jest celowo osobną komendą po finale; implementacja nie usuwa
     // śledzonego brancha przed merge/smoke.
-    if (run.workspaceDir) {
-      await execFileControlled("git", ["-C", project.repo, "worktree", "remove", "--force", run.workspaceDir])
-        .catch(() => {});
-    }
+    const workspaceDir = typeof command.payload.workspaceDir === "string"
+      ? command.payload.workspaceDir
+      : run.workspaceDir;
+    const branch = typeof command.payload.branch === "string"
+      ? command.payload.branch
+      : run.branch;
+    await cleanupLocalWorkspace(project.repo, workspaceDir, branch);
   }
   if (command.kind !== "publish-pr") deps.store.markCommand(command.key, "done");
 }
@@ -853,6 +968,24 @@ export async function dispatchOutbox(deps: PollerDependencies): Promise<void> {
           `${errorClass}: ${message.slice(0, 400)}`,
           run.manifest.url
         ).catch(() => {});
+        if (command.kind === "retire-generation") {
+          const retiredGeneration = Number(command.payload.generation ?? run.generation);
+          deps.store.enqueue({
+            key: `${run.ticketId}:g${retiredGeneration}:retire-failed`,
+            ticketId: run.ticketId,
+            kind: "linear-comment",
+            stage: command.stage,
+            payload: {
+              body: [
+                "⚠️ Automatyczne sprzątanie poprzedniej generacji nie powiodło się.",
+                `PR: ${String(command.payload.prUrl ?? "brak")}`,
+                `Gałąź: \`${String(command.payload.branch ?? "brak")}\``,
+                `Błąd: ${message}`,
+                "Zamknij stary PR i usuń jego gałąź ręcznie przed publikacją nowej generacji.",
+              ].join("\n"),
+            },
+          });
+        }
       }
       // Dead-letter joba domyka jego próbę — wisząca próba 'running' na zawsze
       // rezerwowałaby budżet i fałszowała wiersz eksperymentu.
