@@ -168,11 +168,14 @@ function linearComment(
   };
 }
 
-/** Sprzątanie artefaktów GitHub poprzedniej generacji — dane kopiujemy przed resetem runu. */
+/**
+ * Sprzątanie artefaktów GitHub/lokalnych poprzedniej generacji.
+ * MUSI być wywołane na runie SPRZED patcha czyszczącego prUrl.
+ */
 function retireGenerationCommand(run: LifecycleRun, reason: string): NewCommand | undefined {
-  if (!run.prUrl || run.mergedSha || !run.branch) return undefined;
+  if (!run.prUrl || !run.branch || !run.headSha || run.mergedSha) return undefined;
   return {
-    key: key(run, `retire:${run.generation}`),
+    key: key(run, "retire"),
     ticketId: run.ticketId,
     kind: "retire-generation",
     stage: run.stage,
@@ -180,6 +183,7 @@ function retireGenerationCommand(run: LifecycleRun, reason: string): NewCommand 
       prUrl: run.prUrl,
       branch: run.branch,
       workspaceDir: run.workspaceDir,
+      headSha: run.headSha,
       generation: run.generation,
       reason,
     },

@@ -83,14 +83,18 @@ function createGitFixture(): GitFixture {
     "#!/bin/sh",
     "printf '%s\\n' \"$*\" >> \"$FACTORY_TEST_GH_LOG\"",
     "if [ \"$1 $2\" = \"pr view\" ]; then",
+    "  if [ \"$FACTORY_TEST_GH_FAIL\" = \"pr-view\" ]; then",
+    "    printf 'sterowana awaria pr view\\n' >&2",
+    "    exit 1",
+    "  fi",
     "  case \" $* \" in",
-    "    *\" --json state,url \"*)",
+    "    *\" --json state,url,headRefName,headRefOid \"*)",
     "      case \"$FACTORY_TEST_PR_STATE\" in",
     "        merged) state=MERGED ;;",
     "        closed) state=CLOSED ;;",
     "        *) state=OPEN ;;",
     "      esac",
-    "      printf '{\"state\":\"%s\",\"url\":\"https://github.test/o/r/pull/1\"}\\n' \"$state\"",
+    "      printf '{\"state\":\"%s\",\"url\":\"https://github.test/o/r/pull/1\",\"headRefName\":\"%s\",\"headRefOid\":\"%s\"}\\n' \"$state\" \"$FACTORY_TEST_PR_HEAD_NAME\" \"$FACTORY_TEST_PR_HEAD_OID\"",
     "      ;;",
     "    *\" --json comments \"*) printf '{\"comments\":[]}\\n' ;;",
     "  esac",
@@ -132,6 +136,9 @@ async function withFixture(
   const previousPath = process.env.PATH;
   const previousState = process.env.FACTORY_TEST_PR_STATE;
   const previousLog = process.env.FACTORY_TEST_GH_LOG;
+  const previousHeadName = process.env.FACTORY_TEST_PR_HEAD_NAME;
+  const previousHeadOid = process.env.FACTORY_TEST_PR_HEAD_OID;
+  const previousGhFail = process.env.FACTORY_TEST_GH_FAIL;
   const store = new LifecycleStore(join(fixture.root, "registry.db"));
   const notifications: string[] = [];
   try {
@@ -139,6 +146,9 @@ async function withFixture(
     process.env.PATH = `${join(fixture.root, "bin")}:${previousPath ?? ""}`;
     process.env.FACTORY_TEST_PR_STATE = prState;
     process.env.FACTORY_TEST_GH_LOG = fixture.ghLog;
+    process.env.FACTORY_TEST_PR_HEAD_NAME = fixture.branch;
+    process.env.FACTORY_TEST_PR_HEAD_OID = fixture.oldSha;
+    delete process.env.FACTORY_TEST_GH_FAIL;
     const source = {
       async listComments() { return []; },
       async comment() {},
@@ -161,6 +171,12 @@ async function withFixture(
     else process.env.FACTORY_TEST_PR_STATE = previousState;
     if (previousLog === undefined) delete process.env.FACTORY_TEST_GH_LOG;
     else process.env.FACTORY_TEST_GH_LOG = previousLog;
+    if (previousHeadName === undefined) delete process.env.FACTORY_TEST_PR_HEAD_NAME;
+    else process.env.FACTORY_TEST_PR_HEAD_NAME = previousHeadName;
+    if (previousHeadOid === undefined) delete process.env.FACTORY_TEST_PR_HEAD_OID;
+    else process.env.FACTORY_TEST_PR_HEAD_OID = previousHeadOid;
+    if (previousGhFail === undefined) delete process.env.FACTORY_TEST_GH_FAIL;
+    else process.env.FACTORY_TEST_GH_FAIL = previousGhFail;
     rmSync(fixture.root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 }
@@ -189,7 +205,11 @@ function seedPreviousGeneration(
   });
 }
 
-function applyReplan(store: LifecycleStore, run: LifecycleRun): LifecycleRun {
+function applyReplan(
+  store: LifecycleStore,
+  run: LifecycleRun,
+  options: { completePlanningJob?: boolean } = {}
+): LifecycleRun {
   const decision = reduceLifecycle(run, {
     type: "replan",
     commentId: "comment-replan",
@@ -200,10 +220,25 @@ function applyReplan(store: LifecycleStore, run: LifecycleRun): LifecycleRun {
     ...decision.transition,
     commands: decision.commands,
   });
-  for (const command of decision.commands.filter((candidate) => candidate.kind === "run-job")) {
-    store.markCommand(command.key, "done", { error: "test-skips-planner" });
+  if (options.completePlanningJob !== false) {
+    for (const command of decision.commands.filter((candidate) => candidate.kind === "run-job")) {
+      store.markCommand(command.key, "done", { error: "test-skips-planner" });
+    }
   }
   return updated;
+}
+
+function pushUnseenDivergedBranch(fixture: GitFixture): string {
+  const other = join(fixture.root, "other-clone");
+  execFileSync("git", ["clone", fixture.origin, other]);
+  git(other, "config", "user.email", "other@example.test");
+  git(other, "config", "user.name", "Other Test");
+  writeFileSync(join(other, "remote-only.txt"), "remote generation\n");
+  git(other, "add", "remote-only.txt");
+  git(other, "commit", "-m", "remote-only generation");
+  const sha = git(other, "rev-parse", "HEAD");
+  git(other, "push", "--force", "origin", `${sha}:refs/heads/${fixture.branch}`);
+  return sha;
 }
 
 test("/replan zamyka stary PR, usuwa jego branch/worktree i pozwala opublikować nową generację", async () => {
@@ -223,6 +258,7 @@ test("/replan zamyka stary PR, usuwa jego branch/worktree i pozwala opublikować
       prUrl: "https://github.test/o/r/pull/1",
       branch: fixture.branch,
       workspaceDir: fixture.workspace,
+      headSha: fixture.oldSha,
       generation: 1,
       reason: "zastąpione nową generacją planu po /replan",
     });
@@ -233,7 +269,7 @@ test("/replan zamyka stary PR, usuwa jego branch/worktree i pozwala opublikować
 
     const ghAfterRetire = readFileSync(fixture.ghLog, "utf8");
     assert.match(ghAfterRetire, /pr comment https:\/\/github\.test\/o\/r\/pull\/1/);
-    assert.match(ghAfterRetire, /Zastąpione nową generacją planu po \/replan/);
+    assert.match(ghAfterRetire, /Generacja \*\*g1\*\* została zastąpiona nowym planem/);
     assert.match(ghAfterRetire, /pr close https:\/\/github\.test\/o\/r\/pull\/1/);
     assert.equal(git(fixture.repo, "ls-remote", "--heads", "origin", fixture.branch), "");
     assert.equal(existsSync(fixture.workspace), false);
@@ -323,6 +359,11 @@ test("retire-generation nie dotyka zmergowanego PR-a ani jego zdalnej gałęzi",
 
 test("rozjechana zdalna gałąź kończy publish-pr po jednej próbie czytelnym błędem terminalnym", async () => {
   await withFixture("open", async (fixture, store, deps, notifications) => {
+    const remoteSha = pushUnseenDivergedBranch(fixture);
+    assert.throws(
+      () => git(fixture.repo, "cat-file", "-e", `${remoteSha}^{commit}`),
+      /Command failed/
+    );
     const run = store.createRun("BAR-192", "harness", manifest);
     store.transition(run.ticketId, {
       stage: "publish",
@@ -349,6 +390,7 @@ test("rozjechana zdalna gałąź kończy publish-pr po jednej próbie czytelnym 
     assert.match(failed.lastError ?? "", /BRANCH_DIVERGED/);
     assert.match(failed.lastError ?? "", /wskazuje inną generację/);
     assert.match(failed.lastError ?? "", /Wymagane sprzątanie poprzedniej generacji/);
+    assert.match(failed.lastError ?? "", new RegExp(remoteSha.slice(0, 7)));
     assert.deepEqual(
       [store.getRun(run.ticketId)?.status, store.getRun(run.ticketId)?.errorCode],
       ["blocked", "OUTBOX_FAILED"]
@@ -377,6 +419,7 @@ test("retire-generation odrzuca gałąź innego ticketu bez wywołań GitHuba", 
       payload: {
         prUrl: "https://github.test/o/r/pull/1",
         branch: foreignBranch,
+        headSha: fixture.oldSha,
         generation: 1,
         reason: "test",
       },
@@ -404,6 +447,7 @@ test("input-changed-before-build również kopiuje dane starej generacji do reti
     critiqueRound: 0,
     branch: "agent/BAR-192-cleanup-after-replan",
     workspaceDir: "/tmp/BAR-192-old",
+    headSha: "1111111111111111111111111111111111111111",
     prUrl: "https://github.test/o/r/pull/4",
     createdAt: "2026-07-30T00:00:00.000Z",
     updatedAt: "2026-07-30T00:00:00.000Z",
@@ -422,7 +466,89 @@ test("input-changed-before-build również kopiuje dane starej generacji do reti
     prUrl: run.prUrl,
     branch: run.branch,
     workspaceDir: run.workspaceDir,
+    headSha: run.headSha,
     generation: 4,
     reason: "zastąpione nową generacją po zmianie wejścia ticketu",
+  });
+});
+
+test("opóźniony retire nie usuwa worktree, lokalnej ani zdalnej gałęzi nowej generacji", async () => {
+  await withFixture("open", async (fixture, store, deps) => {
+    const oldRun = seedPreviousGeneration(store, fixture);
+    applyReplan(store, oldRun);
+
+    git(fixture.repo, "worktree", "remove", "--force", fixture.workspace);
+    git(fixture.repo, "worktree", "prune");
+    git(fixture.repo, "branch", "-D", fixture.branch);
+    git(fixture.repo, "worktree", "add", "-b", fixture.branch, fixture.workspace, "main");
+    writeFileSync(join(fixture.workspace, "new-worktree.txt"), "new workspace generation\n");
+    git(fixture.workspace, "add", "new-worktree.txt");
+    git(fixture.workspace, "commit", "-m", "new workspace generation");
+    const replacementSha = git(fixture.workspace, "rev-parse", "HEAD");
+    git(
+      fixture.repo,
+      "push",
+      "--force",
+      "origin",
+      `${replacementSha}:refs/heads/${fixture.branch}`
+    );
+    process.env.FACTORY_TEST_PR_HEAD_OID = replacementSha;
+
+    await dispatchOutbox(deps);
+
+    const ghLog = readFileSync(fixture.ghLog, "utf8");
+    assert.doesNotMatch(ghLog, /pr comment|pr close/);
+    assert.equal(existsSync(fixture.workspace), true);
+    assert.equal(
+      git(fixture.repo, "rev-parse", `refs/heads/${fixture.branch}`),
+      replacementSha
+    );
+    assert.equal(
+      git(fixture.repo, "ls-remote", "--heads", "origin", fixture.branch).split(/\s+/)[0],
+      replacementSha
+    );
+    assert.equal(store.getCommand("BAR-192:g1:retire")?.state, "done");
+  });
+});
+
+test("żywy job nowej generacji chroni lokalne artefakty i retire jest pierwszy w outboxie", async () => {
+  await withFixture("open", async (fixture, store, deps) => {
+    const oldRun = seedPreviousGeneration(store, fixture);
+    applyReplan(store, oldRun, { completePlanningJob: false });
+
+    const pending = store.pendingCommands();
+    assert.deepEqual(pending.slice(0, 2).map((command) => command.kind), [
+      "retire-generation",
+      "run-job",
+    ]);
+    const planningJob = pending[1];
+    store.deferCommand(planningJob.key, new Date(Date.now() + 60_000).toISOString());
+
+    await dispatchOutbox(deps);
+
+    assert.equal(store.getCommand("BAR-192:g1:retire")?.state, "done");
+    assert.equal(existsSync(fixture.workspace), true);
+    assert.equal(
+      git(fixture.repo, "rev-parse", `refs/heads/${fixture.branch}`),
+      fixture.oldSha
+    );
+  });
+});
+
+test("awaria gh pr view nie blokuje bezpiecznego sprzątania lokalnego", async () => {
+  await withFixture("open", async (fixture, store, deps) => {
+    const oldRun = seedPreviousGeneration(store, fixture);
+    applyReplan(store, oldRun);
+    process.env.FACTORY_TEST_GH_FAIL = "pr-view";
+
+    await dispatchOutbox(deps);
+
+    const retire = store.getCommand("BAR-192:g1:retire")!;
+    assert.deepEqual([retire.state, retire.attempts], ["pending", 1]);
+    assert.match(retire.lastError ?? "", /remote-pr-view/);
+    assert.match(retire.lastError ?? "", /sterowana awaria pr view/);
+    assert.equal(existsSync(fixture.workspace), false);
+    assert.equal(git(fixture.repo, "branch", "--list", fixture.branch), "");
+    assert.notEqual(git(fixture.repo, "ls-remote", "--heads", "origin", fixture.branch), "");
   });
 });

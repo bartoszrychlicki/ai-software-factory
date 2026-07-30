@@ -90,10 +90,20 @@ odczytu Lineara/GitHuba/repo przed apply.
 `/replan` oraz zmiana wejścia przed buildem atomowo enqueue'ują
 `retire-generation`, ale tylko gdy poprzednia generacja miała zapisany `prUrl`
 i niezmergowaną gałąź. Payload kopiuje stare `prUrl`, `branch` i
-`workspaceDir` przed resetem rejestru. Komenda dodaje idempotentny komentarz,
-zamyka niezmergowany PR, usuwa jego zdalną gałąź oraz lokalny worktree i branch.
-Guard własności dopuszcza wyłącznie `agent/<ticket>-*`; PR o stanie `MERGED`
-nie jest komentowany, zamykany ani pozbawiany zdalnej gałęzi.
+`workspaceDir`, `headSha` i numer generacji przed resetem rejestru. Komenda
+dodaje idempotentny komentarz, zamyka niezmergowany PR, usuwa jego zdalną
+gałąź oraz lokalny worktree i branch. Guard własności dopuszcza wyłącznie
+`agent/<ticket>-*`; PR o stanie `MERGED` nie jest komentowany, zamykany ani
+pozbawiany zdalnej gałęzi.
+
+Destrukcja jest bramkowana tożsamością artefaktu, nie samą nazwą. PR jest
+zamykany tylko przy zgodności jego `headRefOid` z `headSha` payloadu. Zdalna
+gałąź jest usuwana tylko wtedy, gdy jej tip jest równy zarówno `headRefOid`
+starego PR-a, jak i `headSha` z payloadu. Worktree i lokalna gałąź są usuwane
+wyłącznie przy zgodnym `headSha`; żywy job nowej generacji wstrzymuje całe
+lokalne sprzątanie. Kroki zdalne i lokalne są niezależne, więc awaria GitHuba
+nie blokuje bezpiecznego cleanupu lokalnego, a opóźniony retire staje się
+no-opem, gdy nazwę przejęła już nowa generacja.
 
 Publikacja sprawdza, czy istniejący zdalny branch jest przodkiem checkpointu.
 Rozjazd generacji zwraca czytelny `BRANCH_DIVERGED` jako błąd `terminal`

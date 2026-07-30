@@ -645,11 +645,18 @@ export async function publishDraftPullRequest(
   );
   const existingRemoteSha = await remoteBranchSha();
   if (existingRemoteSha) {
-    const remoteIsAncestor = await execFileControlled(
+    const fetchedRemoteBranch = await execFileControlled(
       "git",
-      ["-C", project.repo, "merge-base", "--is-ancestor", existingRemoteSha, sha]
+      ["-C", project.repo, "fetch", "origin", branch],
+      { timeoutMs: 60_000 }
     ).then(() => true).catch(() => false);
-    if (!remoteIsAncestor) throw branchDiverged(existingRemoteSha);
+    if (fetchedRemoteBranch) {
+      const remoteIsAncestor = await execFileControlled(
+        "git",
+        ["-C", project.repo, "merge-base", "--is-ancestor", existingRemoteSha, sha]
+      ).then(() => true).catch(() => false);
+      if (!remoteIsAncestor) throw branchDiverged(existingRemoteSha);
+    }
   }
 
   try {
@@ -659,10 +666,8 @@ export async function publishDraftPullRequest(
       { timeoutMs: 120_000 }
     );
   } catch (error) {
-    const details = error instanceof Error
-      ? `${error.message}\n${String((error as Error & { stderr?: string }).stderr ?? "")}`
-      : String(error);
-    if (/non-fast-forward|fetch first|rejected/i.test(details)) {
+    const details = processErrorDetails(error);
+    if (/non-fast-forward|fetch first|\[rejected\]/i.test(details)) {
       throw branchDiverged(await remoteBranchSha().catch(() => existingRemoteSha));
     }
     throw error;
@@ -701,6 +706,16 @@ export async function publishDraftPullRequest(
   }
   if (!prUrl) throw new Error("Nie udało się odczytać URL draft PR.");
   return { prUrl, branch, sha };
+}
+
+function processErrorDetails(error: unknown): string {
+  return error instanceof Error
+    ? `${error.message}\n${String((error as Error & { stderr?: string }).stderr ?? "")}`
+    : String(error);
+}
+
+function retireSkip(message: string): void {
+  console.warn(`retire-generation: ${message}`);
 }
 
 async function cleanupLocalWorkspace(
@@ -801,62 +816,178 @@ async function dispatchExternal(
     const workspaceDir = typeof command.payload.workspaceDir === "string"
       ? command.payload.workspaceDir
       : undefined;
+    const headSha = String(command.payload.headSha ?? "");
     const generation = Number(command.payload.generation ?? run.generation);
     if (!branch.startsWith(`agent/${run.ticketId}-`)) {
       deps.store.markCommand(command.key, "done", { error: "branch-not-owned" });
       return;
     }
 
-    const viewed = await execFileControlled(
-      "gh",
-      ["pr", "view", prUrl, "--json", "state,url"],
-      { cwd: project.repo, timeoutMs: 30_000 }
-    );
-    const pr = JSON.parse(viewed.stdout) as { state?: string; url?: string };
-    if (pr.state !== "MERGED") {
-      const tag = `<!-- factory-outbox:${command.key} -->`;
-      const existing = await execFileControlled(
+    const errors: string[] = [];
+    let pr: {
+      state?: string;
+      url?: string;
+      headRefName?: string;
+      headRefOid?: string;
+    } | undefined;
+    try {
+      const viewed = await execFileControlled(
         "gh",
-        ["pr", "view", prUrl, "--json", "comments"],
+        ["pr", "view", prUrl, "--json", "state,url,headRefName,headRefOid"],
         { cwd: project.repo, timeoutMs: 30_000 }
       );
-      const comments = JSON.parse(existing.stdout) as { comments?: { body?: string }[] };
-      if (!(comments.comments ?? []).some((comment) => comment.body?.includes(tag))) {
-        const reason = String(
-          command.payload.reason ?? "zastąpione nową generacją planu"
-        );
-        const body = [
-          `♻️ ${reason.charAt(0).toUpperCase()}${reason.slice(1)} — ten PR jest zamykany, ` +
-            `prace kontynuuje generacja g${generation + 1}.`,
-          "",
-          tag,
-        ].join("\n");
-        await execFileControlled(
-          "gh",
-          ["pr", "comment", prUrl, "--body", body],
-          { cwd: project.repo, timeoutMs: 30_000 }
-        );
-      }
-      if (pr.state === "OPEN") {
-        await execFileControlled(
-          "gh",
-          ["pr", "close", prUrl],
-          { cwd: project.repo, timeoutMs: 30_000 }
-        );
-      }
-      await execFileControlled(
-        "git",
-        ["-C", project.repo, "push", "origin", "--delete", branch],
-        { timeoutMs: 120_000 }
-      ).catch((error) => {
-        const details = error instanceof Error
-          ? `${error.message}\n${String((error as Error & { stderr?: string }).stderr ?? "")}`
-          : String(error);
-        if (/remote ref does not exist|unable to delete/i.test(details)) return;
-        throw error;
-      });
+      pr = JSON.parse(viewed.stdout) as typeof pr;
+    } catch (error) {
+      errors.push(`remote-pr-view: ${processErrorDetails(error)}`);
     }
-    await cleanupLocalWorkspace(project.repo, workspaceDir, branch);
+
+    if (pr?.state === "MERGED") {
+      retireSkip(`PR ${prUrl} jest zmergowany; zdalne artefakty pozostają bez zmian`);
+    } else if (pr && pr.headRefName !== branch) {
+      retireSkip(
+        `PR ${prUrl} wskazuje ${pr.headRefName ?? "brak gałęzi"}, nie ${branch}`
+      );
+    } else if (pr && pr.headRefOid !== headSha) {
+      retireSkip(
+        `PR ${prUrl} wskazuje inne SHA (${pr.headRefOid?.slice(0, 7) ?? "unknown"}; ` +
+          `payload ${headSha.slice(0, 7) || "unknown"})`
+      );
+    } else if (pr) {
+      const tag = `<!-- factory-outbox:${command.key} -->`;
+      try {
+        const existing = await execFileControlled(
+          "gh",
+          ["pr", "view", prUrl, "--json", "comments"],
+          { cwd: project.repo, timeoutMs: 30_000 }
+        );
+        const comments = JSON.parse(existing.stdout) as { comments?: { body?: string }[] };
+        if (!(comments.comments ?? []).some((comment) => comment.body?.includes(tag))) {
+          const reason = String(
+            command.payload.reason ?? "zastąpione nową generacją planu"
+          );
+          const replacement = reason.includes("/replan")
+            ? "została zastąpiona nowym planem (`/replan`)"
+            : `została ${reason.replace(/^zastąpione/, "zastąpiona")}`;
+          const body = [
+            `♻️ Generacja **g${generation}** ${replacement}. Ten PR jest zamykany, ` +
+              "prace kontynuuje kolejna generacja tego ticketu.",
+            "",
+            tag,
+          ].join("\n");
+          await execFileControlled(
+            "gh",
+            ["pr", "comment", prUrl, "--body", body],
+            { cwd: project.repo, timeoutMs: 30_000 }
+          );
+        }
+      } catch (error) {
+        errors.push(`remote-pr-comment: ${processErrorDetails(error)}`);
+      }
+
+      if (pr.state === "OPEN") {
+        try {
+          await execFileControlled(
+            "gh",
+            ["pr", "close", prUrl],
+            { cwd: project.repo, timeoutMs: 30_000 }
+          );
+        } catch (error) {
+          errors.push(`remote-pr-close: ${processErrorDetails(error)}`);
+        }
+      }
+
+      try {
+        const remote = await execFileControlled(
+          "git",
+          ["-C", project.repo, "ls-remote", "--heads", "origin", branch],
+          { timeoutMs: 60_000 }
+        );
+        const remoteSha = remote.stdout.trim().split(/\s+/)[0] || undefined;
+        if (
+          remoteSha &&
+          remoteSha === pr.headRefOid &&
+          remoteSha === headSha
+        ) {
+          try {
+            await execFileControlled(
+              "git",
+              ["-C", project.repo, "push", "origin", "--delete", branch],
+              { timeoutMs: 120_000 }
+            );
+          } catch (error) {
+            const details = processErrorDetails(error);
+            if (!/remote ref does not exist|unable to delete|does not appear to be a git repository/i.test(details)) {
+              throw error;
+            }
+          }
+        } else if (remoteSha) {
+          retireSkip(
+            `retire-skip-remote: branch moved (${remoteSha.slice(0, 7)}; ` +
+              `PR ${pr.headRefOid?.slice(0, 7) ?? "unknown"}; payload ${headSha.slice(0, 7) || "unknown"})`
+          );
+        }
+      } catch (error) {
+        errors.push(`remote-branch-delete: ${processErrorDetails(error)}`);
+      }
+    }
+
+    if (deps.store.hasOutstandingJob(run.ticketId)) {
+      retireSkip(`lokalne sprzątanie ${branch} pominięte: ticket ma żywy job`);
+    } else {
+      if (workspaceDir && existsSync(workspaceDir)) {
+        try {
+          const workspaceHead = await execFileControlled(
+            "git",
+            ["-C", workspaceDir, "rev-parse", "HEAD"]
+          );
+          const workspaceSha = workspaceHead.stdout.trim();
+          if (workspaceSha === headSha) {
+            try {
+              await execFileControlled(
+                "git",
+                ["-C", project.repo, "worktree", "remove", "--force", workspaceDir]
+              );
+            } catch (error) {
+              errors.push(`local-worktree-remove: ${processErrorDetails(error)}`);
+            }
+          } else {
+            retireSkip(
+              `lokalny worktree należy do innego SHA (${workspaceSha.slice(0, 7)}; ` +
+                `payload ${headSha.slice(0, 7) || "unknown"})`
+            );
+          }
+        } catch (error) {
+          errors.push(`local-worktree-head: ${processErrorDetails(error)}`);
+        }
+      }
+
+      try {
+        await execFileControlled("git", ["-C", project.repo, "worktree", "prune"]);
+      } catch (error) {
+        errors.push(`local-worktree-prune: ${processErrorDetails(error)}`);
+      }
+
+      const localBranchSha = await execFileControlled(
+        "git",
+        ["-C", project.repo, "rev-parse", "--verify", `refs/heads/${branch}`]
+      ).then((result) => result.stdout.trim()).catch(() => undefined);
+      if (localBranchSha === headSha) {
+        try {
+          await execFileControlled("git", ["-C", project.repo, "branch", "-D", branch]);
+        } catch (error) {
+          errors.push(`local-branch-delete: ${processErrorDetails(error)}`);
+        }
+      } else if (localBranchSha) {
+        retireSkip(
+          `lokalna gałąź należy do innego SHA (${localBranchSha.slice(0, 7)}; ` +
+            `payload ${headSha.slice(0, 7) || "unknown"})`
+        );
+      }
+    }
+
+    if (errors.length) {
+      throw new Error(`retire-generation niepełne: ${errors.join(" | ")}`);
+    }
   } else if (command.kind === "cleanup-workspace") {
     // Cleanup jest celowo osobną komendą po finale; implementacja nie usuwa
     // śledzonego brancha przed merge/smoke.
