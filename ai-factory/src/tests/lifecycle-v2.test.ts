@@ -2431,7 +2431,9 @@ test("poller pozwala na fallback tylko przy headroomie budżetu ticketu", async 
     await writeHarnessFixture(root, [
       "  budget:",
       "    maxUsd: 100",
-      "    maxMinutes: 25",
+      // plan ma 20 min: pusty ticket mieści dwie próby (40 < 45), a ticket
+      // z 10 min użycia mieści główną (30 < 45), lecz nie zapas (50 >= 45).
+      "    maxMinutes: 45",
     ]);
     process.env.FACTORY_ROOT = root;
     const mastra = {

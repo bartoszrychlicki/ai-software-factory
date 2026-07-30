@@ -163,8 +163,7 @@ export async function resolveRouteCandidates(
     specs = normalizeSpecs(value, context);
   }
 
-  const candidates: Route[] = [];
-  for (const spec of specs) {
+  const candidates = specs.map((spec) => {
     const { engineName, model, effort } = parseSpec(spec);
     const engine = engines[engineName];
     if (!engine) {
@@ -172,9 +171,8 @@ export async function resolveRouteCandidates(
         `Nieznany silnik "${engineName}" w routingu (dostępne: ${Object.keys(engines).join(", ")})`
       );
     }
-    const cliVersion = engine.version ? await engine.version() : undefined;
-    candidates.push({ engine, model, effort, spec, cliVersion });
-  }
+    return { engine, model, effort, spec };
+  });
 
   const allowed = options.excludeEngine
     ? candidates.filter((candidate) => candidate.engine.name !== options.excludeEngine)
@@ -182,7 +180,10 @@ export async function resolveRouteCandidates(
   if (!allowed.length) {
     throw new Error(`Routing ${stage}.diverse wskazuje wykluczony silnik "${options.excludeEngine}".`);
   }
-  return allowed;
+  return Promise.all(allowed.map(async (candidate) => ({
+    ...candidate,
+    cliVersion: candidate.engine.version ? await candidate.engine.version() : undefined,
+  })));
 }
 
 /** Kompatybilny wrapper dla wywołujących, którzy znają tylko jedną trasę. */

@@ -97,15 +97,17 @@ or a YAML list containing a primary and one backup specification. The backup
 runs only when the primary adapter returns a recognized infrastructure failure
 such as a process start error, timeout, network/authentication error, exhausted
 quota, or provider outage. A negative work result (`BLOCKED`, missing verdict,
-review comments, empty research) never switches models. Unknown error messages
-also fail closed without a second charge.
+review comments, empty research, or empty output without an infrastructure
+signal) never switches models. Unknown error messages also fail closed without
+a second charge.
 
 There is at most one switch per stage attempt, and the poller disables it when
-the ticket budget lacks headroom. Both engine attempts count toward ticket
-usage. A switch is visible in `runs/metrics.jsonl` (`engineFallback` and
-`fallbackReason`), in the stage artifact and actual-model signature, and as a
-⚠️ degradation at the Linear gate (or an immediate Linear comment for build
-and review).
+the ticket budget lacks headroom. Both attempts share the stage's time budget
+and count toward ticket usage. A switch is visible in `runs/metrics.jsonl`
+(`engineFallback` and `fallbackReason`), in the stage artifact and actual-model
+signature, and as a ⚠️ degradation at the Linear gate (or an immediate Linear
+comment for build and review). The failed primary report remains available as
+`<stage>-attempt-<N>-primary.md` beside the final stage artifact.
 
 Commit substantive changes shared by all hosts to the base files; `.local` is
 only for per-machine differences. Tests read the committed YAML files through a

@@ -451,7 +451,7 @@ export function jobBudgetMinutes(stage: string): number {
   const kind = stage.startsWith("research-") ? "research" : stage;
   return kind in JOB_BUDGET_MINUTES
     ? JOB_BUDGET_MINUTES[kind as keyof typeof JOB_BUDGET_MINUTES]
-    : 20;
+    : 25; // zachowaj historyczny lease nieznanego rodzaju joba
 }
 
 function reservedUsage(
@@ -543,12 +543,12 @@ async function dispatchJob(
 
   const jobMinutes = jobBudgetMinutes(String(command.payload.kind));
   const perMinute = Number(process.env.FACTORY_SYNTH_USD_PER_MIN ?? 0.15);
-  // Zapas liczy się jak kolejna próba. Wpuszczamy go tylko, gdy po rezerwacji
-  // bieżącego joba w obu limitach pozostaje dodatni margines; faktyczny koszt
-  // drugiej próby zostanie doliczony z outputu joba.
+  // Bieżący job nie figuruje jeszcze w reservedUsage. Zapas wpuszczamy tylko,
+  // gdy budżet mieści DWIE pełne rezerwacje roli; faktyczny czas drugiej próby
+  // job ograniczy do reszty budżetu pierwszej próby.
   const allowEngineFallback =
-    usage.minutes + reserved.minutes + jobMinutes < maxMinutes &&
-    usage.usd + reserved.usd + jobMinutes * perMinute < maxUsd;
+    usage.minutes + reserved.minutes + 2 * jobMinutes < maxMinutes &&
+    usage.usd + reserved.usd + 2 * jobMinutes * perMinute < maxUsd;
   const inputData = jobInputData(deps, command, run, allowEngineFallback);
   let jobRunId = command.externalId;
   if (!jobRunId) {

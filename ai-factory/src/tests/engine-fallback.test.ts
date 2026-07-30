@@ -83,14 +83,19 @@ async function withFixture(
 
 function adapter(
   name: string,
-  result: EngineRunResult | ((workspace: string) => Promise<EngineRunResult>),
+  result: EngineRunResult | ((
+    workspace: string,
+    budgetMinutes: number
+  ) => Promise<EngineRunResult>),
   calls: { count: number }
 ): EngineAdapter {
   return {
     name,
     async run(input) {
       calls.count += 1;
-      return typeof result === "function" ? result(input.workspace) : result;
+      return typeof result === "function"
+        ? result(input.workspace, input.budget.minutes)
+        : result;
     },
   };
 }
@@ -132,15 +137,24 @@ test("infra-pad głównego przechodzi na zapas z jawną metryką, artefaktem i p
   await withFixture("success", async ({ root, repo }) => {
     const primaryCalls = { count: 0 };
     const fallbackCalls = { count: 0 };
+    const budgets: number[] = [];
     const runtime = runtimeWith(
       repo,
-      adapter("primary", {
-        ok: false,
-        report: "failed to lookup address information",
-        stderr: "failed to lookup address information",
-        costUsd: 1,
+      adapter("primary", async (_workspace, budgetMinutes) => {
+        budgets.push(budgetMinutes);
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        return {
+          ok: false,
+          report: "failed to lookup address information",
+          stderr: "failed to lookup address information",
+          terminationReason: "process-error",
+          costUsd: 1,
+        };
       }, primaryCalls),
-      adapter("fallback", { ok: true, report: validPlan, costUsd: 2 }, fallbackCalls)
+      adapter("fallback", async (_workspace, budgetMinutes) => {
+        budgets.push(budgetMinutes);
+        return { ok: true, report: validPlan, costUsd: 2 };
+      }, fallbackCalls)
     );
 
     const output = await executeFactoryJobInput(
@@ -153,10 +167,12 @@ test("infra-pad głównego przechodzi na zapas z jawną metryką, artefaktem i p
     assert.equal(output.outcome, "success");
     assert.equal(output.costUsd, 3);
     assert.deepEqual([primaryCalls.count, fallbackCalls.count], [1, 1]);
+    assert.equal(budgets[0], 20);
+    assert.ok(budgets[1] > 0 && budgets[1] < budgets[0]);
     assert.deepEqual(output.engineFallback, {
       from: "primary/primary-model@high",
       to: "fallback/fallback-model@high",
-      reason: "failed to lookup address information",
+      reason: "failed to lookup address information\nprocess-error",
     });
     assert.match(output.signature, /fallback.*fallback-model@high.*planner/);
 
@@ -169,7 +185,7 @@ test("infra-pad głównego przechodzi na zapas z jawną metryką, artefaktem i p
       rows.map((row) => [row.engine, row.costUsd, row.fallbackDecision]),
       [
         ["primary/primary-model@high", 1, "used"],
-        ["fallback/fallback-model@high", 2, undefined],
+        ["fallback/fallback-model@high", 2, "used"],
       ]
     );
     assert.equal(rows[1].engineFallback, "primary/primary-model@high → fallback/fallback-model@high");
@@ -185,6 +201,12 @@ test("infra-pad głównego przechodzi na zapas z jawną metryką, artefaktem i p
       artifact,
       /^engineFallback: primary\/primary-model@high → fallback\/fallback-model@high$/m
     );
+    const primaryArtifact = await readFile(
+      join(root, "runs", ticket.id, "run-success", "plan-attempt-1-primary.md"),
+      "utf8"
+    );
+    assert.match(primaryArtifact, /^engine: primary\/primary-model@high$/m);
+    assert.match(primaryArtifact, /failed to lookup address information/);
   });
 });
 
@@ -267,6 +289,7 @@ test("pad zapasu kończy etap bez trzeciej próby", async () => {
         ok: false,
         report: "getaddrinfo ENOTFOUND primary",
         stderr: "getaddrinfo ENOTFOUND primary",
+        terminationReason: "process-error",
         costUsd: 1,
       }, primaryCalls),
       adapter("fallback", { ok: false, report: "getaddrinfo ENOTFOUND fallback", costUsd: 2 }, fallbackCalls)
@@ -364,6 +387,7 @@ test("build czyści częściową pracę głównego silnika przed zapasem", async
           ok: false,
           report: "failed to connect to websocket",
           stderr: "failed to connect to websocket",
+          terminationReason: "process-error",
           costUsd: 1,
         };
       }, primaryCalls),
@@ -400,7 +424,6 @@ test("classifyEngineFailure rozdziela awarie infrastruktury od wyników pracy", 
     "credit balance is too low",
     "429 rate limit",
     "spawn claude ENOENT",
-    "Proces codex zakończył się błędem (process-error)",
     "request timeout",
   ]) {
     assert.equal(classifyEngineFailure(message), "infra", message);
@@ -410,6 +433,8 @@ test("classifyEngineFailure rozdziela awarie infrastruktury od wyników pracy", 
     "brak werdyktu",
     "recenzja z uwagami",
     "budżet ticketu wyczerpany",
+    "Proces codex zakończył się błędem (process-error)",
+    "insufficient permissions do pliku roboczego",
   ]) {
     assert.equal(classifyEngineFailure(message), "work", message);
   }
@@ -419,16 +444,42 @@ test("klasyfikacja wyniku nie traktuje prozy modelu jak diagnostyki", () => {
   assert.equal(classifyEngineRunFailure({
     report: "Plan opisuje 429 rate limit, timeout uwierzytelniania i websocket.",
   }), "work");
-  assert.equal(classifyEngineRunFailure({ report: "" }), "infra");
+  assert.equal(classifyEngineRunFailure({ report: "" }), "work");
   assert.equal(classifyEngineRunFailure({
     report: "",
     stderr: "nieznany komunikat diagnostyczny",
-  }), "infra");
+  }), "work");
   assert.equal(classifyEngineRunFailure({
     report: "Model zdążył opisać timeout jako wymaganie.",
     stderr: "failed to connect to websocket",
     terminationReason: "process-error",
   }), "infra");
+  assert.equal(classifyEngineRunFailure({
+    report: "Proces codex zakończył się błędem (process-error).",
+    stderr: "warning: insufficient permissions in a tool subprocess",
+    terminationReason: "process-error",
+  }), "work");
+  assert.equal(classifyEngineRunFailure({
+    report: "Model nie zwrócił werdyktu.",
+    stderr: [
+      "failed to connect to websocket",
+      ...Array.from({ length: 9 }, (_, index) => `warning ${index}`),
+    ].join("\n"),
+    terminationReason: "process-error",
+  }), "work");
+  assert.equal(classifyEngineRunFailure({
+    report: [
+      "Proces codex zakończył się błędem (process-error). stderr:",
+      "failed to connect to websocket",
+      ...Array.from({ length: 9 }, (_, index) => `warning ${index}`),
+    ].join("\n"),
+    terminationReason: "process-error",
+  }), "work");
+  assert.equal(classifyEngineRunFailure({
+    report: "",
+    stderr: "failed to connect to websocket",
+    terminationReason: "empty-report",
+  }), "work");
   assert.equal(classifyEngineRunFailure({
     report: "",
     stderr: "SIGTERM",
@@ -513,7 +564,7 @@ test("codex i claude-code wystawiają stderr oraz przyczynę zakończenia poza r
     assert.equal(silentResult.ok, false);
     assert.equal(silentResult.report, "");
     assert.equal(silentResult.terminationReason, "empty-report");
-    assert.equal(classifyEngineRunFailure(silentResult), "infra");
+    assert.equal(classifyEngineRunFailure(silentResult), "work");
   } finally {
     await rm(root, { recursive: true, force: true });
   }

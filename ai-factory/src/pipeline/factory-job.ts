@@ -230,6 +230,7 @@ function fallbackMetricFields(attempt: EngineAttempt): {
     return {
       engineFallback: `${attempt.fallback.from} → ${attempt.fallback.to}`,
       fallbackReason: attempt.fallback.reason,
+      fallbackDecision: attempt.fallbackDecision,
     };
   }
   return attempt.fallbackDecision
@@ -258,21 +259,22 @@ async function runEngineWithFallback(
     metricStage: MetricRow["stage"];
     attempt: number;
     baseSha?: string;
+    budgetMinutes: number;
   },
-  invoke: (route: Route) => Promise<EngineRunResult>,
+  invoke: (route: Route, budgetMinutes: number) => Promise<EngineRunResult>,
   beforeFallback?: () => Promise<void>
 ): Promise<EngineAttempt> {
   const primary = candidates[0];
   if (!primary) throw new Error(`Routing ${stage} nie zwrócił głównego kandydata.`);
 
-  const runOne = async (route: Route) => {
+  const runOne = async (route: Route, budgetMinutes: number) => {
     const startedAt = Date.now();
-    const result = await invoke(route);
+    const result = await invoke(route, budgetMinutes);
     const durationMs = Date.now() - startedAt;
     return { result, durationMs, ...effectiveCost(result, durationMs) };
   };
 
-  const first = await runOne(primary);
+  const first = await runOne(primary, ctx.budgetMinutes);
   if (first.result.ok) {
     return {
       result: first.result,
@@ -308,6 +310,14 @@ async function runEngineWithFallback(
     };
   }
 
+  const diagnostic = engineFailureDiagnostic(first.result);
+  const fallbackRoute = candidates[1];
+  const fallback: EngineFallback = {
+    from: primary.spec,
+    to: fallbackRoute.spec,
+    reason: (diagnostic || "silnik nie zwrócił raportu ani diagnostyki").slice(0, 200),
+  };
+
   // Osobny wiersz próby głównej istnieje wyłącznie wtedy, gdy faktycznie
   // uruchamiamy drugi silnik. Bez zapasu etap zapisuje swój dotychczasowy,
   // bogatszy wiersz metryki (np. humanSummary/resumed).
@@ -325,15 +335,38 @@ async function runEngineWithFallback(
     fallbackDecision: decision,
   });
 
-  const fallbackRoute = candidates[1];
+  const primaryReport = first.result.transcript ?? first.result.report;
+  const diagnosticSection = diagnostic && !primaryReport.includes(diagnostic)
+    ? `\n\n## Diagnostyka adaptera\n\n${diagnostic}`
+    : "";
+  await saveArtifact(
+    ctx.ticket,
+    ctx.runId,
+    `${ctx.metricStage}-attempt-${ctx.attempt}-primary.md`,
+    artifactHeader({
+      jobId: ctx.runId,
+      ticket: ctx.ticket,
+      sha: ctx.baseSha,
+      step: ctx.metricStage,
+      attempt: ctx.attempt,
+      outcome: "engine-fail",
+      ...signatureMeta(buildSignature(stage, primary)),
+      engine: primary.spec,
+      costUsd: first.costUsd,
+      durationMs: first.durationMs,
+      fallbackDecision: decision,
+    }) + primaryReport + diagnosticSection
+  );
+
   await beforeFallback?.();
-  const diagnostic = engineFailureDiagnostic(first.result);
-  const fallback: EngineFallback = {
-    from: primary.spec,
-    to: fallbackRoute.spec,
-    reason: (diagnostic || "silnik nie zwrócił raportu ani diagnostyki").slice(0, 200),
-  };
-  const second = await runOne(fallbackRoute);
+  // Dwie próby współdzielą dotychczasowy budżet roli. Minimalny dodatni limit
+  // (1 ms) zapobiega znaczeniu "brak timeoutu" dla wartości 0 po pełnym
+  // timeoutcie próby głównej i nadal mieści całość w tym samym lease.
+  const fallbackBudgetMinutes = Math.max(
+    1 / 60_000,
+    ctx.budgetMinutes - first.durationMs / 60_000
+  );
+  const second = await runOne(fallbackRoute, fallbackBudgetMinutes);
   return {
     result: second.result,
     route: fallbackRoute,
@@ -508,15 +541,22 @@ async function runPlan(
         "plan",
         candidates,
         input.allowEngineFallback !== false,
-        { ticket: input.ticket.id, runId, metricStage: "plan", attempt: input.attempt, baseSha: base.sha },
-        (route) => route.engine.run({
+        {
+          ticket: input.ticket.id,
+          runId,
+          metricStage: "plan",
+          attempt: input.attempt,
+          baseSha: base.sha,
+          budgetMinutes: JOB_BUDGET_MINUTES.plan,
+        },
+        (route, budgetMinutes) => route.engine.run({
           role: "plan",
           model: route.model,
           effort: route.effort,
           instructions: planInstructions,
           context: planContext(input),
           workspace: base.dir,
-          budget: { minutes: JOB_BUDGET_MINUTES.plan },
+          budget: { minutes: budgetMinutes },
           signal,
         })
       );
@@ -631,15 +671,22 @@ async function runTriage(
         "triage",
         candidates,
         input.allowEngineFallback !== false,
-        { ticket: input.ticket.id, runId, metricStage: "triage", attempt: input.attempt, baseSha: base.sha },
-        (route) => route.engine.run({
+        {
+          ticket: input.ticket.id,
+          runId,
+          metricStage: "triage",
+          attempt: input.attempt,
+          baseSha: base.sha,
+          budgetMinutes: JOB_BUDGET_MINUTES.triage,
+        },
+        (route, budgetMinutes) => route.engine.run({
           role: "plan",
           model: route.model,
           effort: route.effort,
           instructions: triageInstructions,
           context: planContext(input),
           workspace: base.dir,
-          budget: { minutes: JOB_BUDGET_MINUTES.triage },
+          budget: { minutes: budgetMinutes },
           signal,
         })
       );
@@ -764,8 +811,15 @@ async function runResearch(
         "research",
         candidates,
         input.allowEngineFallback !== false,
-        { ticket: input.ticket.id, runId, metricStage: stage, attempt: input.attempt, baseSha: base.sha },
-        (route) => route.engine.run({
+        {
+          ticket: input.ticket.id,
+          runId,
+          metricStage: stage,
+          attempt: input.attempt,
+          baseSha: base.sha,
+          budgetMinutes: JOB_BUDGET_MINUTES.research,
+        },
+        (route, budgetMinutes) => route.engine.run({
           role: "plan",
           model: route.model,
           effort: route.effort,
@@ -775,7 +829,7 @@ async function runResearch(
             input.triageSummary ? `# Klasyfikacja triage\n${input.triageSummary}` : "",
           ].filter(Boolean).join("\n\n"),
           workspace: base.dir,
-          budget: { minutes: JOB_BUDGET_MINUTES.research },
+          budget: { minutes: budgetMinutes },
           signal,
         })
       );
@@ -890,8 +944,15 @@ async function runSynthesis(
         "synthesis",
         candidates,
         input.allowEngineFallback !== false,
-        { ticket: input.ticket.id, runId, metricStage: "synthesis", attempt: input.attempt, baseSha: base.sha },
-        (route) => route.engine.run({
+        {
+          ticket: input.ticket.id,
+          runId,
+          metricStage: "synthesis",
+          attempt: input.attempt,
+          baseSha: base.sha,
+          budgetMinutes: JOB_BUDGET_MINUTES.synthesis,
+        },
+        (route, budgetMinutes) => route.engine.run({
           role: "plan",
           model: route.model,
           effort: route.effort,
@@ -902,7 +963,7 @@ async function runSynthesis(
             briefsContext(input.briefs),
           ].filter(Boolean).join("\n\n"),
           workspace: base.dir,
-          budget: { minutes: JOB_BUDGET_MINUTES.synthesis },
+          budget: { minutes: budgetMinutes },
           signal,
         })
       );
@@ -1052,8 +1113,15 @@ async function runCritique(
         "critique",
         candidates,
         input.allowEngineFallback !== false,
-        { ticket: input.ticket.id, runId, metricStage: "critique", attempt: input.attempt, baseSha: base.sha },
-        (route) => route.engine.run({
+        {
+          ticket: input.ticket.id,
+          runId,
+          metricStage: "critique",
+          attempt: input.attempt,
+          baseSha: base.sha,
+          budgetMinutes: JOB_BUDGET_MINUTES.critique,
+        },
+        (route, budgetMinutes) => route.engine.run({
           role: "plan",
           model: route.model,
           effort: route.effort,
@@ -1066,7 +1134,7 @@ async function runCritique(
             input.briefs?.recon ? `# Brief RECON (do cross-checku files)\n${input.briefs.recon}` : "",
           ].filter(Boolean).join("\n\n"),
           workspace: base.dir,
-          budget: { minutes: JOB_BUDGET_MINUTES.critique },
+          budget: { minutes: budgetMinutes },
           signal,
         })
       );
@@ -1248,8 +1316,14 @@ async function runBuild(
     "build",
     candidates,
     input.allowEngineFallback !== false,
-    { ticket: input.ticket.id, runId, metricStage: "build", attempt: input.attempt },
-    (route) => route.engine.run({
+    {
+      ticket: input.ticket.id,
+      runId,
+      metricStage: "build",
+      attempt: input.attempt,
+      budgetMinutes: JOB_BUDGET_MINUTES.build,
+    },
+    (route, budgetMinutes) => route.engine.run({
       role: "build",
       model: route.model,
       effort: route.effort,
@@ -1272,7 +1346,7 @@ async function runBuild(
         feedback,
       ].filter(Boolean).join("\n\n"),
       workspace: workspace.dir,
-      budget: { minutes: JOB_BUDGET_MINUTES.build },
+      budget: { minutes: budgetMinutes },
       signal,
     }),
     async () => {
@@ -1460,8 +1534,15 @@ async function runReview(
       "review",
       candidates,
       input.allowEngineFallback !== false,
-      { ticket: input.ticket.id, runId, metricStage: "review", attempt: input.attempt, baseSha: input.headSha },
-      (route) => route.engine.run({
+      {
+        ticket: input.ticket.id,
+        runId,
+        metricStage: "review",
+        attempt: input.attempt,
+        baseSha: input.headSha,
+        budgetMinutes: JOB_BUDGET_MINUTES.review,
+      },
+      (route, budgetMinutes) => route.engine.run({
         role: "review",
         model: route.model,
         effort: route.effort,
@@ -1483,7 +1564,7 @@ async function runReview(
           `# Zmiany\n${manifest.nameStatus}\n\n${manifest.diffStat}`,
         ].filter(Boolean).join("\n\n"),
         workspace: checkout.dir,
-        budget: { minutes: JOB_BUDGET_MINUTES.review },
+        budget: { minutes: budgetMinutes },
         signal,
       })
     );
