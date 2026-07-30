@@ -210,8 +210,11 @@ for reading/migration tests, but they are not connected to the runtime.
 - Deep-plan v3: a triage failure degrades to the solo path (never blocks); one
   research role failing after 1 auto-retry produces an explicit ⚠️ degradation
   at the gate; critique is advisory (engine ≠ synthesis) with a ONE-revision
-  limit; all degradations are visible in the `/approve` comment together with
-  the cost.
+  limit. The `/approve` comment starts with a product-language human summary,
+  followed by one sentence explaining critique issues, degradations, cost, and
+  only then the full technical plan. Missing human-facing sections are
+  fail-open and recorded as `summary-missing` in `runs/metrics.jsonl`; they do
+  not change the strict machine verdict.
 - Every Done records an experiment row (`runs/experiments.jsonl`) with the
   process variant, per-stage costs, and model signatures from actual attempts;
   `/score 1-5` attaches the human rating. Report:

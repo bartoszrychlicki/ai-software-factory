@@ -26,6 +26,11 @@ export interface MetricRow {
   durationMs?: number;
   /** Czy wywołanie planera wznowiło sesję CLI (BAR-136). */
   resumed?: boolean;
+  /**
+   * Obserwacja, czy model dotrzymał instrukcji streszczenia (BAR-187).
+   * Nie wpływa na `ok` ani `outcome`.
+   */
+  humanSummary?: "summary-present" | "summary-missing";
 }
 
 export async function recordMetric(row: Omit<MetricRow, "ts">): Promise<void> {

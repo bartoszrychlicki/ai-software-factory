@@ -23,6 +23,7 @@ import {
 } from "./verdicts";
 import { changeManifest } from "./quality";
 import { auditScope, changedFilesInWorkspace } from "./scope";
+import { critiqueMeaningOf, humanSummaryOf } from "./human-summary";
 import type { Route, Stage } from "./routing";
 import type { ProjectConfig } from "./projects";
 
@@ -95,6 +96,8 @@ export const factoryJobOutputSchema = z.object({
   critiqueVerdict: z.enum(["ok", "issues", "unavailable"]).optional(),
   /** Skoncentrowane uwagi krytyka — feedback rewizji syntezy i sekcja bramki. */
   critiqueIssues: z.string().optional(),
+  /** Jedno zdanie dla autora ticketu; tekst prezentacyjny poza kontraktem `factory`. */
+  critiqueMeaning: z.string().optional(),
 });
 
 export type FactoryJobInput = z.infer<typeof factoryJobInputSchema>;
@@ -160,6 +163,10 @@ const planInstructions = [
   "Każda zmiana .github/, katalogu ops lub migracji musi być jawnie wymieniona.",
   "Jeżeli potrzebujesz odpowiedzi człowieka, zadaj ponumerowane pytania z A/B/C i rekomendacją.",
   "Nie używaj sesji ani suspend/resume. Każdy job planowania jest bezstanowy.",
+  "ZACZNIJ raport sekcją `## Podsumowanie dla człowieka` — językiem product managera, bez nazw plików, bez API, bez żargonu.",
+  "Sekcja ma zawierać pięć krótkich bloków: `**Co dostaniesz**`, `**Dlaczego tak**`, `**Czego świadomie NIE robimy**`, `**Kompromisy i czego to nie naprawi**`, `**Jak poznasz, że działa**`.",
+  "Bloki `Czego świadomie NIE robimy` i `Kompromisy i czego to nie naprawi` są OBOWIĄZKOWE; jawnie wymień kompromisy bezpieczeństwa, wydajności i UX, jeżeli plan je zawiera.",
+  "Ta sekcja NIE jest częścią kontraktu maszynowego — nie wstawiaj jej do bloku ```factory.",
   verdictInstruction("plan"),
 ].join("\n");
 
@@ -194,6 +201,7 @@ async function runPlan(
   const durationMs = Date.now() - startedAt;
   const { costUsd, costSource } = effectiveCost(result, durationMs);
   const report = result.transcript ?? result.report;
+  const summary = humanSummaryOf(report);
   const verdict = parsePlanVerdict(report);
   const outcome = !result.ok || verdict.source === "missing"
     ? "failed"
@@ -214,6 +222,7 @@ async function runPlan(
     costUsd,
     durationMs,
     resumed: false,
+    humanSummary: summary ? "summary-present" : "summary-missing",
   });
   await saveArtifact(
     input.ticket.id,
@@ -453,6 +462,10 @@ const synthesisInstructions = [
   "Każda zmiana .github/, katalogu ops lub migracji musi być jawnie wymieniona.",
   "Jeżeli mimo briefów potrzebujesz odpowiedzi człowieka, zadaj ponumerowane pytania z A/B/C i rekomendacją.",
   "Nie używaj sesji ani suspend/resume. Każdy job syntezy jest bezstanowy.",
+  "ZACZNIJ raport sekcją `## Podsumowanie dla człowieka` — językiem product managera, bez nazw plików, bez API, bez żargonu.",
+  "Sekcja ma zawierać pięć krótkich bloków: `**Co dostaniesz**`, `**Dlaczego tak**`, `**Czego świadomie NIE robimy**`, `**Kompromisy i czego to nie naprawi**`, `**Jak poznasz, że działa**`.",
+  "Bloki `Czego świadomie NIE robimy` i `Kompromisy i czego to nie naprawi` są OBOWIĄZKOWE; jawnie wymień kompromisy bezpieczeństwa, wydajności i UX, jeżeli plan je zawiera.",
+  "Ta sekcja NIE jest częścią kontraktu maszynowego — nie wstawiaj jej do bloku ```factory.",
   verdictInstruction("plan"),
 ].join("\n");
 
@@ -482,6 +495,7 @@ async function runSynthesis(
   const durationMs = Date.now() - startedAt;
   const { costUsd, costSource } = effectiveCost(result, durationMs);
   const report = result.transcript ?? result.report;
+  const summary = humanSummaryOf(report);
   const verdict = parsePlanVerdict(report);
   const outcome = !result.ok || verdict.source === "missing"
     ? "failed"
@@ -500,6 +514,7 @@ async function runSynthesis(
     outcome,
     costUsd,
     durationMs,
+    humanSummary: summary ? "summary-present" : "summary-missing",
   });
   await saveArtifact(
     input.ticket.id,
@@ -545,6 +560,7 @@ const critiqueInstructions = [
   "4. Czy założenia planu zgadzają się ze stanem repo (nazwy, API, istniejące zachowania)?",
   "5. Czy zakres jest minimalny — bez zmian niewynikających z ticketu?",
   "Uwagi podawaj ponumerowane, z priorytetem i konkretną poprawką.",
+  "Dodaj przed werdyktem sekcję `## Co to znaczy dla autora` — JEDNO zdanie po ludzku, co uwagi oznaczają dla autora ticketu (np. „Plan może przejść testy, nie rozwiązując zgłoszonego problemu”).",
   verdictInstruction("critique"),
 ].join("\n");
 
@@ -613,6 +629,7 @@ async function runCritique(
   const durationMs = Date.now() - startedAt;
   const { costUsd, costSource } = effectiveCost(result, durationMs);
   const report = result.transcript ?? result.report;
+  const critiqueMeaning = critiqueMeaningOf(report);
   const verdict = parseCritiqueVerdict(report);
   const critiqueVerdict = !result.ok || verdict.source === "missing" ? "unavailable" : verdict.verdict;
   await recordMetric({
@@ -654,6 +671,7 @@ async function runCritique(
     durationMs,
     critiqueVerdict,
     critiqueIssues: critiqueVerdict === "issues" ? clip(verdict.issues, CRITIQUE_CLIP_CHARS) : undefined,
+    critiqueMeaning,
     files: [],
     changedFiles: [],
     scopeWarnings: [],

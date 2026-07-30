@@ -16,6 +16,11 @@ import {
   REVIEW_CLIP_CHARS,
   type FactoryJobOutput,
 } from "./factory-job";
+import {
+  HUMAN_SUMMARY_HEADING,
+  humanSummaryOf,
+  stripSection,
+} from "./human-summary";
 import { authorizeScopePaths, scopeBlockedPaths } from "./scope";
 
 type NewCommand = Omit<
@@ -148,6 +153,7 @@ const PLAN_RESET_PATCH = {
   fixRound: 0,
   critiqueVerdict: undefined,
   critiqueReport: undefined,
+  critiqueMeaning: undefined,
   degradations: undefined,
   // Ocena /score dotyczy generacji, którą oceniano — nowa generacja startuje
   // bez niej (inaczej summary N+1 dziedziczyłoby rating generacji N).
@@ -197,7 +203,7 @@ function retireGenerationCommand(run: LifecycleRun, reason: string): NewCommand 
 }
 
 /**
- * Komentarz bramki aprobat: plan + werdykt krytyki + jawne degradacje + koszt.
+ * Komentarz bramki: streszczenie → krytyka → degradacje → koszt → pełny plan.
  * Człowiek decyduje z pełnym obrazem; mechanika /approve i /reject bez zmian.
  */
 function approvalGateComment(
@@ -208,10 +214,18 @@ function approvalGateComment(
   const header = run.planVariant === "deep"
     ? "🧠 **Plan gotowy (deep: research ×3 → synteza → krytyka)**"
     : "🧠 **Plan gotowy**";
+  const summary = humanSummaryOf(run.plan);
+  const summarySection = summary
+    ? `📋 **Podsumowanie dla człowieka**\n\n${summary}`
+    : "";
   const critiqueSection = run.critiqueVerdict === "ok"
     ? "✅ **Krytyka planu** (niezależny silnik): bez zastrzeżeń."
     : run.critiqueVerdict === "issues"
-      ? `⚠️ **Krytyka planu — uwagi (advisory, po ${run.critiqueRound ? "1 rewizji" : "0 rewizjach"}):**\n\n${run.critiqueReport ?? ""}`
+      ? [
+          `⚠️ **Krytyka planu — uwagi (advisory, po ${run.critiqueRound ? "1 rewizji" : "0 rewizjach"}):**`,
+          run.critiqueMeaning ? `> ${run.critiqueMeaning}` : "",
+          run.critiqueReport ?? "",
+        ].filter(Boolean).join("\n\n")
       : run.critiqueVerdict === "unavailable"
         ? "⚠️ **Krytyka planu niedostępna** — plan idzie na bramkę bez adwersaryjnego sprawdzenia."
         : "";
@@ -221,14 +235,17 @@ function approvalGateComment(
   const cost = opts.usage
     ? `Koszt planowania dotychczas: $${opts.usage.usd.toFixed(2)} (${opts.usage.minutes.toFixed(1)} min sumy jobów).`
     : "";
+  const technicalPlan = stripSection(run.plan ?? "", HUMAN_SUMMARY_HEADING);
   const body = [
     header,
-    run.triageSummary ? `> Triage: ${run.triageSummary}` : "",
-    run.plan ?? "",
-    "---",
+    summarySection,
     critiqueSection,
     degradations,
     cost,
+    run.triageSummary ? `> Triage: ${run.triageSummary}` : "",
+    "---",
+    "🔧 **Plan techniczny**",
+    technicalPlan,
     "Zatwierdź wyłącznie komendą `/approve` albo odrzuć: `/reject <powód>`.",
   ].filter(Boolean).join("\n\n");
   return linearComment(run, suffix, body, "approval", opts.signature);
@@ -1123,6 +1140,7 @@ export function reduceLifecycle(run: LifecycleRun, event: CoordinatorEvent): Coo
           critiqueRound: 1,
           critiqueVerdict: verdict,
           critiqueReport: issues,
+          critiqueMeaning: event.output.critiqueMeaning ?? run.critiqueMeaning,
           feedback: issues,
         };
         const nextRun: LifecycleRun = { ...run, ...revisionPatch };
@@ -1150,6 +1168,7 @@ export function reduceLifecycle(run: LifecycleRun, event: CoordinatorEvent): Coo
       const gatePatch = {
         critiqueVerdict: verdict,
         critiqueReport: issues ?? run.critiqueReport,
+        critiqueMeaning: event.output.critiqueMeaning ?? run.critiqueMeaning,
         degradations,
       };
       return {
