@@ -22,6 +22,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { buildCommentContextSnapshot } from "./comment-context";
 import {
+  bareCommandsFor,
   isCommandAttempt,
   parseCommand,
   parseScorePayload,
@@ -270,13 +271,13 @@ function emitTransitionNotification(
     message = `${after.errorCode ?? reason}: ${(after.errorMessage ?? "").slice(0, 300)}`;
   } else if (after.stage === "approval" && after.status === "waiting_human") {
     title = `⏳ ${after.ticketId}: plan do akceptacji`;
-    message = "Zatwierdź `/approve` albo odrzuć `/reject <powód>`.";
+    message = "Zatwierdź `approve` (albo `/approve`) lub odrzuć `reject <powód>` (albo `/reject <powód>`).";
   } else if (
     (after.stage === "plan" || after.stage === "triage" || after.stage === "synthesis") &&
     after.status === "waiting_human"
   ) {
     title = `❓ ${after.ticketId}: pytania planera`;
-    message = `Runda ${after.clarifyRound}/2 — odpowiedz \`/answer <treść>\`.`;
+    message = `Runda ${after.clarifyRound}/2 — odpowiedz \`answer <treść>\` (albo \`/answer <treść>\`).`;
   } else if (after.stage === "merge" && after.status === "waiting_human" && before.stage !== "merge") {
     title = `✅ ${after.ticketId}: PR gotowy do merge`;
     message = `Review: ${after.reviewStatus ?? "advisory"} — ${after.prUrl ?? ""}`;
@@ -1213,9 +1214,10 @@ function enqueueUnknownCommandHint(
 async function processCommands(deps: PollerDependencies, run: LifecycleRun): Promise<void> {
   const source = sourceFor(deps, run);
   const comments = await source.listComments(run.ticketId);
+  const allowedBare = bareCommandsFor(run);
   for (const comment of comments) {
     if (deps.store.isCommentProcessed(comment.id) || comment.body.includes(marker(run.ticketId))) continue;
-    const parsed = parseCommand(comment.body);
+    const parsed = parseCommand(comment.body, allowedBare);
     if (!parsed) {
       if (isCommandAttempt(comment.body)) enqueueUnknownCommandHint(deps, run, comment);
       continue;
@@ -1260,7 +1262,13 @@ async function processCommands(deps: PollerDependencies, run: LifecycleRun): Pro
           run.ticketId,
           ticket.title,
           ticket.description,
-          comments
+          comments,
+          {
+            executedCommandIds: new Set([
+              ...deps.store.processedCommandIds(run.ticketId),
+              comment.id,
+            ]),
+          }
         );
         event.inputHash = snapshot.effectiveInputHash;
         event.commentContext = snapshot.context || undefined;
@@ -1276,6 +1284,7 @@ async function processCommands(deps: PollerDependencies, run: LifecycleRun): Pro
       deps.store.markCommentProcessed(run.ticketId, comment.id, parsed.kind);
       return;
     } catch (error) {
+      if (parsed.form === "bare") continue;
       await source.comment(
         run.ticketId,
         `ℹ️ Komenda \`${comment.body.split(/\s+/)[0]}\` jest teraz niedozwolona: ${error instanceof Error ? error.message : error}\n\n${marker(run.ticketId)}`
@@ -1306,7 +1315,8 @@ async function detectInputChange(
     run.ticketId,
     ticket.title,
     ticket.description,
-    comments
+    comments,
+    { executedCommandIds: deps.store.processedCommandIds(run.ticketId) }
   );
   if (snapshot.effectiveInputHash === run.manifest.inputHash) return run;
   await cancelActiveJobs(deps, run.ticketId);
@@ -1495,7 +1505,7 @@ export async function sweepScores(deps: PollerDependencies): Promise<void> {
     const comments = await source.listComments(run.ticketId).catch(() => []);
     for (const comment of comments) {
       if (deps.store.isCommentProcessed(comment.id) || comment.body.includes(marker(run.ticketId))) continue;
-      const parsed = parseCommand(comment.body);
+      const parsed = parseCommand(comment.body, new Set(["score"]));
       if (!parsed && isCommandAttempt(comment.body)) {
         enqueueUnknownCommandHint(deps, run, comment);
         continue;

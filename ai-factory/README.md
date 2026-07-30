@@ -110,16 +110,29 @@ Fabryka używa wyłącznie stanów `Todo → In Progress → In Review → Done`
 `👤 ⛔ Zablokowany` i `Canceled`. Zmiana fazy przez przeciąganie karty nie jest
 decyzją workflow.
 
-- `/approve` — zatwierdza bieżący plan;
-- `/reject <powód>` — zatrzymuje plan;
-- `/answer <odpowiedź>` — odpowiada na pytania plannera (maks. dwie rundy;
+- `approve` albo `/approve` — zatwierdza bieżący plan;
+- `reject <powód>` albo `/reject <powód>` — zatrzymuje plan;
+- `answer <odpowiedź>` albo `/answer <odpowiedź>` — odpowiada na pytania
+  plannera (maks. dwie rundy;
   rundę 1 może zadać triage, rundę 2 synteza);
-- `/retry` — ponawia wyłącznie zatrzymany etap;
-- `/replan <powód>` — unieważnia plan i tworzy nową generację;
-- `/restart` — tymczasowy alias `/replan`;
-- `/done` — potwierdza ręczne wykonanie zatwierdzonej checklisty ops;
-- `/score 1-5 [komentarz]` — ocena jakości wyniku do danych eksperymentu
-  (działa także po Done, do 14 dni).
+- `retry` albo `/retry` — ponawia wyłącznie zatrzymany etap;
+- `replan <powód>` albo `/replan <powód>` — unieważnia plan i tworzy nową
+  generację;
+- `restart` albo `/restart` — tymczasowy alias `replan`;
+- `done` albo `/done` — potwierdza ręczne wykonanie zatwierdzonej checklisty
+  ops;
+- `score 1-5 [komentarz]` albo `/score 1-5 [komentarz]` — ocena jakości wyniku
+  do danych eksperymentu (działa także po Done, do 14 dni).
+
+Forma z ukośnikiem działa jak dotychczas. Goła forma jest rozpoznawana
+case-insensitive tylko wtedy, gdy jej dokładny pierwszy token i payload są
+ważne dla bieżącej bramki: approval, otwartych pytań, checklisty ops, blokady
+albo aktywnego runu; `score` działa przy runie aktywnym lub Done. W innym
+kontekście komentarz pozostaje zwykłą treścią autora i nie dostaje hintu.
+Nie ma fuzzy matchingu ani tolerancji literówek.
+
+Gołe komendy omijają konflikt z edytorem Lineara, w którym wpisanie `/` otwiera
+modal formatowania (incydent BAR-183 #2).
 
 Labele `plan:solo` / `plan:deep` wymuszają ścieżkę planowania w projektach v3.
 
