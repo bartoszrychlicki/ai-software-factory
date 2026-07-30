@@ -70,7 +70,11 @@ import { execFileControlled } from "../pipeline/process-control";
 import { evaluateGithubChecks, inspectPullRequestChecks } from "../pipeline/github-ci";
 import { runProdChecks } from "../pipeline/prod-smoke";
 import { notify } from "../pipeline/notify";
-import { parseSignatureLine, POLLER_SIGNATURE } from "../pipeline/signature";
+import {
+  parseSignatureLine,
+  POLLER_SIGNATURE,
+  signatureLine,
+} from "../pipeline/signature";
 import { progressComment, type ProgressCommentContext } from "../pipeline/progress";
 import { resolveRoute } from "../pipeline/routing";
 import { extendedStatusName, LINEAR_STATE_MAP } from "./state-map";
@@ -806,7 +810,11 @@ async function dispatchExternal(
     const body = [
       String(command.payload.body),
       "",
-      `Signature: ${String(command.payload.signature)}`,
+      `Signature: ${
+        command.payload.signature
+          ? String(command.payload.signature)
+          : signatureLine(POLLER_SIGNATURE)
+      }`,
       `Ticket: ${run.ticketId}`,
       `SHA: ${run.headSha}`,
       `Outcome: ${run.reviewStatus ?? "advisory"}`,
@@ -1376,7 +1384,13 @@ async function reconcilePullRequest(deps: PollerDependencies, run: LifecycleRun)
       state: "closed",
       sha: pr.headRefOid ?? run.headSha ?? "",
     }));
-  } else if (pr.headRefOid && pr.headRefOid !== run.headSha) {
+  } else if (
+    pr.headRefOid &&
+    pr.headRefOid !== run.headSha &&
+    ["ci", "review", "merge"].includes(run.stage)
+  ) {
+    // W build/test/publish lokalny pipeline jest z przodu: świeży checkpoint
+    // nie został jeszcze wypchnięty, więc źródłem prawdy nie jest stary PR head.
     await cancelActiveJobs(deps, run.ticketId);
     applyDecision(deps, run.ticketId, reduceLifecycle(run, {
       type: "pr-head-changed",
@@ -1445,6 +1459,8 @@ function enqueueUnknownCommandHint(
         blockedStage: run.blockedStage,
         planDomain: run.planDomain,
         approvedAt: run.approvedAt,
+        reviewStatus: run.reviewStatus,
+        fixRound: run.fixRound,
       }),
     },
   });
@@ -1487,6 +1503,17 @@ async function processCommands(deps: PollerDependencies, run: LifecycleRun): Pro
           ? deps.store.nextAttempt(run.ticketId, attemptStage)
           : undefined,
         nextAttempts: followUpAttempts(deps.store, run.ticketId),
+      };
+    }
+    else if (parsed.kind === "fix") {
+      const reviewAttempt = deps.store.latestAttempt(run.ticketId, "review");
+      event = {
+        type: "fix",
+        commentId: comment.id,
+        hints: parsed.payload,
+        reviewReport: reviewAttempt?.report,
+        reviewSha: reviewAttempt?.sha,
+        nextAttempt: deps.store.nextAttempt(run.ticketId, "build"),
       };
     }
     else if (parsed.kind === "replan" || parsed.kind === "restart") event = {

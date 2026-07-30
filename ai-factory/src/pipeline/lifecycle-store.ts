@@ -105,6 +105,8 @@ export interface LifecycleRun {
   researchFailures?: Partial<Record<ResearchRole, number>>;
   /** Ile rewizji syntezy po krytyce już było (limit: 1). */
   critiqueRound: number;
+  /** Ile poprawek `/fix` po review było w tej generacji (limit: 2). */
+  fixRound: number;
   critiqueVerdict?: "ok" | "issues" | "unavailable";
   /** Treść uwag krytyka (clipowana) — sekcja komentarza bramki i kontekst reviewera. */
   critiqueReport?: string;
@@ -350,6 +352,7 @@ export class LifecycleStore {
       briefs_json: "TEXT",
       research_failures_json: "TEXT",
       critique_round: "INTEGER NOT NULL DEFAULT 0",
+      fix_round: "INTEGER NOT NULL DEFAULT 0",
       critique_verdict: "TEXT",
       critique_report: "TEXT",
       degradations_json: "TEXT",
@@ -395,6 +398,7 @@ export class LifecycleStore {
         planFiles: [],
         clarifyRound: 0,
         critiqueRound: 0,
+        fixRound: 0,
         createdAt: timestamp,
         updatedAt: timestamp,
       };
@@ -432,6 +436,7 @@ export class LifecycleStore {
           briefs_json=NULL,
           research_failures_json=NULL,
           critique_round=0,
+          fix_round=0,
           critique_verdict=NULL,
           critique_report=NULL,
           degradations_json=NULL,
@@ -912,7 +917,7 @@ export class LifecycleStore {
         merged_sha=?, review_status=?, smoke_status=?, blocked_stage=?,
         error_code=?, error_message=?, feedback=?,
         plan_entry=?, plan_variant=?, triage_summary=?, briefs_json=?,
-        research_failures_json=?, critique_round=?, critique_verdict=?,
+        research_failures_json=?, critique_round=?, fix_round=?, critique_verdict=?,
         critique_report=?, degradations_json=?, score=?, score_comment=?,
         scored_at=?, updated_at=?
       WHERE ticket_id=?
@@ -945,6 +950,7 @@ export class LifecycleStore {
       run.briefs ? json(run.briefs) : null,
       run.researchFailures ? json(run.researchFailures) : null,
       run.critiqueRound,
+      run.fixRound,
       run.critiqueVerdict ?? null,
       run.critiqueReport ?? null,
       run.degradations?.length ? json(run.degradations) : null,
@@ -996,6 +1002,7 @@ export class LifecycleStore {
         ? undefined
         : parseJson<Partial<Record<ResearchRole, number>>>(row.research_failures_json, {}),
       critiqueRound: Number(row.critique_round ?? 0),
+      fixRound: Number(row.fix_round ?? 0),
       critiqueVerdict: row.critique_verdict == null
         ? undefined
         : String(row.critique_verdict) as LifecycleRun["critiqueVerdict"],

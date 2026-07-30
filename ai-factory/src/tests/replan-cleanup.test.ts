@@ -635,6 +635,7 @@ test("input-changed-before-build również kopiuje dane starej generacji do reti
     planFiles: ["src/a.ts"],
     clarifyRound: 0,
     critiqueRound: 0,
+    fixRound: 0,
     branch: "agent/BAR-192-cleanup-after-replan",
     workspaceDir: "/tmp/BAR-192-old",
     headSha: "1111111111111111111111111111111111111111",

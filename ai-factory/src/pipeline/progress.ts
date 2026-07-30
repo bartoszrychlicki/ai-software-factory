@@ -68,6 +68,15 @@ function milestoneComment(
     };
   }
 
+  if (reason.startsWith("/fix")) {
+    return {
+      body:
+        `🔧 **\`/fix\` przyjęty → builder poprawia kod wg uwag review ` +
+        `(runda ${after.fixRound}/2).** Plan i branch bez zmian.`,
+      level: "milestones",
+    };
+  }
+
   if (
     reason.startsWith("/approve") &&
     before.stage === "approval" &&
