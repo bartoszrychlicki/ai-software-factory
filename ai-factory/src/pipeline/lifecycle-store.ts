@@ -112,6 +112,8 @@ export interface LifecycleRun {
   critiqueVerdict?: "ok" | "issues" | "unavailable";
   /** Treść uwag krytyka (clipowana) — sekcja komentarza bramki i kontekst reviewera. */
   critiqueReport?: string;
+  /** Jedno zdanie krytyki po ludzku do bramki; opcjonalne i fail-open. */
+  critiqueMeaning?: string;
   /** Jawne noty degradacji (⚠️) pokazywane człowiekowi na bramce aprobat. */
   degradations?: string[];
   /** Ocena jakości od człowieka (/score 1-5) — cel badawczy eksperymentu. */
@@ -358,6 +360,7 @@ export class LifecycleStore {
       fix_round: "INTEGER NOT NULL DEFAULT 0",
       critique_verdict: "TEXT",
       critique_report: "TEXT",
+      critique_meaning: "TEXT",
       degradations_json: "TEXT",
       score: "INTEGER",
       score_comment: "TEXT",
@@ -443,6 +446,7 @@ export class LifecycleStore {
           fix_round=0,
           critique_verdict=NULL,
           critique_report=NULL,
+          critique_meaning=NULL,
           degradations_json=NULL,
           score=NULL,
           score_comment=NULL,
@@ -922,7 +926,7 @@ export class LifecycleStore {
         error_code=?, error_message=?, feedback=?,
         plan_entry=?, plan_variant=?, triage_summary=?, briefs_json=?,
         research_failures_json=?, critique_round=?, fix_round=?, critique_verdict=?,
-        critique_report=?, degradations_json=?, score=?, score_comment=?,
+        critique_report=?, critique_meaning=?, degradations_json=?, score=?, score_comment=?,
         scored_at=?, updated_at=?
       WHERE ticket_id=?
     `).run(
@@ -958,6 +962,7 @@ export class LifecycleStore {
       run.fixRound,
       run.critiqueVerdict ?? null,
       run.critiqueReport ?? null,
+      run.critiqueMeaning ?? null,
       run.degradations?.length ? json(run.degradations) : null,
       run.score ?? null,
       run.scoreComment ?? null,
@@ -1013,6 +1018,7 @@ export class LifecycleStore {
         ? undefined
         : String(row.critique_verdict) as LifecycleRun["critiqueVerdict"],
       critiqueReport: row.critique_report == null ? undefined : String(row.critique_report),
+      critiqueMeaning: row.critique_meaning == null ? undefined : String(row.critique_meaning),
       degradations: row.degradations_json == null
         ? undefined
         : parseJson<string[]>(row.degradations_json, []),

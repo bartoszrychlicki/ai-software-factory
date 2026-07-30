@@ -21,7 +21,7 @@ jeden plan + Rozstrzygnięcia"]
   D -- "pytania max 2" --> E["Linear /answer"]
   E --> D
   D -- "plan" --> F["Linear /approve
-komentarz: plan + krytyka + degradacje + koszt"]
+komentarz: streszczenie → krytyka → degradacje → koszt → plan"]
   F --> G["Mastra factoryJob: build (+ brief recon)"]
   G --> H["Jeden checkpoint commit"]
   H --> I["Detached runner: fresh checkout exact SHA, checks (+Semgrep opt-in) + E2E"]
@@ -145,13 +145,18 @@ jednego strzału jednego modelu (zastępuje zaprojektowany, niewdrożony
   Pad roli po 1 auto-retry → synteza jedzie dalej z ⚠️ widocznym na bramce;
   pad wszystkich → `RESEARCH_FAILED` (`/retry` ponawia brakujące role).
 - **Synteza** (15 min): jeden plan w kontrakcie `factory` + sekcja
-  `## Rozstrzygnięcia`; pytania runda 2 (wspólny limit 2 rund na ticket).
+  `## Rozstrzygnięcia` oraz otwierające `## Podsumowanie dla człowieka`;
+  pytania runda 2 (wspólny limit 2 rund na ticket).
 - **Krytyka** (8 min, silnik ≠ synteza przez `excludeEngine`+`critique.diverse`):
   checklista adwersaryjna; `issues` → dokładnie JEDNA rewizja syntezy; drugi
-  werdykt idzie na bramkę bez pętli. Krytyka advisory — `unavailable` = ⚠️
-  na bramce, nie blokada.
-- **Bramka `/approve` bez zmian mechanicznie**; komentarz zawiera plan,
-  werdykt krytyki, degradacje i koszt planowania.
+  werdykt idzie na bramkę bez pętli. Jednozdaniowe `## Co to znaczy dla autora`
+  wyjaśnia uwagi bez żargonu. Krytyka advisory — `unavailable` = ⚠️ na
+  bramce, nie blokada.
+- **Bramka `/approve` bez zmian mechanicznie**; komentarz ma kolejność:
+  streszczenie → krytyka → degradacje → koszt planowania → pełny plan
+  techniczny. Brak streszczenia jest fail-open i zapisuje
+  `humanSummary: "summary-missing"` w `runs/metrics.jsonl`; nie zmienia
+  werdyktu kontraktu `factory`.
 - Brief recon zasila buildera, brief ryzyk + uwagi krytyka zasilają reviewera
   (wszystko clipowane — lekcja E2BIG).
 
