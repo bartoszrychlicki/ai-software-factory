@@ -158,7 +158,9 @@ Changing the phase by dragging a card is not a workflow decision.
   `advisory-fix` verdict, at most twice per generation, after which
   `/replan <reason>` is required; unavailable after merge. It updates the
   existing PR in place and requires the remote branch tip to equal the last SHA
-  published by the factory;
+  published by the factory. A `/fix` that ends with `BUILD_FAILED` also consumes
+  one of the two rounds; the counter tracks dispatched attempts, not successful
+  ones;
 - `/replan <reason>` — invalidates the plan and creates a new generation;
 - `/restart` — temporary alias for `/replan`;
 - `/done` — confirms manual execution of the approved ops checklist;
@@ -231,8 +233,10 @@ for reading/migration tests, but they are not connected to the runtime.
 - AI review is advisory and may retry only the review once. Review never
   dispatches the builder on its own; after review, the builder runs only on an
   explicit human `/fix` command, at most twice per generation, after which
-  `/replan` is required. Each `/fix` continues from the published branch tip,
-  then exact-SHA tests synchronize with main before a normal fast-forward push.
+  `/replan` is required. A `/fix` that ends with `BUILD_FAILED` also consumes
+  one of the two rounds; the counter tracks dispatched attempts, not successful
+  ones. Each `/fix` continues from the published branch tip, then exact-SHA
+  tests synchronize with main before a normal fast-forward push.
   The reviewer is never the same engine as the builder (`review.diverse` in
   routing.yaml), and `mark-pr-ready` is emitted only AFTER the verdict; the
   reviewer's comment exists before the PR leaves draft.

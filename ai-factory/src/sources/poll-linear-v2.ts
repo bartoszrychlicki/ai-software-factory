@@ -840,10 +840,14 @@ async function dispatchExternal(
       deps.store.markCommand(command.key, "done");
       return;
     }
-    const signature = command.payload.signature
-      ?? deps.store.latestAttempt(run.ticketId, "build")?.signature
-      ?? signatureLine(POLLER_SIGNATURE);
     const outcome = command.payload.outcome ?? run.reviewStatus ?? "advisory";
+    // BAR-179/BAR-198: /fix wykonuje orkiestrator po decyzji człowieka,
+    // więc podpis poprzedniego buildera fałszowałby autorstwo tej akcji.
+    const signature = command.payload.signature
+      ?? (outcome === "fix-dispatched"
+        ? signatureLine(POLLER_SIGNATURE)
+        : deps.store.latestAttempt(run.ticketId, "build")?.signature
+          ?? signatureLine(POLLER_SIGNATURE));
     const body = [
       String(command.payload.body),
       "",
