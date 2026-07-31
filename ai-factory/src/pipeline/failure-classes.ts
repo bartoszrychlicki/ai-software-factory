@@ -16,8 +16,11 @@ const INFRA_PATTERNS: RegExp[] = [
   // pełny budżet i druga próba płaci drugi raz za tę samą porażkę.
   /ETIMEDOUT|request timed? ?out|gateway time-?out/i,
   /getaddrinfo|failed to lookup address information|ENOTFOUND|ECONNRESET|ECONNREFUSED|EPIPE|socket hang up|network error|websocket/i,
-  /\b401\b|\b403\b|unauthorized|authentication|invalid api key|not logged in|please (re)?login/i,
-  /\b429\b|rate limit|quota|credit balance|usage limit|insufficient (?:credits?|quota|balance|funds)|out of credits|overloaded|\b50[0234]\b/i,
+  // Statusy HTTP wyłącznie w kontekście odpowiedzi API. Gołe liczby trafiały
+  // w ogon stderr buildera (log narzędzia, curl, asercja testu) i kupowały
+  // płatną drugą próbę przy zwykłym niezerowym exit code.
+  /(?:API |HTTP |status(?:[ :]code)?[ :]|Error[ :]+)\b(?:401|403)\b|unauthorized|authentication|invalid api key|not logged in|please (re)?login/i,
+  /(?:API |HTTP |status(?:[ :]code)?[ :]|Error[ :]+)\b(?:429|50[0234])\b|rate limit|quota|credit balance|usage limit|insufficient (?:credits?|quota|balance|funds)|out of credits|overloaded/i,
   /internal server error|service unavailable|bad gateway/i,
 ];
 

@@ -2347,7 +2347,7 @@ test("fallback planu zapisuje degradację i renderuje ją na bramce", () => {
     },
   });
   const degradations = decision.transition.patch?.degradations ?? [];
-  assert.match(degradations.join("\n"), /plan wykonany silnikiem zapasowym fallback\/backup-model@high/);
+  assert.match(degradations.join("\n"), /plan \(próba \d+\) wykonany silnikiem zapasowym fallback\/backup-model@high/);
   assert.match(String(decision.commands[0].payload.body), /Degradacje/);
   assert.match(String(decision.commands[0].payload.body), /failed to lookup address information/);
 });
@@ -2393,7 +2393,7 @@ test("fallback buildu dodaje jawny komentarz Linear z podpisem użytego modelu",
   });
   const comment = decision.commands.find((command) => command.kind === "linear-comment");
   assert.ok(comment);
-  assert.match(String(comment.payload.body), /^⚠️ build wykonany silnikiem zapasowym/);
+  assert.match(String(comment.payload.body), /^⚠️ build \(próba \d+\) wykonany silnikiem zapasowym/);
   assert.equal(comment.payload.signature, signature);
   assert.match((decision.transition.patch?.degradations ?? []).join("\n"), /websocket/);
 });

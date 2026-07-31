@@ -321,8 +321,11 @@ function engineFallbackNote(event: JobFinishedEvent): string | undefined {
   const fallback = event.output.engineFallback;
   if (!fallback) return undefined;
   const reason = fallback.reason.replace(/\s+/g, " ").trim();
-  return `⚠️ ${event.output.kind} wykonany silnikiem zapasowym ${fallback.to}, ` +
-    `bo ${reason} (główny: ${fallback.from})`;
+  // Numer próby w treści: bez niego dwie próby tego samego etapu, obie
+  // przełączone na zapas z tego samego powodu, dedupowałyby się do jednego ⚠️
+  // i człowiek zobaczyłby na bramce jedno przejście zamiast dwóch.
+  return `⚠️ ${event.output.kind} (próba ${event.attempt}) wykonany silnikiem ` +
+    `zapasowym ${fallback.to}, bo ${reason} (główny: ${fallback.from})`;
 }
 
 function annotateEngineFallback(

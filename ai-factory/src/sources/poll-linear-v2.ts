@@ -556,7 +556,15 @@ async function dispatchJob(
   // Wcześniejszy wariant żądał miejsca na dwie pełne role. Przy realnych
   // budżetach nie przechodził dla builda ani review, czyli funkcja nie
   // uruchomiłaby się tam, gdzie miała ratować nocną kolejkę.
-  const inputData = jobInputData(deps, command, run, true);
+  // `allowEngineFallback` zostaje jako WYŁĄCZNIK AWARYJNY operatora: gdyby
+  // fallback zaczął zachowywać się nieprzewidzianie na produkcji, wystarczy
+  // `FACTORY_ENGINE_FALLBACK=off` i restart usług — bez cofania kodu.
+  const inputData = jobInputData(
+    deps,
+    command,
+    run,
+    process.env.FACTORY_ENGINE_FALLBACK !== "off"
+  );
   let jobRunId = command.externalId;
   if (!jobRunId) {
     jobRunId = stableRunId(command.key);

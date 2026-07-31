@@ -196,10 +196,21 @@ type EngineFallback = NonNullable<FactoryJobOutput["engineFallback"]>;
 type FallbackDecision = NonNullable<MetricRow["fallbackDecision"]>;
 
 /**
- * Minimum czasu, jaki musi zostać z budżetu roli, żeby próba zapasowa miała
- * sens. Poniżej tego progu spawn jest płatny, a wynik z góry przesądzony.
+ * Ile budżetu roli musi zostać, żeby próba zapasowa miała sens.
+ *
+ * Próg jest WZGLĘDNY, bo nie wszystkie awarie z allowlisty przychodzą wcześnie:
+ * wyczerpany limit subskrypcji (`429`, `usage limit`) czy przeciążenie dostawcy
+ * (`overloaded`, `503`) trafiają w środku pracy. Stała 2 min przepuszczałaby
+ * wtedy zapas z 7 minutami na zadanie skalibrowane na 25 — czyli niemal pewny
+ * timeout i drugi rachunek za tę samą porażkę.
+ *
+ * Połowa budżetu roli to minimum, przy którym drugi model ma realną szansę.
+ * Poniżej zapas nie startuje, a metryka dostaje `fallbackDecision: "no-headroom"`,
+ * więc widać, jak często to się zdarza (żadnych cichych pominięć).
  */
-const MIN_FALLBACK_MINUTES = 2;
+function minFallbackMinutes(budgetMinutes: number): number {
+  return Math.max(2, 0.5 * budgetMinutes);
+}
 
 interface EngineAttempt {
   result: EngineRunResult;
@@ -306,7 +317,7 @@ async function runEngineWithFallback(
       ? "no-candidate"
       : classifyEngineRunFailure(first.result) === "work"
         ? "not-infra"
-        : fallbackBudgetMinutes < MIN_FALLBACK_MINUTES
+        : fallbackBudgetMinutes < minFallbackMinutes(ctx.budgetMinutes)
           ? "no-headroom"
           : "used";
 
