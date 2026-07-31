@@ -196,20 +196,42 @@ type EngineFallback = NonNullable<FactoryJobOutput["engineFallback"]>;
 type FallbackDecision = NonNullable<MetricRow["fallbackDecision"]>;
 
 /**
- * Ile budżetu roli musi zostać, żeby próba zapasowa miała sens.
+ * Ułamek budżetu roli, jaki musi zostać, żeby próba zapasowa miała sens.
  *
- * Próg jest WZGLĘDNY, bo nie wszystkie awarie z allowlisty przychodzą wcześnie:
- * wyczerpany limit subskrypcji (`429`, `usage limit`) czy przeciążenie dostawcy
- * (`overloaded`, `503`) trafiają w środku pracy. Stała 2 min przepuszczałaby
- * wtedy zapas z 7 minutami na zadanie skalibrowane na 25 — czyli niemal pewny
- * timeout i drugi rachunek za tę samą porażkę.
+ * 80% to konsekwencja tezy całego ticketu: ratujemy WYŁĄCZNIE tanie, wczesne
+ * pady. Część wzorców z allowlisty (`429`, `usage limit`, `overloaded`) z
+ * natury trafia w środku pracy — wtedy drugi model dostałby resztkę czasu na
+ * zadanie skalibrowane na pełny budżet i niemal pewnie by nie zdążył. To jest
+ * dokładnie ten sam błąd, przed którym broni wyłączenie timeoutu z klasy
+ * `infra`: drugi rachunek za tę samą porażkę.
  *
- * Połowa budżetu roli to minimum, przy którym drugi model ma realną szansę.
- * Poniżej zapas nie startuje, a metryka dostaje `fallbackDecision: "no-headroom"`,
- * więc widać, jak często to się zdarza (żadnych cichych pominięć).
+ * Próg 50% osłabiał ten problem, ale go nie usuwał (builder padający w 12.
+ * minucie z 25 dostawał 13 minut). Przy 80% pad po pierwszej piątej budżetu
+ * kończy etap i oddaje decyzję człowiekowi — co jest właściwym sygnałem,
+ * bo awaria w środku pracy zwykle znaczy, że zadanie i tak jest za duże.
  */
-function minFallbackMinutes(budgetMinutes: number): number {
-  return Math.max(2, 0.5 * budgetMinutes);
+const FALLBACK_HEADROOM_FRACTION = 0.8;
+
+interface FallbackInputs {
+  allowFallback: boolean;
+  hasCandidate: boolean;
+  failureClass: "infra" | "work";
+  budgetMinutes: number;
+  elapsedMinutes: number;
+}
+
+/**
+ * Czysta decyzja „czy uruchomić silnik zapasowy" — wydzielona, żeby dała się
+ * przetestować bez czekania realnych minut na atrapę silnika.
+ */
+export function decideFallback(input: FallbackInputs): FallbackDecision {
+  if (!input.allowFallback) return "disabled";
+  if (!input.hasCandidate) return "no-candidate";
+  if (input.failureClass === "work") return "not-infra";
+  const remaining = input.budgetMinutes - input.elapsedMinutes;
+  return remaining < FALLBACK_HEADROOM_FRACTION * input.budgetMinutes
+    ? "no-headroom"
+    : "used";
 }
 
 interface EngineAttempt {
@@ -305,21 +327,15 @@ async function runEngineWithFallback(
     };
   }
 
-  // Zapas mieści się w budżecie i lease PIERWSZEJ próby, bo uruchamiają go
-  // wyłącznie tanie, wczesne pady (timeout jest klasą `work` — patrz
-  // failure-classes.ts). Gdyby jednak główny silnik zdążył zużyć budżet przed
-  // padem, nie odpalamy drugiej próby na resztkach: spawn jest płatny, a wynik
-  // z góry przesądzony.
-  const fallbackBudgetMinutes = ctx.budgetMinutes - first.durationMs / 60_000;
-  const decision: FallbackDecision = !allowFallback
-    ? "budget"
-    : !candidates[1]
-      ? "no-candidate"
-      : classifyEngineRunFailure(first.result) === "work"
-        ? "not-infra"
-        : fallbackBudgetMinutes < minFallbackMinutes(ctx.budgetMinutes)
-          ? "no-headroom"
-          : "used";
+  const elapsedMinutes = first.durationMs / 60_000;
+  const fallbackBudgetMinutes = ctx.budgetMinutes - elapsedMinutes;
+  const decision = decideFallback({
+    allowFallback,
+    hasCandidate: Boolean(candidates[1]),
+    failureClass: classifyEngineRunFailure(first.result),
+    budgetMinutes: ctx.budgetMinutes,
+    elapsedMinutes,
+  });
 
   if (decision !== "used") {
     return {

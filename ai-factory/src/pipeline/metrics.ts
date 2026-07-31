@@ -33,7 +33,7 @@ export interface MetricRow {
   /** Komunikat awarii głównego silnika, który uruchomił zapas. */
   fallbackReason?: string;
   /** Decyzja bramki fallbacku dla nieudanej próby głównego silnika. */
-  fallbackDecision?: "used" | "no-candidate" | "not-infra" | "budget" | "no-headroom";
+  fallbackDecision?: "used" | "no-candidate" | "not-infra" | "disabled" | "no-headroom";
   /**
    * Obserwacja, czy model dotrzymał instrukcji streszczenia (BAR-187).
    * Nie wpływa na `ok` ani `outcome`.

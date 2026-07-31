@@ -110,8 +110,14 @@ only cheap, early failures trigger a switch — and why the fallback needs no
 budget headroom of its own.
 
 There is at most one switch per stage attempt. Both attempts share the stage's
-time budget and count toward ticket usage; the fallback runs on what remains
-after the primary and is skipped when less than two minutes are left. A switch is visible in `runs/metrics.jsonl`
+time budget and count toward ticket usage; the fallback runs on what remains after the primary and is skipped
+unless at least 80% of the stage budget is still available — a failure in the
+middle of the work means the task is likely too large for any model, so the
+ticket stops for a human instead of paying twice (`fallbackDecision:
+"no-headroom"` in the metrics).
+
+Set `FACTORY_ENGINE_FALLBACK=off` to disable engine fallback entirely without
+reverting code; skipped attempts are recorded as `fallbackDecision: "disabled"`. A switch is visible in `runs/metrics.jsonl`
 (`engineFallback` and `fallbackReason`), in the stage artifact and actual-model
 signature, and as a ⚠️ degradation at the Linear gate (or an immediate Linear
 comment for build and review). The failed primary report remains available as

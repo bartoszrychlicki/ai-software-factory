@@ -12,6 +12,7 @@ import {
   classifyEngineRunFailure,
 } from "../pipeline/failure-classes";
 import {
+  decideFallback,
   executeFactoryJobInput,
   type FactoryJobRuntime,
 } from "../pipeline/factory-job";
@@ -309,7 +310,7 @@ test("pad zapasu kończy etap bez trzeciej próby", async () => {
   });
 });
 
-test("brak headroomu budżetu blokuje zapas", async () => {
+test("wyłącznik operatora blokuje zapas i zachowuje bogaty wiersz metryki", async () => {
   await withFixture("budget", async ({ root, repo }) => {
     const primaryCalls = { count: 0 };
     const fallbackCalls = { count: 0 };
@@ -328,7 +329,7 @@ test("brak headroomu budżetu blokuje zapas", async () => {
     const metric = JSON.parse(
       (await readFile(join(root, "runs", "metrics.jsonl"), "utf8")).trim()
     ) as Record<string, unknown>;
-    assert.equal(metric.fallbackDecision, "budget");
+    assert.equal(metric.fallbackDecision, "disabled");
     assert.equal(metric.outcome, "failed");
     assert.equal(metric.humanSummary, "summary-missing");
     assert.equal(metric.resumed, false);
@@ -607,3 +608,34 @@ test("timeout NIE uruchamia zapasu — to sygnał za szerokiego zadania, nie awa
   }
 });
 
+
+test("decyzja o zapasie: ratujemy wyłącznie wczesne pady infrastruktury", () => {
+  const base = {
+    allowFallback: true,
+    hasCandidate: true,
+    failureClass: "infra" as const,
+    budgetMinutes: 25,
+    elapsedMinutes: 0.5,
+  };
+
+  assert.equal(decideFallback(base), "used");
+
+  // Wyłącznik awaryjny operatora (FACTORY_ENGINE_FALLBACK=off).
+  assert.equal(decideFallback({ ...base, allowFallback: false }), "disabled");
+  // Brak drugiej pozycji w routingu.
+  assert.equal(decideFallback({ ...base, hasCandidate: false }), "no-candidate");
+  // Wynik pracy (m.in. timeout) nigdy nie kupuje drugiej próby.
+  assert.equal(decideFallback({ ...base, failureClass: "work" }), "not-infra");
+
+  // Pad w środku pracy: zadanie jest najpewniej za duże dla każdego modelu,
+  // więc etap kończy się i decyduje człowiek, zamiast płacić drugi raz.
+  assert.equal(decideFallback({ ...base, elapsedMinutes: 12 }), "no-headroom");
+  assert.equal(decideFallback({ ...base, elapsedMinutes: 6 }), "no-headroom");
+  // Dokładnie na granicy 80% budżetu jeszcze ratujemy.
+  assert.equal(decideFallback({ ...base, elapsedMinutes: 5 }), "used");
+  assert.equal(decideFallback({ ...base, elapsedMinutes: 5.01 }), "no-headroom");
+
+  // Krótka rola skaluje się tak samo (triage 5 min → próg 1 min).
+  assert.equal(decideFallback({ ...base, budgetMinutes: 5, elapsedMinutes: 0.5 }), "used");
+  assert.equal(decideFallback({ ...base, budgetMinutes: 5, elapsedMinutes: 2 }), "no-headroom");
+});
