@@ -63,6 +63,11 @@ Linear jest projekcją uproszczoną: `Todo`, `In Progress`, `In Review`, `Done`,
 `👤 ⛔ Zablokowany`, `Canceled`. Zdarzenia GitHub i SQLite pozostają źródłem
 prawdy nawet po ręcznym przestawieniu Lineara.
 
+Korytarz zapisu stanu pomija mutację, gdy karta jest już w stanie końcowym
+(`skipped-terminal`), komenda nie odpowiada bieżącej projekcji runu
+(`superseded`) albo docelowy stan jest już ustawiony (`noop`). Powód oraz
+bieżący i docelowy stan trafiają do logu usługi.
+
 ## Workspace jobów
 
 | Job | Workspace | Zapisana baza |

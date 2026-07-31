@@ -428,3 +428,93 @@ test("/replan na zakończonym runie nie jest przetwarzany przez aktywny cykl", a
     assert.equal(store.isCommentProcessed("human-replan"), false);
   });
 });
+
+test("komendy sterujące na runie done kończą się podpowiedzią", async () => {
+  await withHarness("factory-terminal-done-hints-", async ({ store }) => {
+    const item = ticket("BAR-TERM-8");
+    const commandComments = [
+      { id: "done-replan", body: "/replan nowy kierunek", createdAt: "2026-07-31T08:00:00.000Z" },
+      { id: "done-approve", body: "/approve", createdAt: "2026-07-31T08:00:01.000Z" },
+      { id: "done-retry", body: "/retry", createdAt: "2026-07-31T08:00:02.000Z" },
+      { id: "done-done", body: "/done", createdAt: "2026-07-31T08:00:03.000Z" },
+    ];
+    const linear = linearHarness(item, "Done", commandComments);
+    store.createRun(item.id, "harness", manifestFor(item));
+    store.transition(item.id, {
+      stage: "merge",
+      status: "done",
+      actor: "test",
+      reason: "done-with-open-pr",
+      patch: {
+        plan: "plan",
+        planFiles: ["src/a.ts"],
+        planDomain: "backend",
+        prUrl: "https://github.test/o/r/pull/8",
+        headSha: "a".repeat(40),
+      },
+    });
+    const deps = depsFor(store, linear.source);
+    const generation = store.getRun(item.id)!.generation;
+
+    for (const active of store.listActive()) {
+      await reconcileRun(deps, active);
+    }
+
+    const after = store.getRun(item.id)!;
+    const hints = store.outstandingCommands(100).filter((command) =>
+      command.ticketId === item.id &&
+      command.kind === "linear-comment" &&
+      command.key.includes(":done-command:")
+    );
+    assert.deepEqual([after.status, after.generation], ["done", generation]);
+    assert.equal(
+      store.outstandingCommands(100).some((command) => command.kind === "run-job"),
+      false
+    );
+    assert.equal(hints.length, commandComments.length);
+    assert.ok(hints.every((command) =>
+      String(command.payload.body).includes("ticket jest zakończony") &&
+      String(command.payload.body).includes("/score 1-5 [komentarz]")
+    ));
+    assert.ok(commandComments.every((comment) => store.isCommentProcessed(comment.id)));
+  });
+});
+
+test("/score na runie done zapisuje ocenę", async () => {
+  await withHarness("factory-terminal-done-score-", async ({ store }) => {
+    const item = ticket("BAR-TERM-9");
+    const linear = linearHarness(item, "Done", [{
+      id: "done-score",
+      body: "/score 5 dobre",
+      createdAt: "2026-07-31T08:00:00.000Z",
+    }]);
+    store.createRun(item.id, "harness", manifestFor(item));
+    store.transition(item.id, {
+      stage: "merge",
+      status: "done",
+      actor: "test",
+      reason: "done-with-open-pr",
+      patch: {
+        plan: "plan",
+        planFiles: ["src/a.ts"],
+        planDomain: "backend",
+        prUrl: "https://github.test/o/r/pull/9",
+        headSha: "b".repeat(40),
+      },
+    });
+    const deps = depsFor(store, linear.source);
+
+    for (const active of store.listActive()) {
+      await reconcileRun(deps, active);
+    }
+
+    assert.deepEqual(
+      [store.getRun(item.id)?.score, store.getRun(item.id)?.scoreComment],
+      [5, "dobre"]
+    );
+    assert.equal(store.isCommentProcessed("done-score"), true);
+    assert.ok(linear.comments.some((comment) =>
+      comment.body.includes("Zapisano ocenę") && comment.body.includes("5/5")
+    ));
+  });
+});

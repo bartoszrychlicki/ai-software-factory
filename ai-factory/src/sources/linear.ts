@@ -123,9 +123,18 @@ export class LinearSource implements TicketSource {
    * zobaczył. Labeli NIE rusza — są wyłącznie informacyjne (BAR-142/147).
    * Fazę właściwą ustawia poller przez setPhase.
    */
-  async claim(id: string): Promise<void> {
+  async claim(id: string, preferredStateName?: string): Promise<void> {
     const issue = await this.fetchIssue(id);
-    const started = pickState(issue.team.states.nodes, "started", "In Progress");
+    const preferred = preferredStateName
+      ? issue.team.states.nodes.find((state) => state.name === preferredStateName)
+      : undefined;
+    if (preferredStateName && !preferred) {
+      console.warn(
+        `[${id}] brak preferowanego stanu claim "${preferredStateName}" — ` +
+          "fallback do stanu started."
+      );
+    }
+    const started = preferred ?? pickState(issue.team.states.nodes, "started", "In Progress");
     await this.gql(
       `mutation($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }`,
       { id: issue.id, input: { stateId: started.id } }
