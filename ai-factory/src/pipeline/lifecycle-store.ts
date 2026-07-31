@@ -569,6 +569,14 @@ export class LifecycleStore {
     `).all(now(), limit) as Record<string, unknown>[]).map((row) => this.hydrateCommand(row));
   }
 
+  countCommands(ticketId: string, kind: string): number {
+    const row = this.db.prepare(`
+      SELECT COUNT(*) AS value FROM lifecycle_commands
+      WHERE ticket_id=? AND kind=?
+    `).get(ticketId, kind) as { value: number };
+    return Number(row.value);
+  }
+
   /**
    * Czy ticket ma jakikolwiek niedokończony job (run-job/run-tests)?
    * CELOWO bez filtra available_at — build odsunięty serializacją planFiles

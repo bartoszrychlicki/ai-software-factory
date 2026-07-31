@@ -151,6 +151,16 @@ export function unknownCommandHint(input: UnknownCommandContext): string {
   );
 }
 
+/** Podpowiedź dla rozpoznanej komendy, której nie wolno wykonać po Done. */
+export function doneCommandHint(firstToken: string): string {
+  const [rawFirstToken = firstToken.trim()] = firstToken.trim().split(/\s+/);
+  const normalized = normalizeCommandToken(rawFirstToken);
+  return (
+    `ℹ️ Komenda \`${normalized}\` jest niedostępna: ticket jest zakończony. ` +
+    "Dostępne teraz: `/score 1-5 [komentarz]`."
+  );
+}
+
 export interface ParsedScore {
   value: number;
   comment?: string;

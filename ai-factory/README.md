@@ -147,6 +147,10 @@ bash ops/install-launchd.sh --render-only /tmp/ai-factory-plisty
 The factory uses only the `Todo → In Progress → In Review → Done`,
 `👤 ⛔ Zablokowany` (blocked, waiting for a human), and `Canceled` states.
 Changing the phase by dragging a card is not a workflow decision.
+Projects with `statuses: extended` move a claimed ticket directly to the
+current lifecycle phase instead of passing through `In Progress`. After Done,
+every recognized command except `/score` gets a hint that the ticket is
+finished.
 
 - `/approve` — approves the current plan;
 - `/reject <reason>` — stops the plan;
