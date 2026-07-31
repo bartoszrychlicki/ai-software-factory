@@ -4,8 +4,10 @@
 #   plan:
 #     - claude-code/claude-fable-5@high   # główny
 #     - claude-code/claude-opus-5@high    # zapas (tylko przy AWARII silnika głównego)
-# Zapas NIE rusza przy wyniku merytorycznym (BLOCKED, brak werdyktu, uwagi recenzji)
-# ani przy wyczerpanym budżecie ticketu. Maksymalnie jedno przejście na próbę etapu.
+# Zapas NIE rusza: przy wyniku merytorycznym (BLOCKED, brak werdyktu, uwagi
+# recenzji), przy timeoucie budżetu roli (to znak, że zadanie jest za duże dla
+# każdego modelu), gdy główny zdążył zużyć ponad 20% budżetu roli przed padem,
+# oraz przy FACTORY_ENGINE_FALLBACK=off. Maksymalnie jedno przejście na próbę.
 defaults:
   plan: claude-code/sonnet
   build: codex              # bez modelu = default CLI

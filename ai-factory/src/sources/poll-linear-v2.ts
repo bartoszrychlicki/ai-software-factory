@@ -454,9 +454,11 @@ export function jobBudgetMinutes(stage: string): number {
   const kind = stage.startsWith("research-") ? "research" : stage;
   return kind in JOB_BUDGET_MINUTES
     ? JOB_BUDGET_MINUTES[kind as keyof typeof JOB_BUDGET_MINUTES]
-    : 25; // zachowaj historyczny lease nieznanego rodzaju joba
+    // Wspólne dla lease strażnika i rezerwacji budżetu; 25 min to dawny
+    // lease nieznanego joba (rezerwacja używała 20 — ujednolicone świadomie,
+    // dziś nieosiągalne, bo wszystkie rodzaje jobów są w JOB_BUDGET_MINUTES).
+    : 25;
 }
-
 
 function reservedUsage(
   store: LifecycleStore,
@@ -551,7 +553,8 @@ async function dispatchJob(
   // zerwany websocket) — timeout jest klasą `work`, więc nie prowadzi do drugiej
   // próby. Padnięty silnik nie zużywa więc ani budżetu, ani czasu, które job już
   // ma zarezerwowane: druga próba mieści się w rezerwacji pierwszej, a sam job
-  // pilnuje, żeby nie startować na resztkach (MIN_FALLBACK_MINUTES).
+  // pilnuje, żeby nie startować na resztkach (FALLBACK_HEADROOM_FRACTION
+  // w factory-job.ts: zapas wymaga 80% budżetu roli).
   //
   // Wcześniejszy wariant żądał miejsca na dwie pełne role. Przy realnych
   // budżetach nie przechodził dla builda ani review, czyli funkcja nie
