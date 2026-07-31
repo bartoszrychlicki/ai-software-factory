@@ -411,6 +411,8 @@ export function classifyFailure(message: string): FailureReason {
   if (/budżet ticketu wyczerpany/i.test(message)) return "budget";
   if (/plan bez werdyktu ok|nie oddał bloku|niejasności blokujące|Pytania do autora|JUŻ ISTNIEJE|już istnieje/i.test(message)) return "plan-gate";
   if (/BLOCKED po \d+\/\d+ próbach|konflikt semantyczny|konflikt z /i.test(message)) return "verify";
+  // Legacy finalizacja runu zachowuje dotychczasowy domyślny powód "infra".
+  // Bramka wydatku na fallback jest ostrzejsza: nieznany tekst = "work".
   return "infra";
 }
 

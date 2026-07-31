@@ -28,6 +28,12 @@ export interface MetricRow {
   baseSha?: string;
   /** Czy wywołanie planera wznowiło sesję CLI (BAR-136). */
   resumed?: boolean;
+  /** Jawne przejście na zapas, np. "główny → zapasowy". */
+  engineFallback?: string;
+  /** Komunikat awarii głównego silnika, który uruchomił zapas. */
+  fallbackReason?: string;
+  /** Decyzja bramki fallbacku dla nieudanej próby głównego silnika. */
+  fallbackDecision?: "used" | "no-candidate" | "not-infra" | "disabled" | "no-headroom";
   /**
    * Obserwacja, czy model dotrzymał instrukcji streszczenia (BAR-187).
    * Nie wpływa na `ok` ani `outcome`.

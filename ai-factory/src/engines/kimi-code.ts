@@ -45,13 +45,26 @@ export const kimiCode: EngineAdapter = {
         timeoutMs: input.budget.minutes * 60_000,
       });
       const report = stdout.trim();
-      return { ok: report.length > 0, report, raw: { stderr } };
+      const ok = report.length > 0;
+      return {
+        ok,
+        report,
+        stderr,
+        terminationReason: ok ? undefined : "empty-report",
+        raw: { stderr },
+      };
     } catch (error) {
-      const detail = error as Error & { stdout?: string; stderr?: string };
+      const detail = error as Error & {
+        stdout?: string;
+        stderr?: string;
+        terminationReason?: "abort" | "timeout";
+      };
       const report = detail.stdout?.trim() ?? "";
       return {
         ok: false,
         report: report || `Proces zakończył się błędem: ${detail.message}\n${detail.stderr ?? ""}`,
+        stderr: detail.stderr,
+        terminationReason: detail.terminationReason ?? "process-error",
         raw: { stdout: detail.stdout, stderr: detail.stderr },
       };
     }

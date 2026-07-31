@@ -53,7 +53,14 @@ export const pi: EngineAdapter = {
         timeoutMs: input.budget.minutes * 60_000,
       });
       const report = stdout.trim();
-      return { ok: report.length > 0, report, raw: { stderr } };
+      const ok = report.length > 0;
+      return {
+        ok,
+        report,
+        stderr,
+        terminationReason: ok ? undefined : "empty-report",
+        raw: { stderr },
+      };
     } catch (error) {
       const detail = error as Error & {
         stdout?: string;
@@ -67,6 +74,8 @@ export const pi: EngineAdapter = {
         report: timedOut
           ? `Pi: timeout po budżecie ${input.budget.minutes} min (grupa procesów zakończona)`
           : report || `Proces pi zakończył się błędem: ${detail.message}\n${detail.stderr ?? ""}`,
+        stderr: detail.stderr,
+        terminationReason: detail.terminationReason ?? "process-error",
         raw: {
           stdout: detail.stdout,
           stderr: detail.stderr,

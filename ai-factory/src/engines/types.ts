@@ -30,6 +30,13 @@ export interface EngineRunResult {
   costSource?: CostSource;
   /** Id sesji zwrócone przez CLI; inne adaptery mogą je pominąć. */
   sessionId?: string;
+  /**
+   * Diagnostyka procesu poza swobodnym tekstem modelu. Bramka fallbacku
+   * klasyfikuje te pola, żeby plan opisujący np. timeout nie wyglądał jak
+   * rzeczywista awaria dostawcy.
+   */
+  stderr?: string;
+  terminationReason?: string;
   raw?: unknown;
 }
 

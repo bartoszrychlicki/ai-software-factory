@@ -369,7 +369,8 @@ function followUpAttempts(store: LifecycleStore, ticketId: string): NextAttempts
 function jobInputData(
   deps: PollerDependencies,
   command: LifecycleCommand,
-  run: LifecycleRun
+  run: LifecycleRun,
+  allowEngineFallback: boolean
 ): Record<string, unknown> {
   // Format podpisu: "ai-factory · <harness> · <model> · <profil>"; harness może
   // nieść wersję CLI ("codex@0.44") — do wykluczenia liczy się sama nazwa.
@@ -378,15 +379,16 @@ function jobInputData(
     const harness = signature?.split(" · ")[1]?.split("@")[0]?.trim();
     return harness && harness !== "unavailable" ? harness : undefined;
   };
+  const payload = { ...command.payload, allowEngineFallback };
   if (command.payload.kind === "review") {
     const buildHarness = harnessOf("build");
-    return buildHarness ? { ...command.payload, buildHarness } : command.payload;
+    return buildHarness ? { ...payload, buildHarness } : payload;
   }
   if (command.payload.kind === "critique") {
     const synthesisHarness = harnessOf("synthesis");
-    return synthesisHarness ? { ...command.payload, synthesisHarness } : command.payload;
+    return synthesisHarness ? { ...payload, synthesisHarness } : payload;
   }
-  return command.payload;
+  return payload;
 }
 
 /**
@@ -403,8 +405,11 @@ async function handleStalledJob(
   mastraStatus: string
 ): Promise<boolean> {
   const kind = String(command.payload.kind) as keyof typeof JOB_BUDGET_MINUTES;
-  const budgetMinutes = JOB_BUDGET_MINUTES[kind] ?? 25;
+  const budgetMinutes = jobBudgetMinutes(kind);
   const graceMinutes = Number(process.env.FACTORY_JOB_GRACE_MIN ?? 10);
+  // Lease bez zmian względem stanu sprzed fallbacku: próba zapasowa mieści się
+  // w budżecie pierwszej, bo uruchamiają ją wyłącznie tanie, wczesne pady
+  // (timeout jest klasą `work`, nie `infra` — patrz failure-classes.ts).
   const leaseMinutes = budgetMinutes + graceMinutes;
   const latest = deps.store.latestAttempt(run.ticketId, command.stage);
   const startedAt = latest?.jobRunId === jobRunId ? latest.startedAt : command.updatedAt;
@@ -445,6 +450,16 @@ async function handleStalledJob(
  * Rezerwujemy budżet czasowy roli (górna granica lease) + estymatę USD dla
  * jobów AI; deterministyczny runner testów rezerwuje tylko minuty.
  */
+export function jobBudgetMinutes(stage: string): number {
+  const kind = stage.startsWith("research-") ? "research" : stage;
+  return kind in JOB_BUDGET_MINUTES
+    ? JOB_BUDGET_MINUTES[kind as keyof typeof JOB_BUDGET_MINUTES]
+    // Wspólne dla lease strażnika i rezerwacji budżetu; 25 min to dawny
+    // lease nieznanego joba (rezerwacja używała 20 — ujednolicone świadomie,
+    // dziś nieosiągalne, bo wszystkie rodzaje jobów są w JOB_BUDGET_MINUTES).
+    : 25;
+}
+
 function reservedUsage(
   store: LifecycleStore,
   ticketId: string
@@ -457,10 +472,7 @@ function reservedUsage(
       minutes += 20; // bazowy lease detached runnera
       continue;
     }
-    const kind = attempt.stage.startsWith("research-") ? "research" : attempt.stage;
-    const budget = kind in JOB_BUDGET_MINUTES
-      ? JOB_BUDGET_MINUTES[kind as keyof typeof JOB_BUDGET_MINUTES]
-      : 20;
+    const budget = jobBudgetMinutes(attempt.stage);
     minutes += budget;
     usd += budget * perMinute;
   }
@@ -535,7 +547,27 @@ async function dispatchJob(
     return;
   }
 
-  const inputData = jobInputData(deps, command, run);
+  // Zapas NIE wymaga osobnej rezerwacji budżetu.
+  //
+  // Uruchamiają go wyłącznie tanie, wczesne pady silnika (brak kredytów, DNS,
+  // zerwany websocket) — timeout jest klasą `work`, więc nie prowadzi do drugiej
+  // próby. Padnięty silnik nie zużywa więc ani budżetu, ani czasu, które job już
+  // ma zarezerwowane: druga próba mieści się w rezerwacji pierwszej, a sam job
+  // pilnuje, żeby nie startować na resztkach (FALLBACK_HEADROOM_FRACTION
+  // w factory-job.ts: zapas wymaga 80% budżetu roli).
+  //
+  // Wcześniejszy wariant żądał miejsca na dwie pełne role. Przy realnych
+  // budżetach nie przechodził dla builda ani review, czyli funkcja nie
+  // uruchomiłaby się tam, gdzie miała ratować nocną kolejkę.
+  // `allowEngineFallback` zostaje jako WYŁĄCZNIK AWARYJNY operatora: gdyby
+  // fallback zaczął zachowywać się nieprzewidzianie na produkcji, wystarczy
+  // `FACTORY_ENGINE_FALLBACK=off` i restart usług — bez cofania kodu.
+  const inputData = jobInputData(
+    deps,
+    command,
+    run,
+    process.env.FACTORY_ENGINE_FALLBACK !== "off"
+  );
   let jobRunId = command.externalId;
   if (!jobRunId) {
     jobRunId = stableRunId(command.key);

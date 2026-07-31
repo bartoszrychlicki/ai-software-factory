@@ -51,9 +51,12 @@ export const claudeCode: EngineAdapter = {
       stderr = detail.stderr ?? "";
     }
     if (processError && !stdout) {
+      const reason = (processError as { terminationReason?: string }).terminationReason ?? "process-error";
       return {
         ok: false,
         report: `Proces zakończył się błędem: ${processError instanceof Error ? processError.message : processError}\n${stderr}`,
+        stderr,
+        terminationReason: reason,
         raw: { error: String(processError) },
       };
     }
@@ -90,15 +93,30 @@ export const claudeCode: EngineAdapter = {
     }
     const report = final?.result ?? texts.at(-1) ?? "";
     if (!report && !texts.length) {
-      return { ok: false, report: `Brak treści od agenta:\n${stdout.slice(0, 2000)}`, raw: { stderr } };
+      return {
+        ok: false,
+        report: `Brak treści od agenta:\n${stdout.slice(0, 2000)}`,
+        stderr,
+        terminationReason: processError
+          ? (processError as { terminationReason?: string }).terminationReason ?? "process-error"
+          : "empty-report",
+        raw: { stderr },
+      };
     }
+    const ok = !processError && !!final && !final.is_error;
     return {
-      ok: !processError && !!final && !final.is_error,
+      ok,
       report,
       transcript: texts.join("\n\n"),
       costUsd: final?.total_cost_usd,
       costSource: final?.total_cost_usd !== undefined ? "reported" : undefined,
       sessionId,
+      stderr,
+      terminationReason: processError
+        ? (processError as { terminationReason?: string }).terminationReason ?? "process-error"
+        : final?.is_error
+          ? "engine-error-result"
+          : undefined,
       raw: { events: texts.length, error: processError ? String(processError) : undefined },
     };
   },

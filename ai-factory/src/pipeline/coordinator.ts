@@ -315,7 +315,57 @@ function assertStage(run: LifecycleRun, expected: LifecycleStage, event: string)
   }
 }
 
+type JobFinishedEvent = Extract<CoordinatorEvent, { type: "job-finished" }>;
+
+function engineFallbackNote(event: JobFinishedEvent): string | undefined {
+  const fallback = event.output.engineFallback;
+  if (!fallback) return undefined;
+  const reason = fallback.reason.replace(/\s+/g, " ").trim();
+  // Numer próby w treści: bez niego dwie próby tego samego etapu, obie
+  // przełączone na zapas z tego samego powodu, dedupowałyby się do jednego ⚠️
+  // i człowiek zobaczyłby na bramce jedno przejście zamiast dwóch.
+  return `⚠️ ${event.output.kind} (próba ${event.attempt}) wykonany silnikiem ` +
+    `zapasowym ${fallback.to}, bo ${reason} (główny: ${fallback.from})`;
+}
+
+function annotateEngineFallback(
+  run: LifecycleRun,
+  event: JobFinishedEvent,
+  decision: CoordinatorDecision
+): CoordinatorDecision {
+  const note = engineFallbackNote(event);
+  if (!note) return decision;
+  const current = decision.transition.patch?.degradations ?? run.degradations ?? [];
+  const degradations = current.includes(note) ? current : [...current, note];
+  decision.transition.patch = {
+    ...decision.transition.patch,
+    degradations,
+  };
+  if (event.output.kind === "build" || event.output.kind === "review") {
+    decision.commands = [
+      ...decision.commands,
+      linearComment(
+        run,
+        `engine-fallback:${event.output.kind}:${event.attempt}`,
+        note,
+        event.output.kind,
+        event.output.signature
+      ),
+    ];
+  }
+  return decision;
+}
+
 export function reduceLifecycle(run: LifecycleRun, event: CoordinatorEvent): CoordinatorDecision {
+  if (event.type !== "job-finished") return reduceLifecycleCore(run, event);
+  const note = engineFallbackNote(event);
+  const annotatedRun = note && !(run.degradations ?? []).includes(note)
+    ? { ...run, degradations: [...(run.degradations ?? []), note] }
+    : run;
+  return annotateEngineFallback(run, event, reduceLifecycleCore(annotatedRun, event));
+}
+
+function reduceLifecycleCore(run: LifecycleRun, event: CoordinatorEvent): CoordinatorDecision {
   if (event.type === "cancel") {
     return {
       transition: {
