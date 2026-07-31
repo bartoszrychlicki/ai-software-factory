@@ -2422,7 +2422,7 @@ test("job-finished bez fallbacku nie zmienia degradacji", () => {
   assert.equal(decision.transition.patch?.degradations, undefined);
 });
 
-test("poller pozwala na fallback tylko przy headroomie budżetu ticketu", async () => {
+test("zapas nie ma osobnej bramki budżetu; chroni bramka zlecenia joba", async () => {
   const root = await mkdtemp(join(tmpdir(), "factory-fallback-budget-headroom-"));
   const previousRoot = process.env.FACTORY_ROOT;
   const store = new LifecycleStore(join(root, "registry.db"));
@@ -2462,12 +2462,14 @@ test("poller pozwala na fallback tylko przy headroomie budżetu ticketu", async 
         reason: "budget-fixture",
       });
       if (id === "BAR-FB-TIGHT") {
+        // Budżet ticketu już wyczerpany (50 >= 45): job nie zostanie zlecony,
+        // więc pytanie o zapas w ogóle nie powstaje.
         store.startAttempt(id, "build", 1, `historic-${id}`);
         store.finishAttempt(id, "build", 1, {
           status: "success",
           outcome: "committed",
           costUsd: 0,
-          durationMs: 10 * 60_000,
+          durationMs: 50 * 60_000,
         });
       }
       store.enqueue({
@@ -2492,8 +2494,12 @@ test("poller pozwala na fallback tylko przy headroomie budżetu ticketu", async 
     }
 
     await dispatchOutbox(deps);
+    // Zapas nie ma osobnej bramki budżetu: uruchamiają go wyłącznie tanie,
+    // wczesne pady, więc druga próba mieści się w rezerwacji pierwszej.
+    // Ochroną pozostaje istniejąca bramka na poziomie zlecenia joba.
     assert.equal(captured.get("BAR-FB-ROOM"), true);
-    assert.equal(captured.get("BAR-FB-TIGHT"), false);
+    assert.equal(captured.has("BAR-FB-TIGHT"), false, "ticket bez miejsca na jedną próbę nie startuje");
+    assert.equal(store.getRun("BAR-FB-TIGHT")?.errorCode, "BUDGET_EXHAUSTED");
   } finally {
     store.close();
     if (previousRoot === undefined) delete process.env.FACTORY_ROOT;

@@ -195,6 +195,12 @@ const defaultRuntime: FactoryJobRuntime = {
 type EngineFallback = NonNullable<FactoryJobOutput["engineFallback"]>;
 type FallbackDecision = NonNullable<MetricRow["fallbackDecision"]>;
 
+/**
+ * Minimum czasu, jaki musi zostać z budżetu roli, żeby próba zapasowa miała
+ * sens. Poniżej tego progu spawn jest płatny, a wynik z góry przesądzony.
+ */
+const MIN_FALLBACK_MINUTES = 2;
+
 interface EngineAttempt {
   result: EngineRunResult;
   route: Route;
@@ -288,13 +294,21 @@ async function runEngineWithFallback(
     };
   }
 
+  // Zapas mieści się w budżecie i lease PIERWSZEJ próby, bo uruchamiają go
+  // wyłącznie tanie, wczesne pady (timeout jest klasą `work` — patrz
+  // failure-classes.ts). Gdyby jednak główny silnik zdążył zużyć budżet przed
+  // padem, nie odpalamy drugiej próby na resztkach: spawn jest płatny, a wynik
+  // z góry przesądzony.
+  const fallbackBudgetMinutes = ctx.budgetMinutes - first.durationMs / 60_000;
   const decision: FallbackDecision = !allowFallback
     ? "budget"
     : !candidates[1]
       ? "no-candidate"
       : classifyEngineRunFailure(first.result) === "work"
         ? "not-infra"
-        : "used";
+        : fallbackBudgetMinutes < MIN_FALLBACK_MINUTES
+          ? "no-headroom"
+          : "used";
 
   if (decision !== "used") {
     return {
@@ -359,15 +373,7 @@ async function runEngineWithFallback(
   );
 
   await beforeFallback?.();
-  // Zapas dostaje PEŁNY budżet roli, nie resztę po próbie głównej.
-  //
-  // Najczęstsza awaria z allowlisty to `timeout`, który z definicji zjada cały
-  // budżet głównego silnika — dzielenie budżetu dawało wtedy zapasowi ułamek
-  // sekundy i gwarantowaną porażkę, czyli podwójny rachunek bez wyniku.
-  // Spójność trzech warstw: poller wpuszcza zapas dopiero przy miejscu na DWIE
-  // pełne rezerwacje roli, lease w `handleStalledJob` liczy się wtedy podwójnie,
-  // a tutaj druga próba faktycznie te dwie rezerwacje wykorzystuje.
-  const second = await runOne(fallbackRoute, ctx.budgetMinutes);
+  const second = await runOne(fallbackRoute, fallbackBudgetMinutes);
   return {
     result: second.result,
     route: fallbackRoute,

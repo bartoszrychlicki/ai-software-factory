@@ -167,12 +167,11 @@ test("infra-pad głównego przechodzi na zapas z jawną metryką, artefaktem i p
     assert.equal(output.outcome, "success");
     assert.equal(output.costUsd, 3);
     assert.deepEqual([primaryCalls.count, fallbackCalls.count], [1, 1]);
-    // Zapas dostaje PEŁNY budżet roli, nie resztę po próbie głównej. Dzielenie
-    // budżetu dawało po timeoucie głównego silnika ułamek sekundy na drugą
-    // próbę — czyli gwarantowaną porażkę i podwójny rachunek. Poller wpuszcza
-    // zapas dopiero przy miejscu na dwie pełne rezerwacje, a lease liczy je obie.
+    // Zapas dostaje resztę budżetu roli po próbie głównej. Ponieważ zapas
+    // uruchamiają wyłącznie tanie, wczesne pady, ta reszta to praktycznie cały
+    // budżet — druga próba mieści się w rezerwacji i lease pierwszej.
     assert.equal(budgets[0], 20);
-    assert.equal(budgets[1], 20);
+    assert.ok(budgets[1] > 19.9 && budgets[1] <= 20, String(budgets[1]));
     assert.deepEqual(output.engineFallback, {
       from: "primary/primary-model@high",
       to: "fallback/fallback-model@high",
@@ -574,28 +573,37 @@ test("codex i claude-code wystawiają stderr oraz przyczynę zakończenia poza r
   }
 });
 
-test("lease obejmuje obie próby, gdy zapas jest dozwolony", async () => {
-  const { jobLeaseMinutes } = await import("../sources/poll-linear-v2");
-  const previousGrace = process.env.FACTORY_JOB_GRACE_MIN;
-  process.env.FACTORY_JOB_GRACE_MIN = "10";
-  try {
-    // Bez zgody na zapas — jak dotąd: budżet roli + grace.
-    assert.equal(jobLeaseMinutes("plan", false), 30);
-    assert.equal(jobLeaseMinutes("build", false), 35);
 
-    // Ze zgodą — dwie pełne role, bo tyle job faktycznie może zużyć.
-    // Kluczowy scenariusz: timeout próby głównej zjada cały budżet roli,
-    // a zapas dostaje własny pełny budżet. Przy pojedynczym lease strażnik
-    // zabiłby go w locie i ticket zapłaciłby za obie próby bez wyniku.
-    assert.equal(jobLeaseMinutes("plan", true), 50);
-    assert.equal(jobLeaseMinutes("build", true), 60);
-
-    // Role researchu dziedziczą budżet po etapie bazowym.
-    assert.equal(jobLeaseMinutes("research-recon", true), 30);
-    // Nieznany rodzaj joba zachowuje historyczne 25 min.
-    assert.equal(jobLeaseMinutes("nieznany", false), 35);
-  } finally {
-    if (previousGrace === undefined) delete process.env.FACTORY_JOB_GRACE_MIN;
-    else process.env.FACTORY_JOB_GRACE_MIN = previousGrace;
+test("timeout NIE uruchamia zapasu — to sygnał za szerokiego zadania, nie awaria dostawcy", () => {
+  // Decyzja z danych (2026-07-31): wszystkie pady silników w historii fabryki
+  // poza jednym kosztowały grosze, bo model umierał na starcie. Jedyny drogi
+  // przypadek to timeout buildera — 25 min i $3.75 spalone bez wyniku.
+  // Drugi model najpewniej też nie zdąży, więc ratowanie kosztuje podwójnie
+  // za tę samą porażkę.
+  assert.equal(
+    classifyEngineRunFailure({
+      report: "Proces codex zakończył się błędem (timeout).",
+      stderr: "",
+      terminationReason: "timeout",
+    }),
+    "work"
+  );
+  // Tanie, wczesne pady zostają ratowane.
+  for (const stderr of [
+    "failed to lookup address information",
+    "failed to connect to websocket",
+    "insufficient credits",
+    "401 unauthorized",
+  ]) {
+    assert.equal(
+      classifyEngineRunFailure({
+        report: "Proces codex zakończył się błędem (process-error).",
+        stderr,
+        terminationReason: "process-error",
+      }),
+      "infra",
+      stderr
+    );
   }
 });
+

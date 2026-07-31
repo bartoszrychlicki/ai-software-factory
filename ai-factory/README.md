@@ -101,9 +101,17 @@ review comments, empty research, or empty output without an infrastructure
 signal) never switches models. Unknown error messages also fail closed without
 a second charge.
 
-There is at most one switch per stage attempt, and the poller disables it when
-the ticket budget lacks headroom. Both attempts share the stage's time budget
-and count toward ticket usage. A switch is visible in `runs/metrics.jsonl`
+A stage-budget **timeout is deliberately not an infrastructure failure**: it
+means the task was too large, so a second model would most likely time out too
+and the ticket would pay twice for the same failure. Timeouts on the provider
+side (`ETIMEDOUT`, `request timeout`, `gateway timeout`) do count as
+infrastructure, because they fail early and cost almost nothing. This is why
+only cheap, early failures trigger a switch — and why the fallback needs no
+budget headroom of its own.
+
+There is at most one switch per stage attempt. Both attempts share the stage's
+time budget and count toward ticket usage; the fallback runs on what remains
+after the primary and is skipped when less than two minutes are left. A switch is visible in `runs/metrics.jsonl`
 (`engineFallback` and `fallbackReason`), in the stage artifact and actual-model
 signature, and as a ⚠️ degradation at the Linear gate (or an immediate Linear
 comment for build and review). The failed primary report remains available as
