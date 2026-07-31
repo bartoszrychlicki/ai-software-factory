@@ -167,8 +167,12 @@ test("infra-pad głównego przechodzi na zapas z jawną metryką, artefaktem i p
     assert.equal(output.outcome, "success");
     assert.equal(output.costUsd, 3);
     assert.deepEqual([primaryCalls.count, fallbackCalls.count], [1, 1]);
+    // Zapas dostaje PEŁNY budżet roli, nie resztę po próbie głównej. Dzielenie
+    // budżetu dawało po timeoucie głównego silnika ułamek sekundy na drugą
+    // próbę — czyli gwarantowaną porażkę i podwójny rachunek. Poller wpuszcza
+    // zapas dopiero przy miejscu na dwie pełne rezerwacje, a lease liczy je obie.
     assert.equal(budgets[0], 20);
-    assert.ok(budgets[1] > 0 && budgets[1] < budgets[0]);
+    assert.equal(budgets[1], 20);
     assert.deepEqual(output.engineFallback, {
       from: "primary/primary-model@high",
       to: "fallback/fallback-model@high",
@@ -567,5 +571,31 @@ test("codex i claude-code wystawiają stderr oraz przyczynę zakończenia poza r
     assert.equal(classifyEngineRunFailure(silentResult), "work");
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("lease obejmuje obie próby, gdy zapas jest dozwolony", async () => {
+  const { jobLeaseMinutes } = await import("../sources/poll-linear-v2");
+  const previousGrace = process.env.FACTORY_JOB_GRACE_MIN;
+  process.env.FACTORY_JOB_GRACE_MIN = "10";
+  try {
+    // Bez zgody na zapas — jak dotąd: budżet roli + grace.
+    assert.equal(jobLeaseMinutes("plan", false), 30);
+    assert.equal(jobLeaseMinutes("build", false), 35);
+
+    // Ze zgodą — dwie pełne role, bo tyle job faktycznie może zużyć.
+    // Kluczowy scenariusz: timeout próby głównej zjada cały budżet roli,
+    // a zapas dostaje własny pełny budżet. Przy pojedynczym lease strażnik
+    // zabiłby go w locie i ticket zapłaciłby za obie próby bez wyniku.
+    assert.equal(jobLeaseMinutes("plan", true), 50);
+    assert.equal(jobLeaseMinutes("build", true), 60);
+
+    // Role researchu dziedziczą budżet po etapie bazowym.
+    assert.equal(jobLeaseMinutes("research-recon", true), 30);
+    // Nieznany rodzaj joba zachowuje historyczne 25 min.
+    assert.equal(jobLeaseMinutes("nieznany", false), 35);
+  } finally {
+    if (previousGrace === undefined) delete process.env.FACTORY_JOB_GRACE_MIN;
+    else process.env.FACTORY_JOB_GRACE_MIN = previousGrace;
   }
 });

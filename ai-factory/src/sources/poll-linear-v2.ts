@@ -405,9 +405,7 @@ async function handleStalledJob(
   mastraStatus: string
 ): Promise<boolean> {
   const kind = String(command.payload.kind) as keyof typeof JOB_BUDGET_MINUTES;
-  const budgetMinutes = jobBudgetMinutes(kind);
-  const graceMinutes = Number(process.env.FACTORY_JOB_GRACE_MIN ?? 10);
-  const leaseMinutes = budgetMinutes + graceMinutes;
+  const leaseMinutes = jobLeaseMinutes(kind, command.payload.allowEngineFallback === true);
   const latest = deps.store.latestAttempt(run.ticketId, command.stage);
   const startedAt = latest?.jobRunId === jobRunId ? latest.startedAt : command.updatedAt;
   const elapsedMinutes = (Date.now() - Date.parse(startedAt)) / 60_000;
@@ -452,6 +450,21 @@ export function jobBudgetMinutes(stage: string): number {
   return kind in JOB_BUDGET_MINUTES
     ? JOB_BUDGET_MINUTES[kind as keyof typeof JOB_BUDGET_MINUTES]
     : 25; // zachowaj historyczny lease nieznanego rodzaju joba
+}
+
+/**
+ * Ile minut job ma na oddanie wyniku, zanim strażnik uzna go za wiszący.
+ *
+ * Gdy job dostał zgodę na silnik zapasowy, może wykonać DWIE pełne próby
+ * w jednym runie Mastry — lease musi je obie objąć. Inaczej najczęstsza awaria
+ * z allowlisty (timeout próby głównej, który z definicji zjada cały budżet roli)
+ * gwarantowałaby zabicie zapasu w locie: ticket płaci za obie próby i nie
+ * dostaje wyniku, czyli dokładnie odwrotnie do celu fallbacku. Bramka budżetu
+ * w `dispatchJob` rezerwuje symetrycznie dwie pełne role.
+ */
+export function jobLeaseMinutes(stage: string, fallbackAllowed: boolean): number {
+  const graceMinutes = Number(process.env.FACTORY_JOB_GRACE_MIN ?? 10);
+  return jobBudgetMinutes(stage) * (fallbackAllowed ? 2 : 1) + graceMinutes;
 }
 
 function reservedUsage(
@@ -544,8 +557,10 @@ async function dispatchJob(
   const jobMinutes = jobBudgetMinutes(String(command.payload.kind));
   const perMinute = Number(process.env.FACTORY_SYNTH_USD_PER_MIN ?? 0.15);
   // Bieżący job nie figuruje jeszcze w reservedUsage. Zapas wpuszczamy tylko,
-  // gdy budżet mieści DWIE pełne rezerwacje roli; faktyczny czas drugiej próby
-  // job ograniczy do reszty budżetu pierwszej próby.
+  // gdy budżet mieści DWIE pełne rezerwacje roli — bo tyle druga próba naprawdę
+  // może zużyć (dostaje pełny budżet roli, a lease w handleStalledJob liczy się
+  // wtedy podwójnie). Skutek uboczny jest zamierzony: przy ciasnym budżecie
+  // ticketu zapas nie ruszy, zamiast wystartować i przekroczyć limit.
   const allowEngineFallback =
     usage.minutes + reserved.minutes + 2 * jobMinutes < maxMinutes &&
     usage.usd + reserved.usd + 2 * jobMinutes * perMinute < maxUsd;

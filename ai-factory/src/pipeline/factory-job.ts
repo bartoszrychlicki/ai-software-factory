@@ -359,14 +359,15 @@ async function runEngineWithFallback(
   );
 
   await beforeFallback?.();
-  // Dwie próby współdzielą dotychczasowy budżet roli. Minimalny dodatni limit
-  // (1 ms) zapobiega znaczeniu "brak timeoutu" dla wartości 0 po pełnym
-  // timeoutcie próby głównej i nadal mieści całość w tym samym lease.
-  const fallbackBudgetMinutes = Math.max(
-    1 / 60_000,
-    ctx.budgetMinutes - first.durationMs / 60_000
-  );
-  const second = await runOne(fallbackRoute, fallbackBudgetMinutes);
+  // Zapas dostaje PEŁNY budżet roli, nie resztę po próbie głównej.
+  //
+  // Najczęstsza awaria z allowlisty to `timeout`, który z definicji zjada cały
+  // budżet głównego silnika — dzielenie budżetu dawało wtedy zapasowi ułamek
+  // sekundy i gwarantowaną porażkę, czyli podwójny rachunek bez wyniku.
+  // Spójność trzech warstw: poller wpuszcza zapas dopiero przy miejscu na DWIE
+  // pełne rezerwacje roli, lease w `handleStalledJob` liczy się wtedy podwójnie,
+  // a tutaj druga próba faktycznie te dwie rezerwacje wykorzystuje.
+  const second = await runOne(fallbackRoute, ctx.budgetMinutes);
   return {
     result: second.result,
     route: fallbackRoute,
