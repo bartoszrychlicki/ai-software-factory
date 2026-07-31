@@ -1373,7 +1373,9 @@ function reduceLifecycleCore(run: LifecycleRun, event: CoordinatorEvent): Coordi
         patch: {
           headSha: event.sha,
           testedSha: undefined,
+          // Raport review dotyczy poprzedniego SHA i nie może przeżyć resetu statusu.
           reviewStatus: run.prUrl ? "pending" : run.reviewStatus,
+          reviewReport: run.prUrl ? undefined : run.reviewReport,
         },
       },
       commands: [],
@@ -1394,6 +1396,7 @@ function reduceLifecycleCore(run: LifecycleRun, event: CoordinatorEvent): Coordi
           headSha: event.sha,
           testedSha: undefined,
           reviewStatus: "pending",
+          reviewReport: undefined,
           blockedStage: undefined,
           errorCode: undefined,
           errorMessage: undefined,

@@ -23,6 +23,7 @@ import {
   FIX_HINTS_CLIP_CHARS,
   REVIEW_CLIP_CHARS,
 } from "../pipeline/factory-job";
+import { POLLER_SIGNATURE, signatureLine } from "../pipeline/signature";
 
 const manifest: TicketManifestV2 = {
   title: "Komenda fix",
@@ -196,10 +197,18 @@ test("/fix przechodzi pełną ścieżkę na tym samym planie, branchu i PR oraz 
     assert.equal(reviewCommand.payload.headSha, newSha);
 
     const externalSha = "c".repeat(40);
+    assert.equal(run.reviewReport, "BUG: claimReady pomija executedCommandIds.");
     run = apply(store, run, { type: "pr-head-changed", sha: externalSha });
     assert.deepEqual(
-      [run.stage, run.status, run.headSha, run.testedSha, run.reviewStatus],
-      ["test", "pending", externalSha, undefined, "pending"]
+      [
+        run.stage,
+        run.status,
+        run.headSha,
+        run.testedSha,
+        run.reviewStatus,
+        run.reviewReport,
+      ],
+      ["test", "pending", externalSha, undefined, "pending", undefined]
     );
     assert.equal(run.testedSha, undefined);
     assert.equal(run.reviewStatus, "pending");
@@ -211,10 +220,58 @@ test("/fix przechodzi pełną ścieżkę na tym samym planie, branchu i PR oraz 
     store.close();
     store = new LifecycleStore(db);
     assert.equal(store.getRun("BAR-FIX-1")?.fixRound, 1);
-    assert.equal(
-      store.getRun("BAR-FIX-1")?.reviewReport,
-      "BUG: claimReady pomija executedCommandIds."
+    assert.equal(store.getRun("BAR-FIX-1")?.reviewReport, undefined);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("branch-synchronized czyści review tylko dla istniejącego PR", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "factory-fix-branch-sync-"));
+  const store = new LifecycleStore(join(dir, "registry.db"));
+  try {
+    const previousSha = "a".repeat(40);
+    const synchronizedSha = "b".repeat(40);
+    const createTestRun = (
+      ticketId: string,
+      prUrl: string | undefined
+    ): LifecycleRun => {
+      store.createRun(ticketId, "br-factory", manifest);
+      return store.transition(ticketId, {
+        stage: "test",
+        status: "running",
+        actor: "test",
+        reason: "fixture-branch-synchronized",
+        patch: {
+          headSha: previousSha,
+          prUrl,
+          reviewStatus: "advisory-fix",
+          reviewReport: "BUG",
+        },
+      });
+    };
+
+    let withPr = createTestRun(
+      "BAR-FIX-BRANCH-SYNC-PR",
+      "https://github.test/o/r/pull/198"
     );
+    withPr = apply(store, withPr, {
+      type: "branch-synchronized",
+      previousSha,
+      sha: synchronizedSha,
+    });
+    assert.equal(withPr.reviewStatus, "pending");
+    assert.equal(withPr.reviewReport, undefined);
+
+    let withoutPr = createTestRun("BAR-FIX-BRANCH-SYNC-NO-PR", undefined);
+    withoutPr = apply(store, withoutPr, {
+      type: "branch-synchronized",
+      previousSha,
+      sha: synchronizedSha,
+    });
+    assert.equal(withoutPr.reviewStatus, "advisory-fix");
+    assert.equal(withoutPr.reviewReport, "BUG");
   } finally {
     store.close();
     await rm(dir, { recursive: true, force: true });
@@ -617,7 +674,7 @@ test("reconcilePullRequest nie cofa świeżego checkpointu do starego PR head w 
   }
 });
 
-test("comment-pr /fix używa podpisu ostatniego builda i jawnego outcome", async () => {
+test("comment-pr /fix podpisuje orkiestrator, nie poprzedni build", async () => {
   const root = await mkdtemp(join(tmpdir(), "factory-fix-pr-comment-"));
   const bin = join(root, "bin");
   const capture = join(root, "comment-body.txt");
@@ -697,7 +754,12 @@ test("comment-pr /fix używa podpisu ostatniego builda i jawnego outcome", async
 
     await dispatchOutbox(deps);
     const body = await readFile(capture, "utf8");
-    assert.match(body, new RegExp(`Signature: ${buildSignature.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+    const pollerSignature = signatureLine(POLLER_SIGNATURE);
+    assert.match(
+      body,
+      new RegExp(`Signature: ${pollerSignature.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`)
+    );
+    assert.doesNotMatch(body, /builder/);
     assert.match(body, /Outcome: fix-dispatched/);
     assert.doesNotMatch(body, /undefined/);
   } finally {
