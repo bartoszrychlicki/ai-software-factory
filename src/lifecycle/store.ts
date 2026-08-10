@@ -175,6 +175,19 @@ export interface StageAttempt {
   finishedAt?: string;
 }
 
+export interface LifecycleTransition {
+  id: number;
+  ticketId: string;
+  generation: number;
+  fromStage?: LifecycleStage;
+  fromStatus?: LifecycleStatus;
+  toStage: LifecycleStage;
+  toStatus: LifecycleStatus;
+  actor: string;
+  reason: string;
+  createdAt: string;
+}
+
 export interface TransitionInput {
   stage: LifecycleStage;
   status: LifecycleStatus;
@@ -812,6 +825,14 @@ export class LifecycleStore {
     `).all(ticketId) as Record<string, unknown>[]).map((row) => this.hydrateAttempt(row));
   }
 
+  /** Pełna oś czasu ticketu; id rozstrzyga przejścia zapisane w tej samej milisekundzie. */
+  listTransitions(ticketId: string): LifecycleTransition[] {
+    return (this.db.prepare(`
+      SELECT * FROM lifecycle_transitions
+      WHERE ticket_id=? ORDER BY id
+    `).all(ticketId) as Record<string, unknown>[]).map((row) => this.hydrateTransition(row));
+  }
+
   /**
    * Próby w toku (status running) — rezerwacja budżetu przed dispatchem
    * kolejnego joba: totalUsage widzi tylko koszty ZAKOŃCZONYCH prób, więc
@@ -1078,6 +1099,21 @@ export class LifecycleStore {
       budgetUsedUsd: row.budget_used_usd == null ? undefined : Number(row.budget_used_usd),
       startedAt: String(row.started_at),
       finishedAt: row.finished_at == null ? undefined : String(row.finished_at),
+    };
+  }
+
+  private hydrateTransition(row: Record<string, unknown>): LifecycleTransition {
+    return {
+      id: Number(row.id),
+      ticketId: String(row.ticket_id),
+      generation: Number(row.generation),
+      fromStage: row.from_stage == null ? undefined : String(row.from_stage) as LifecycleStage,
+      fromStatus: row.from_status == null ? undefined : String(row.from_status) as LifecycleStatus,
+      toStage: String(row.to_stage) as LifecycleStage,
+      toStatus: String(row.to_status) as LifecycleStatus,
+      actor: String(row.actor),
+      reason: String(row.reason),
+      createdAt: String(row.created_at),
     };
   }
 }

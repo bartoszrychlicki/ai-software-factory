@@ -51,6 +51,7 @@ import {
   type NextAttempts,
 } from "../lifecycle/coordinator";
 import { appendExperimentRow, buildExperimentSummary } from "../observability/experiments";
+import { writeRunLog } from "../observability/run-log";
 import {
   factoryJobOutputSchema,
   JOB_BUDGET_MINUTES,
@@ -226,6 +227,7 @@ export function applyDecision(
   emitTransitionNotification(deps, current, updated, decision.transition.reason);
   recordBreakerOutcome(current, updated);
   recordExperimentOutcome(deps, current, updated);
+  recordRunLog(deps, current, updated);
   return updated;
 }
 
@@ -244,6 +246,17 @@ function recordExperimentOutcome(
   } catch (error) {
     console.error("Wiersz eksperymentu nie zapisany:", error instanceof Error ? error.message : error);
   }
+}
+
+function recordRunLog(
+  deps: PollerDependencies,
+  before: LifecycleRun,
+  after: LifecycleRun
+): void {
+  const closed = before.status !== "done" && after.status === "done";
+  const generationRetired = after.generation > before.generation;
+  if (!closed && !generationRetired) return;
+  writeRunLog(deps.store, after);
 }
 
 /** Decyzje człowieka nie nabijają serii breakera — tylko realne porażki fabryki. */
@@ -1495,6 +1508,10 @@ async function recordScore(
   const parsed = parseScorePayload(payload);
   if (!parsed) return;
   deps.store.setScore(run.ticketId, parsed.value, parsed.comment);
+  // `run` to kopia sprzed oceny — przebieg musi zobaczyć świeży score,
+  // inaczej plik do końca życia ticketu pokazuje „—”. writeRunLog jest fail-open.
+  const scored = deps.store.getRun(run.ticketId);
+  if (scored) writeRunLog(deps.store, scored);
   deps.store.markCommentProcessed(run.ticketId, commentId, "score");
   void appendExperimentRow({
     kind: "score",
