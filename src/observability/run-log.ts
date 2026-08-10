@@ -138,7 +138,6 @@ export function buildRunLog(store: LifecycleStore, run: LifecycleRun): string {
   const attempts = store.listAttempts(run.ticketId);
   const usage = store.totalUsage(run.ticketId);
   const humanTransitions = transitions.filter(isHumanTransition);
-  const generations = new Set(transitions.map((transition) => transition.generation)).size;
   const stages = [...aggregateStages(attempts).entries()]
     .sort(([leftStage, left], [rightStage, right]) =>
       right.usd - left.usd || leftStage.localeCompare(rightStage)
@@ -166,7 +165,7 @@ export function buildRunLog(store: LifecycleStore, run: LifecycleRun): string {
     "|---|---:|",
     `| koszt łączny | ${usd(usage.usd)} |`,
     `| czas prób łącznie | ${minutes(usage.minutes)} |`,
-    `| liczba generacji | ${generations} |`,
+    `| liczba generacji | ${run.generation} |`,
     `| liczba przejść | ${transitions.length} |`,
     `| przejścia wywołane przez człowieka | ${humanTransitions.length} |`,
     `| lead time | ${minutes(leadTimeMinutes(run))} |`,

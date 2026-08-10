@@ -269,6 +269,7 @@ test("Canceled dostaje plik, a /replan zapisuje i później nadpisuje pełną hi
     const path = join(root, "runs", replanId, "przebieg.md");
     const afterReplan = await readFile(path, "utf8");
     assert.match(afterReplan, /w toku — generacja 1 porzucona/);
+    assert.match(afterReplan, /\| liczba generacji \| 2 \|/);
     assert.match(afterReplan, /\/replan c-live/);
 
     applyTransition(deps, replanId, {
