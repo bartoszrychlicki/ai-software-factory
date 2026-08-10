@@ -1,0 +1,11 @@
+# Copy to projects.local.yaml (gitignored) and use absolute paths that exist on
+# your machine. Only keys listed here override the committed projects.yaml.
+
+pilot-app:
+  repo: /absolute/path/to/pilot-app
+
+br-budget:
+  repo: /absolute/path/to/br-budget
+
+br-factory:
+  repo: /absolute/path/to/ai-software-factory
