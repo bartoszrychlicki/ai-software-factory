@@ -14,7 +14,12 @@ export interface McpLinearClient {
     description?: string;
     labels?: string[];
   }): Promise<{ identifier: string; url: string }>;
-  getTicket(id: string): Promise<{ stateName: string; stateType: string }>;
+  getTicket(id: string): Promise<{
+    stateName: string;
+    stateType: string;
+    projectName: string | null;
+  }>;
+  projectNameOf(id: string): Promise<string | null>;
   setStateByName(id: string, stateName: string): Promise<void>;
   comment(id: string, body: string): Promise<void>;
 }
@@ -87,6 +92,20 @@ export function assertEnqueueAllowed(allowEnqueue: boolean): void {
   if (!allowEnqueue) {
     throw new Error(
       "ticket_enqueue jest wyłączone; ustaw FACTORY_MCP_ALLOW_ENQUEUE=on, aby jawnie oddawać tickety fabryce"
+    );
+  }
+}
+
+export function assertSameProject(
+  expected: string,
+  actual: string | null,
+  ticket: string
+): void {
+  if (actual === null || actual !== expected) {
+    const actualProject = actual === null ? "brak projektu" : `"${actual}"`;
+    throw new Error(
+      `Ticket ${ticket}: oczekiwany projekt "${expected}", ` +
+        `faktyczny projekt w Linearze: ${actualProject}`
     );
   }
 }
@@ -244,6 +263,7 @@ export function createFactoryTools(deps: FactoryToolDependencies) {
       assertProject(deps, input.project);
       const linear = assertWriteEnabled(deps.linearFor(input.project));
       const issue = await linear.getTicket(input.ticket);
+      assertSameProject(input.project, issue.projectName, input.ticket);
       if (issue.stateType !== "backlog") {
         throw new Error(
           `Ticket ${input.ticket} nie jest w Backlogu (aktualny stan: ${issue.stateName}); ` +
@@ -264,6 +284,8 @@ export function createFactoryTools(deps: FactoryToolDependencies) {
       assertNotCommand(input.body);
       assertProject(deps, input.project);
       const linear = assertWriteEnabled(deps.linearFor(input.project));
+      const projectName = await linear.projectNameOf(input.ticket);
+      assertSameProject(input.project, projectName, input.ticket);
       await linear.comment(input.ticket, input.body);
       return { commented: true, ticket: input.ticket, project: input.project };
     },

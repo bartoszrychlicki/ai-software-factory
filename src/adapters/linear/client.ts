@@ -26,6 +26,7 @@ interface LinearIssue {
   url: string;
   priorityLabel: string | null;
   labels: { nodes: { id: string; name: string }[] };
+  project: { id: string; name: string } | null;
   state: { id: string; name: string; type: string };
   team: { states: { nodes: { id: string; name: string; type: string }[] } };
 }
@@ -80,9 +81,19 @@ export class LinearSource implements TicketSource {
     return json.data as T;
   }
 
+  private assertMutationSuccess(
+    payload: { success?: boolean } | null | undefined,
+    what: string
+  ): void {
+    if (!payload || payload.success !== true) {
+      throw new Error(`Linear nie potwierdził zapisu: ${what}`);
+    }
+  }
+
   private issueFields = `
     id identifier title description url priorityLabel
     labels { nodes { id name } }
+    project { id name }
     state { id name type }
     team { states { nodes { id name type } } }
   `;
@@ -95,7 +106,9 @@ export class LinearSource implements TicketSource {
     return data.issue;
   }
 
-  async getTicket(identifier: string): Promise<Ticket & { stateName: string; stateType: string }> {
+  async getTicket(identifier: string): Promise<
+    Ticket & { stateName: string; stateType: string; projectName: string | null }
+  > {
     const issue = await this.fetchIssue(identifier);
     return {
       id: issue.identifier,
@@ -107,7 +120,13 @@ export class LinearSource implements TicketSource {
       url: issue.url,
       stateName: issue.state.name,
       stateType: issue.state.type,
+      projectName: issue.project?.name ?? null,
     };
+  }
+
+  async projectNameOf(identifier: string): Promise<string | null> {
+    const issue = await this.fetchIssue(identifier);
+    return issue.project?.name ?? null;
   }
 
   /** Zakłada ręcznie zlecony ticket zawsze w backlogu projektu, nigdy w kolejce pollera. */
@@ -302,10 +321,11 @@ export class LinearSource implements TicketSource {
     const signedBody = signature.profile === "orchestrator"
       ? body
       : `${signatureHeader(signature)}\n\n${body}`;
-    await this.gql(
+    const result = await this.gql<{ commentCreate: { success: boolean } | null }>(
       `mutation($input: CommentCreateInput!) { commentCreate(input: $input) { success } }`,
       { input: { issueId: issue.id, body: signedBody + signatureFooter(signature) } }
     );
+    this.assertMutationSuccess(result?.commentCreate, `komentarz do ticketu ${id}`);
   }
 
   /** Ustawia stan po dokładnej nazwie (stany procesu fabryki). */
@@ -313,10 +333,11 @@ export class LinearSource implements TicketSource {
     const issue = await this.fetchIssue(id);
     const state = issue.team.states.nodes.find((s) => s.name === stateName);
     if (!state) throw new Error(`Brak stanu "${stateName}" w teamie`);
-    await this.gql(
+    const result = await this.gql<{ issueUpdate: { success: boolean } | null }>(
       `mutation($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }`,
       { id: issue.id, input: { stateId: state.id } }
     );
+    this.assertMutationSuccess(result?.issueUpdate, `zmiana stanu ticketu ${id} na "${stateName}"`);
   }
 
   /** Aktualna nazwa stanu issue (wykrywanie aprobaty przez przeciągnięcie karty). */

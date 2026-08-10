@@ -128,8 +128,12 @@ port or install a background service.
 For Claude Code, use an absolute path to this repository:
 
 ```shell
-claude mcp add ai-factory -- npx tsx <ścieżka>/src/mcp/server.ts
+claude mcp add ai-factory --env FACTORY_ROOT=<ścieżka> -- npx tsx <ścieżka>/src/mcp/server.ts
 ```
+
+`FACTORY_ROOT` is required because the server resolves `projects.yaml` and the
+durable registry relative to the repository root, regardless of the client's
+current working directory.
 
 Clients using an `mcpServers` JSON block can use the equivalent configuration:
 

@@ -63,6 +63,7 @@ class FakeStore implements McpLifecycleReader {
 
 class FakeLinear implements McpLinearClient {
   comments: { id: string; body: string }[] = [];
+  projectName: string | null = "harness";
   state = { stateName: "Backlog", stateType: "backlog" };
   moved: { id: string; state: string }[] = [];
   creates: { title: string; description?: string; labels?: string[] }[] = [];
@@ -71,7 +72,8 @@ class FakeLinear implements McpLinearClient {
     this.creates.push(input);
     return { identifier: "BAR-201", url: "https://linear.app/acme/issue/BAR-201" };
   }
-  async getTicket() { return this.state; }
+  async getTicket() { return { ...this.state, projectName: this.projectName }; }
+  async projectNameOf() { return this.projectName; }
   async setStateByName(id: string, state: string) { this.moved.push({ id, state }); }
   async comment(id: string, body: string) { this.comments.push({ id, body }); }
 }
@@ -134,6 +136,35 @@ test("ticket_enqueue jest fail-closed bez flagi i przenosi wyłącznie backlog d
       .ticketEnqueue({ project: "harness", ticket: "BAR-200" }),
     /Backlog → Todo/
   );
+});
+
+test("zapisy odrzucają ticket z obcego projektu", async () => {
+  const linear = new FakeLinear();
+  const tools = createFactoryTools(deps({ linear, allowEnqueue: true }));
+
+  linear.projectName = "other";
+  await assert.rejects(
+    tools.ticketEnqueue({ project: "harness", ticket: "BAR-200" }),
+    /oczekiwany projekt "harness".*faktyczny projekt w Linearze: "other"/
+  );
+  await assert.rejects(
+    tools.ticketComment({ project: "harness", ticket: "BAR-200", body: "Komentarz" }),
+    /oczekiwany projekt "harness".*faktyczny projekt w Linearze: "other"/
+  );
+  assert.deepEqual(linear.moved, []);
+  assert.deepEqual(linear.comments, []);
+
+  linear.projectName = null;
+  await assert.rejects(
+    tools.ticketEnqueue({ project: "harness", ticket: "BAR-200" }),
+    /oczekiwany projekt "harness".*faktyczny projekt w Linearze: brak projektu/
+  );
+  await assert.rejects(
+    tools.ticketComment({ project: "harness", ticket: "BAR-200", body: "Komentarz" }),
+    /oczekiwany projekt "harness".*faktyczny projekt w Linearze: brak projektu/
+  );
+  assert.deepEqual(linear.moved, []);
+  assert.deepEqual(linear.comments, []);
 });
 
 test("brak LINEAR_API_KEY blokuje tylko zapisy, nie projekcje odczytu", async () => {
@@ -296,6 +327,48 @@ test("LinearSource.createIssue wybiera stan typu backlog i mapuje wszystkie labe
       }),
       /Nieznane labele/
     );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("LinearSource nie uznaje success:false ani pustego payloadu za zapis", async () => {
+  const originalFetch = globalThis.fetch;
+  const mutationResponses = [
+    { issueUpdate: { success: false } },
+    { issueUpdate: null },
+    { commentCreate: { success: false } },
+    { commentCreate: null },
+  ];
+  globalThis.fetch = (async (_url, init) => {
+    const request = JSON.parse(String(init?.body)) as { query: string };
+    if (request.query.includes("query($id: String!)")) {
+      return new Response(JSON.stringify({
+        data: {
+          issue: {
+            id: "issue-id",
+            identifier: "BAR-200",
+            title: "MCP dla fabryki",
+            description: "",
+            url: "https://linear.app/acme/issue/BAR-200",
+            priorityLabel: null,
+            labels: { nodes: [] },
+            project: { id: "project-id", name: "harness" },
+            state: { id: "backlog-id", name: "Backlog", type: "backlog" },
+            team: { states: { nodes: [{ id: "todo-id", name: "Todo", type: "unstarted" }] } },
+          },
+        },
+      }));
+    }
+    return new Response(JSON.stringify({ data: mutationResponses.shift() }));
+  }) as typeof fetch;
+  try {
+    const linear = new LinearSource("test-key", "harness");
+    await assert.rejects(linear.setStateByName("BAR-200", "Todo"), /nie potwierdził zapisu/);
+    await assert.rejects(linear.setStateByName("BAR-200", "Todo"), /nie potwierdził zapisu/);
+    await assert.rejects(linear.comment("BAR-200", "Komentarz"), /nie potwierdził zapisu/);
+    await assert.rejects(linear.comment("BAR-200", "Komentarz"), /nie potwierdził zapisu/);
+    assert.equal(mutationResponses.length, 0);
   } finally {
     globalThis.fetch = originalFetch;
   }
