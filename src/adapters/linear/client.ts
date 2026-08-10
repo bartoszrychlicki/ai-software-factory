@@ -30,6 +30,19 @@ interface LinearIssue {
   team: { states: { nodes: { id: string; name: string; type: string }[] } };
 }
 
+interface LinearProjectForCreate {
+  id: string;
+  name: string;
+  teams: {
+    nodes: {
+      id: string;
+      name: string;
+      states: { nodes: { id: string; name: string; type: string }[] };
+      labels: { nodes: { id: string; name: string }[] };
+    }[];
+  };
+}
+
 export interface LinearComment {
   id: string;
   body: string;
@@ -82,7 +95,7 @@ export class LinearSource implements TicketSource {
     return data.issue;
   }
 
-  async getTicket(identifier: string): Promise<Ticket & { stateName: string }> {
+  async getTicket(identifier: string): Promise<Ticket & { stateName: string; stateType: string }> {
     const issue = await this.fetchIssue(identifier);
     return {
       id: issue.identifier,
@@ -93,7 +106,76 @@ export class LinearSource implements TicketSource {
       priority: issue.priorityLabel ?? undefined,
       url: issue.url,
       stateName: issue.state.name,
+      stateType: issue.state.type,
     };
+  }
+
+  /** Zakłada ręcznie zlecony ticket zawsze w backlogu projektu, nigdy w kolejce pollera. */
+  async createIssue(input: {
+    title: string;
+    description?: string;
+    labels?: string[];
+  }): Promise<{ identifier: string; url: string }> {
+    const data = await this.gql<{ projects: { nodes: LinearProjectForCreate[] } }>(
+      `query($name: String!) {
+        projects(filter: { name: { eq: $name } }, first: 2) {
+          nodes {
+            id name
+            teams {
+              nodes {
+                id name
+                states { nodes { id name type } }
+                labels { nodes { id name } }
+              }
+            }
+          }
+        }
+      }`,
+      { name: this.project }
+    );
+    if (data.projects.nodes.length !== 1) {
+      throw new Error(
+        data.projects.nodes.length === 0
+          ? `Brak projektu "${this.project}" w Linearze`
+          : `Nazwa projektu "${this.project}" nie jest jednoznaczna w Linearze`
+      );
+    }
+    const project = data.projects.nodes[0];
+    if (project.teams.nodes.length !== 1) {
+      throw new Error(
+        `Projekt "${this.project}" musi należeć do dokładnie jednego teamu, ` +
+        `a należy do ${project.teams.nodes.length}`
+      );
+    }
+    const team = project.teams.nodes[0];
+    const requestedLabels = [...new Set(input.labels ?? [])];
+    const labelsByName = new Map(team.labels.nodes.map((label) => [label.name, label.id]));
+    const unknownLabels = requestedLabels.filter((label) => !labelsByName.has(label));
+    if (unknownLabels.length) {
+      throw new Error(`Nieznane labele w teamie "${team.name}": ${unknownLabels.join(", ")}`);
+    }
+    const backlog = pickState(team.states.nodes, "backlog");
+    const created = await this.gql<{
+      issueCreate: { success: boolean; issue: { identifier: string; url: string } | null };
+    }>(
+      `mutation($input: IssueCreateInput!) {
+        issueCreate(input: $input) { success issue { identifier url } }
+      }`,
+      {
+        input: {
+          teamId: team.id,
+          projectId: project.id,
+          stateId: backlog.id,
+          title: input.title,
+          description: input.description ?? "",
+          labelIds: requestedLabels.map((label) => labelsByName.get(label)),
+        },
+      }
+    );
+    if (!created.issueCreate.success || !created.issueCreate.issue) {
+      throw new Error(`Linear nie utworzył issue w projekcie "${this.project}"`);
+    }
+    return created.issueCreate.issue;
   }
 
   /**

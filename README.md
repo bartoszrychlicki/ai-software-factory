@@ -83,6 +83,7 @@ create worktrees, branches, commits and draft pull requests after the explicit
 │   ├── adapters/        # Linear, Mastra and coding-agent integrations
 │   ├── config/          # projects and routing loaders
 │   ├── observability/   # metrics, budgets, experiments and notifications
+│   ├── mcp/             # local stdio server exposing safe factory projections
 │   ├── mastra/          # Mastra registration and storage wiring
 │   └── legacy/          # v1 read/migration compatibility; not production runtime
 ├── test/                # deterministic Node test suite
@@ -112,9 +113,81 @@ transition path on existing hosts; a fresh clone never creates it.
 | `npm run verify` | doctor + tests + type-check + build |
 | `npm run dev` | start local Mastra Studio/API |
 | `npm run poller -- --once` | execute one live Linear polling cycle |
+| `npm run mcp` | start the local MCP stdio server |
 
 CI runs the same baseline from repository root: clean install, doctor, tests,
 type-check and build.
+
+## MCP server
+
+The local MCP server lets a trusted desktop or coding assistant inspect the
+factory's durable state without scraping Linear or logs. It uses stdio only:
+the MCP client starts it as a child process, and the factory does not open a
+port or install a background service.
+
+For Claude Code, use an absolute path to this repository:
+
+```shell
+claude mcp add ai-factory -- npx tsx <ścieżka>/src/mcp/server.ts
+```
+
+Clients using an `mcpServers` JSON block can use the equivalent configuration:
+
+```json
+{
+  "mcpServers": {
+    "ai-factory": {
+      "command": "npx",
+      "args": ["tsx", "/absolute/path/to/ai-software-factory/src/mcp/server.ts"],
+      "env": {
+        "FACTORY_ROOT": "/absolute/path/to/ai-software-factory"
+      }
+    }
+  }
+}
+```
+
+The server exposes exactly these tools:
+
+| Tool | Access | Purpose |
+|---|---|---|
+| `factory_projects` | read | safe project configuration and limits |
+| `factory_health` | read | breaker, poller lease, active runs and hourly cost |
+| `queue_overview` | read | active tickets, current gate, owner of the next action and age |
+| `ticket_status` | read | one durable run, review/smoke state, errors, budget and human commands |
+| `ticket_plan` | read | clipped plan, human summary, triage, critique and research briefs |
+| `ticket_attempts` | read | stage attempts, model signature, cost, duration and optional report tail |
+| `ticket_create` | write | create a Linear issue in a state of type `backlog` |
+| `ticket_enqueue` | write | move an existing backlog issue to `Todo` when explicitly enabled |
+| `ticket_comment` | write | add a non-command Linear comment |
+
+Configuration is read from the process environment first and then from the
+repository `.env` for missing values:
+
+| Variable | Meaning |
+|---|---|
+| `FACTORY_ROOT` | repository root; set it when the client starts elsewhere |
+| `LINEAR_API_KEY` | enables only the three Linear write tools; reads start without it |
+| `LINEAR_PROJECTS` | comma-separated project keys exposed by this MCP process |
+| `FACTORY_LIFECYCLE_DB` | optional explicit path to the durable SQLite registry |
+| `FACTORY_MCP_ALLOW_ENQUEUE` | must equal `on` to enable `ticket_enqueue` |
+
+The lifecycle database is opened with SQLite's read-only mode. The MCP process
+does not create or migrate it, acquire or renew the poller lease, or become a
+second lifecycle writer. A missing registry is reported by read tools as a
+clear error and never creates an empty database.
+
+Human decision commands are deliberately absent. The MCP server cannot
+`/approve`, `/reject`, `/answer`, `/done`, `/fix`, `/replan`, `/restart`,
+`/retry`, `/score` or `/scope`; `ticket_comment` rejects any first token that
+looks like a slash command, including editor-autoformatted variants. Gates
+remain exclusively in Linear.
+
+This is a trusted, single-user local tool, not an authorization boundary.
+Anyone who can run the configured MCP client can see plans, review reports and
+local repository paths and—when the Linear key is present—create issues or add
+comments as that user. Never expose the process remotely or put secrets in MCP
+configuration committed to the repository.
 
 ## Runtime model
 

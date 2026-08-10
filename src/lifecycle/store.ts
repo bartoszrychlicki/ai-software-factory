@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { findUpFile } from "../config/projects";
@@ -215,8 +215,20 @@ export function lifecycleDbPath(): string {
  */
 export class LifecycleStore {
   private readonly db: DatabaseSync;
+  private readonly readOnly: boolean;
 
-  constructor(path = lifecycleDbPath()) {
+  constructor(path = lifecycleDbPath(), options: { readOnly?: boolean } = {}) {
+    this.readOnly = options.readOnly ?? false;
+    if (this.readOnly) {
+      if (!existsSync(path)) {
+        throw new Error(
+          `Fabryka nie ma jeszcze rejestru lifecycle: brak pliku ${path}`
+        );
+      }
+      this.db = new DatabaseSync(path, { readOnly: true });
+      this.db.exec("PRAGMA busy_timeout = 5000;");
+      return;
+    }
     mkdirSync(dirname(path), { recursive: true });
     this.db = new DatabaseSync(path);
     this.db.exec(`
@@ -377,7 +389,12 @@ export class LifecycleStore {
     this.db.close();
   }
 
+  private assertWritable(): void {
+    if (this.readOnly) throw new Error("LifecycleStore otwarty read-only");
+  }
+
   private transaction<T>(fn: () => T): T {
+    this.assertWritable();
     this.db.exec("BEGIN IMMEDIATE");
     try {
       const result = fn();
@@ -390,6 +407,7 @@ export class LifecycleStore {
   }
 
   createRun(ticketId: string, project: string, manifest: TicketManifestV2): LifecycleRun {
+    this.assertWritable();
     return this.transaction(() => {
       const previous = this.getRun(ticketId);
       const timestamp = now();
@@ -548,6 +566,7 @@ export class LifecycleStore {
   enqueue(command: Omit<LifecycleCommand, "state" | "attempts" | "createdAt" | "updatedAt" | "availableAt"> & {
     availableAt?: string;
   }): void {
+    this.assertWritable();
     this.transaction(() => this.insertCommand(command, now()));
   }
 
@@ -595,6 +614,7 @@ export class LifecycleStore {
    * inkrementuje attempts) — używane przy serializacji kolizji plikowych.
    */
   deferCommand(key: string, availableAt: string): void {
+    this.assertWritable();
     this.db.prepare(`
       UPDATE lifecycle_commands SET available_at=?, updated_at=?
       WHERE idempotency_key=? AND state='pending'
@@ -613,6 +633,7 @@ export class LifecycleStore {
     state: LifecycleCommand["state"],
     options: { externalId?: string; error?: string; retryAt?: string } = {}
   ): void {
+    this.assertWritable();
     const retry = state === "pending";
     this.db.prepare(`
       UPDATE lifecycle_commands
@@ -649,6 +670,7 @@ export class LifecycleStore {
       | "budgetUsedUsd"
     > = {}
   ): StageAttempt {
+    this.assertWritable();
     const startedAt = now();
     this.db.prepare(`
       INSERT INTO lifecycle_stage_attempts (
@@ -709,6 +731,7 @@ export class LifecycleStore {
       | "durationMs"
     >
   ): void {
+    this.assertWritable();
     this.db.prepare(`
       UPDATE lifecycle_stage_attempts
       SET status=?, outcome=?, report=?, signature=?, sha=COALESCE(?, sha),
@@ -763,6 +786,7 @@ export class LifecycleStore {
    * nie może istnieć (SQLite odmówi nadpisania istniejącego pliku).
    */
   backupTo(path: string): void {
+    this.assertWritable();
     mkdirSync(dirname(path), { recursive: true });
     this.db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
     this.db.exec(`VACUUM INTO '${path.replace(/'/g, "''")}'`);
@@ -780,6 +804,7 @@ export class LifecycleStore {
   }
 
   claimLease(pid: number, hostname?: string): void {
+    this.assertWritable();
     this.db.prepare(`
       INSERT INTO lifecycle_lease (id, pid, hostname, heartbeat_at) VALUES (1, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
@@ -788,10 +813,12 @@ export class LifecycleStore {
   }
 
   renewLease(pid: number): void {
+    this.assertWritable();
     this.db.prepare("UPDATE lifecycle_lease SET heartbeat_at=? WHERE id=1 AND pid=?").run(now(), pid);
   }
 
   releaseLease(pid: number): void {
+    this.assertWritable();
     this.db.prepare("DELETE FROM lifecycle_lease WHERE id=1 AND pid=?").run(pid);
   }
 
@@ -827,6 +854,7 @@ export class LifecycleStore {
 
   /** Ocena jakości od człowieka (/score) — zapis przy runie, bez przejścia lifecycle. */
   setScore(ticketId: string, score: number, comment?: string): void {
+    this.assertWritable();
     this.db.prepare(`
       UPDATE lifecycle_runs SET score=?, score_comment=?, scored_at=?, updated_at=?
       WHERE ticket_id=?
@@ -863,6 +891,7 @@ export class LifecycleStore {
   }
 
   markCommentProcessed(ticketId: string, commentId: string, command?: string): void {
+    this.assertWritable();
     this.db.prepare(`
       INSERT OR IGNORE INTO lifecycle_processed_comments (
         comment_id, ticket_id, command, processed_at
