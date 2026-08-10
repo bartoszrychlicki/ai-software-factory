@@ -204,6 +204,26 @@ const parseJson = <T>(value: unknown, fallback: T): T => {
   }
 };
 
+const READ_ONLY_REQUIRED_COLUMNS = {
+  lifecycle_runs: [
+    "ticket_id", "project", "generation", "stage", "status", "manifest_json",
+    "plan", "plan_files_json", "plan_domain", "clarify_round", "approved_at",
+    "branch", "workspace_dir", "head_sha", "tested_sha", "pr_url", "merged_sha",
+    "review_status", "review_report", "smoke_status", "blocked_stage", "error_code",
+    "error_message", "feedback", "plan_entry", "plan_variant", "triage_summary",
+    "briefs_json", "research_failures_json", "critique_round", "fix_round",
+    "critique_verdict", "critique_report", "critique_meaning", "degradations_json",
+    "score", "score_comment", "scored_at", "created_at", "updated_at",
+  ],
+  lifecycle_stage_attempts: [
+    "ticket_id", "stage", "attempt", "job_run_id", "input_hash", "sha", "status",
+    "outcome", "report", "signature", "error_code", "error_message", "cost_usd",
+    "cost_source", "duration_ms", "budget_max_minutes", "budget_max_usd",
+    "budget_used_minutes", "budget_used_usd", "started_at", "finished_at",
+  ],
+  lifecycle_lease: ["id", "pid", "hostname", "heartbeat_at"],
+} as const;
+
 export function lifecycleDbPath(): string {
   return process.env.FACTORY_LIFECYCLE_DB ??
     join(dirname(findUpFile("package.json")), "runs", "lifecycle.db");
@@ -226,7 +246,13 @@ export class LifecycleStore {
         );
       }
       this.db = new DatabaseSync(path, { readOnly: true });
-      this.db.exec("PRAGMA busy_timeout = 5000;");
+      try {
+        this.db.exec("PRAGMA busy_timeout = 5000;");
+        this.assertReadableSchema();
+      } catch (error) {
+        this.db.close();
+        throw error;
+      }
       return;
     }
     mkdirSync(dirname(path), { recursive: true });
@@ -391,6 +417,23 @@ export class LifecycleStore {
 
   private assertWritable(): void {
     if (this.readOnly) throw new Error("LifecycleStore otwarty read-only");
+  }
+
+  private assertReadableSchema(): void {
+    const missing: string[] = [];
+    for (const [table, requiredColumns] of Object.entries(READ_ONLY_REQUIRED_COLUMNS)) {
+      const columns = this.db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
+      const available = new Set(columns.map((column) => column.name));
+      for (const column of requiredColumns) {
+        if (!available.has(column)) missing.push(`${table}.${column}`);
+      }
+    }
+    if (missing.length) {
+      throw new Error(
+        `Rejestr lifecycle ma niekompatybilny schemat (brak: ${missing.join(", ")}); ` +
+          "uruchom poller, aby wykonać migrację"
+      );
+    }
   }
 
   private transaction<T>(fn: () => T): T {

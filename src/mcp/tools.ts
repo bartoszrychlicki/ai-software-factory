@@ -1,5 +1,6 @@
 import type { ProjectConfig } from "../config/projects";
 import { isCommandAttempt, parseCommand } from "../lifecycle/commands";
+import { MCP_SIGNATURE, type ActionSignature } from "../lifecycle/signature";
 import { LINEAR_STATE_MAP } from "../lifecycle/state-map";
 import type { LifecycleRun, LifecycleStore, StageAttempt } from "../lifecycle/store";
 import { attemptRow, planView, runSummary } from "./projection";
@@ -19,9 +20,8 @@ export interface McpLinearClient {
     stateType: string;
     projectName: string | null;
   }>;
-  projectNameOf(id: string): Promise<string | null>;
   setStateByName(id: string, stateName: string): Promise<void>;
-  comment(id: string, body: string): Promise<void>;
+  comment(id: string, body: string, signature?: ActionSignature): Promise<void>;
 }
 
 export interface BreakerSnapshot {
@@ -284,9 +284,9 @@ export function createFactoryTools(deps: FactoryToolDependencies) {
       assertNotCommand(input.body);
       assertProject(deps, input.project);
       const linear = assertWriteEnabled(deps.linearFor(input.project));
-      const projectName = await linear.projectNameOf(input.ticket);
-      assertSameProject(input.project, projectName, input.ticket);
-      await linear.comment(input.ticket, input.body);
+      const issue = await linear.getTicket(input.ticket);
+      assertSameProject(input.project, issue.projectName, input.ticket);
+      await linear.comment(input.ticket, input.body, MCP_SIGNATURE);
       return { commented: true, ticket: input.ticket, project: input.project };
     },
   };

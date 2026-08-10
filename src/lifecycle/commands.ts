@@ -1,5 +1,5 @@
 import type { DecisionKind } from "./operator-types";
-import { openGate, type OpenGateInput } from "../mcp/projection";
+import { openGate, type OpenGateInput } from "./gates";
 
 export type OperatorCommandKind = "retry" | "replan" | "restart" | "fix" | "score" | "scope";
 export type CommandKind = DecisionKind | OperatorCommandKind;

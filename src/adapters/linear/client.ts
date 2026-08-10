@@ -124,11 +124,6 @@ export class LinearSource implements TicketSource {
     };
   }
 
-  async projectNameOf(identifier: string): Promise<string | null> {
-    const issue = await this.fetchIssue(identifier);
-    return issue.project?.name ?? null;
-  }
-
   /** Zakłada ręcznie zlecony ticket zawsze w backlogu projektu, nigdy w kolejce pollera. */
   async createIssue(input: {
     title: string;

@@ -128,7 +128,7 @@ port or install a background service.
 For Claude Code, use an absolute path to this repository:
 
 ```shell
-claude mcp add ai-factory --env FACTORY_ROOT=<ścieżka> -- npx tsx <ścieżka>/src/mcp/server.ts
+claude mcp add ai-factory --env FACTORY_ROOT=<ścieżka> -- <ścieżka>/node_modules/.bin/tsx <ścieżka>/src/mcp/server.ts
 ```
 
 `FACTORY_ROOT` is required because the server resolves `projects.yaml` and the
@@ -141,8 +141,8 @@ Clients using an `mcpServers` JSON block can use the equivalent configuration:
 {
   "mcpServers": {
     "ai-factory": {
-      "command": "npx",
-      "args": ["tsx", "/absolute/path/to/ai-software-factory/src/mcp/server.ts"],
+      "command": "/absolute/path/to/ai-software-factory/node_modules/.bin/tsx",
+      "args": ["/absolute/path/to/ai-software-factory/src/mcp/server.ts"],
       "env": {
         "FACTORY_ROOT": "/absolute/path/to/ai-software-factory"
       }

@@ -90,6 +90,32 @@ test("brak lifecycle.db daje czytelny błąd i nie tworzy pliku", () => {
   }
 });
 
+test("stary schemat read-only daje czytelny błąd i nie uruchamia migracji", () => {
+  const { dir, path } = tempDatabase();
+  let inspection: DatabaseSync | undefined;
+  try {
+    const writer = new LifecycleStore(path);
+    writer.close();
+    const oldSchema = new DatabaseSync(path);
+    oldSchema.exec("ALTER TABLE lifecycle_runs DROP COLUMN review_report");
+    oldSchema.close();
+
+    assert.throws(
+      () => new LifecycleStore(path, { readOnly: true }),
+      /niekompatybilny schemat.*uruchom poller/i
+    );
+
+    inspection = new DatabaseSync(path, { readOnly: true });
+    const columns = inspection.prepare("PRAGMA table_info(lifecycle_runs)").all() as {
+      name: string;
+    }[];
+    assert.equal(columns.some((column) => column.name === "review_report"), false);
+  } finally {
+    inspection?.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("reader nie blokuje się podczas otwartej transakcji writera w WAL", () => {
   const { dir, path } = tempDatabase();
   let rawWriter: DatabaseSync | undefined;

@@ -73,14 +73,13 @@ class FakeLinear implements McpLinearClient {
     return { identifier: "BAR-201", url: "https://linear.app/acme/issue/BAR-201" };
   }
   async getTicket() { return { ...this.state, projectName: this.projectName }; }
-  async projectNameOf() { return this.projectName; }
   async setStateByName(id: string, state: string) { this.moved.push({ id, state }); }
   async comment(id: string, body: string) { this.comments.push({ id, body }); }
 }
 
 function deps(options: {
   store?: FakeStore;
-  linear?: FakeLinear;
+  linear?: McpLinearClient;
   allowEnqueue?: boolean;
   breaker?: BreakerSnapshot;
 } = {}): FactoryToolDependencies {
@@ -115,6 +114,53 @@ test("ticket_comment odrzuca komendy i przepuszcza slash wewnątrz komentarza", 
     body: "patrz src/x.ts",
   });
   assert.deepEqual(linear.comments, [{ id: "BAR-200", body: "patrz src/x.ts" }]);
+});
+
+test("ticket_comment podpisuje realne body mutacji jako MCP", async () => {
+  const originalFetch = globalThis.fetch;
+  let sentBody: string | undefined;
+  globalThis.fetch = (async (_url, init) => {
+    const request = JSON.parse(String(init?.body)) as {
+      query: string;
+      variables?: { input?: { body?: string } };
+    };
+    if (request.query.includes("commentCreate")) {
+      sentBody = request.variables?.input?.body;
+      return new Response(JSON.stringify({
+        data: { commentCreate: { success: true } },
+      }));
+    }
+    return new Response(JSON.stringify({
+      data: {
+        issue: {
+          id: "issue-id",
+          identifier: "BAR-200",
+          title: "MCP dla fabryki",
+          description: "",
+          url: "https://linear.app/acme/issue/BAR-200",
+          priorityLabel: null,
+          labels: { nodes: [] },
+          project: { id: "project-id", name: "harness" },
+          state: { id: "backlog-id", name: "Backlog", type: "backlog" },
+          team: { states: { nodes: [] } },
+        },
+      },
+    }));
+  }) as typeof fetch;
+  try {
+    const linear = new LinearSource("test-key", "harness");
+    await createFactoryTools(deps({ linear })).ticketComment({
+      project: "harness",
+      ticket: "BAR-200",
+      body: "Komentarz asystenta",
+    });
+    assert.equal(
+      sentBody,
+      "Komentarz asystenta\n\n> 🖋️ ai-factory · mcp · — · orchestrator"
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("ticket_enqueue jest fail-closed bez flagi i przenosi wyłącznie backlog do Todo", async () => {
