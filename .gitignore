@@ -1,4 +1,37 @@
-# Repo pilotowe (osobny git, GitHub: bartoszrychlicki/pilot-app) — nie wchodzi do ai-sdlc
+# Dependencies and generated output
+node_modules/
+dist/
+.mastra/
+coverage/
+output.txt
+
+# Runtime state
+runs/
+*.db
+*.db-*
+*.duckdb
+*.duckdb.wal
+.netlify/
+.vercel/
+
+# Host-specific configuration and secrets
+.env
+.env.*
+!.env.example
+projects.local.yaml
+routing.local.yaml
+
+# Local agent state
+.claude/settings.local.json
+.claude/worktrees/
+
+# Local repositories used as factory targets
 pilot-app/
 iphone-mirroring-eu-enabler/
+
+# Pre-flattening runtime directory. New clones never create it; existing hosts
+# keep it only until the controlled migration to root-level runs/ and .env.
+/ai-factory/
+
+# OS files
 .DS_Store

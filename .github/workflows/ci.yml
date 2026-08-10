@@ -8,10 +8,6 @@ on:
 permissions:
   contents: read
 
-defaults:
-  run:
-    working-directory: ai-factory
-
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -27,8 +23,9 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: ai-factory/package-lock.json
+          cache-dependency-path: package-lock.json
       - run: npm ci
+      - run: npm run doctor -- --ci
       - run: npm test
       - run: npm run check
       - run: npm run build

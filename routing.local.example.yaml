@@ -1,0 +1,10 @@
+# Copy to routing.local.yaml (gitignored) to select models available on your
+# machine. A scalar means one engine; a list allows one infrastructure fallback.
+
+defaults:
+  plan: codex
+  build: codex
+  verify: codex
+  # Review must use a different engine than build.
+  review: claude-code/sonnet
+  review.diverse: codex

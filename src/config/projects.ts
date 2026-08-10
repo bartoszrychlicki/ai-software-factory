@@ -1,0 +1,107 @@
+import { existsSync } from "node:fs";
+import { dirname, isAbsolute, join, resolve } from "node:path";
+import { localConfigPath, mergeSection, readLocalOverride, readYamlMapping } from "./local-config";
+import type { ProgressLevel } from "../lifecycle/progress";
+
+export interface ProjectConfig {
+  repo: string;
+  github?: string;
+  default_branch?: string;
+  routing?: Record<string, string>; // per-projektowe nadpisania silników/modeli
+  checks?: string[]; // komendy weryfikacyjne projektu (uruchamiane na świeżym checkoutcie)
+  /** GitHub checks wymagane dla dokładnego PR head SHA przed review i zdjęciem draftu. */
+  ci?: { requiredChecks: string[]; timeoutMinutes?: number };
+  /** Budżet czasu dla wywołania silnika verify. */
+  verify?: { budgetMinutes?: number };
+  /** Opcjonalny podgląd wyniku: fabryka stawia serwer, robi screenshot i dołącza do raportu. */
+  screenshot?: { start: string; url: string };
+  /** Limit równolegle prowadzonych ticketów projektu (BAR-122). Domyślnie bez limitu. */
+  max_concurrent_tickets?: number;
+  /** "extended" = fabryka pisze stany procesu w Linear (🧠❓🚦🔨🧪👀✅) zamiast prostego In Progress/In Review. */
+  statuses?: "extended";
+  /** Kanał krótkich komentarzy przejść lifecycle w Linear. Domyślnie milestones. */
+  progress?: ProgressLevel;
+  /** Budżet per ticket-run (nadpisuje globalne defaulty FACTORY_BUDGET_*). */
+  budget?: { maxMinutes?: number; maxUsd?: number };
+  /**
+   * Pipeline planowania: "v3" = triage → (solo | research ×3 → synteza →
+   * krytyka); brak/inna wartość = klasyczny pojedynczy job planu (v2).
+   */
+  planPipeline?: "v2" | "v3";
+  /** QA: runda 1 = e2e w verify (komenda na świeżym checkoutcie); runda 2 = prod smoke po merge'u. */
+  qa?: {
+    e2e?: string;
+    prodChecks?: { name: string; url: string; status?: number; textIncludes?: string; headerIncludes?: string }[];
+  };
+  /** Dodatkowe chronione ścieżki projektu (pełna ścieżka, prefiks katalogu albo basename). */
+  scope?: { protected?: string[] };
+  /** Deterministyczne bramki bezpieczeństwa: semgrep true = `--config auto`, string = ścieżka reguł w repo. */
+  security?: { semgrep?: boolean | string };
+}
+
+export const DEFAULT_VERIFY_BUDGET_MINUTES = 5;
+
+export function progressLevel(project: ProjectConfig): ProgressLevel {
+  const level = project.progress ?? "milestones";
+  if (!["off", "milestones", "verbose"].includes(level)) {
+    throw new Error(
+      `Nieznany poziom progress "${String(level)}" — dozwolone: off, milestones, verbose.`
+    );
+  }
+  return level;
+}
+
+export function verifyBudgetMinutes(project: ProjectConfig): number {
+  return project.verify?.budgetMinutes ?? DEFAULT_VERIFY_BUDGET_MINUTES;
+}
+
+/** mastra dev uruchamia kod z .mastra/output — szukamy pliku konfiguracyjnego w górę drzewa */
+export function findUpFile(name: string): string {
+  if (process.env.FACTORY_ROOT) return join(process.env.FACTORY_ROOT, name);
+  let dir = process.cwd();
+  while (true) {
+    const candidate = join(dir, name);
+    if (existsSync(candidate)) return candidate;
+    const parent = dirname(dir);
+    if (parent === dir) {
+      throw new Error(`Nie znaleziono ${name} — ustaw FACTORY_ROOT albo uruchamiaj z root repo`);
+    }
+    dir = parent;
+  }
+}
+
+export async function getProject(key: string): Promise<ProjectConfig> {
+  const basePath = findUpFile("projects.yaml");
+  const all = await readYamlMapping(basePath);
+  // Opcjonalny, gitignorowany projects.local.yaml per host: płytki merge per
+  // projekt/klucz, local wygrywa; walidacja fail-closed niżej działa na wyniku.
+  const local = await readLocalOverride(basePath);
+  if (local) {
+    for (const [projectKey, override] of Object.entries(local)) {
+      if (override === null || override === undefined) continue; // pusty stub sekcji = brak nadpisań
+      all[projectKey] = mergeSection(all[projectKey], override, `${localConfigPath(basePath)}: ${projectKey}`);
+    }
+  }
+  const project = all[key] as ProjectConfig | undefined;
+  if (!project) throw new Error(`Nieznany projekt "${key}" — brak wpisu w projects.yaml`);
+  if (typeof project.repo !== "string" || !project.repo.trim()) {
+    throw new Error(`Projekt "${key}" nie ma ścieżki repo.`);
+  }
+  // Relative paths make the committed sample portable. They are resolved from
+  // projects.yaml, while production hosts can still use absolute local overrides.
+  project.repo = isAbsolute(project.repo)
+    ? project.repo
+    : resolve(dirname(basePath), project.repo);
+  const checks = project.checks?.map((command) => command.trim()).filter(Boolean) ?? [];
+  if (!checks.length) {
+    throw new Error(`Projekt "${key}" nie ma deterministycznych checks — rejestracja jest fail-closed.`);
+  }
+  const requiredChecks = project.ci?.requiredChecks?.map((name) => name.trim()).filter(Boolean) ?? [];
+  if (project.github && !requiredChecks.length) {
+    throw new Error(`Projekt "${key}" ma GitHub, ale nie ma ci.requiredChecks — PR nie może być bezpiecznie opublikowany.`);
+  }
+  project.checks = checks;
+  if (project.ci) project.ci.requiredChecks = requiredChecks;
+  progressLevel(project);
+  return project;
+}
