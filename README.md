@@ -124,6 +124,12 @@ waits for a human, CI or merge, and no workflow is resumed across those gates.
 The poller can restart at any stage because attempts and an idempotent outbox
 are durable.
 
+When a ticket finishes, is canceled or retires a generation, the poller
+overwrites `runs/<ticket>/przebieg.md` with the ticket's complete transition
+timeline, human-triggered decisions, attempt costs and links to per-job
+artifacts. This is a local diagnostic artifact only; `runs/` remains ignored
+and nothing from the log is published back to Linear.
+
 Projects using `planPipeline: v3` extend planning with triage, three parallel
 research roles, synthesis and one critique/revision round. The human still
 approves the single resulting plan before any build begins.
