@@ -1,6 +1,6 @@
 import { mkdirSync, readdirSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { findUpFile } from "../config/projects";
+import { join } from "node:path";
+import { jobArtifactsDir, ticketRunsDir } from "../config/paths";
 import type {
   LifecycleRun,
   LifecycleStore,
@@ -17,12 +17,15 @@ interface StageSummary {
 }
 
 // `human` to jawne komendy, `linear` to ręczne zmiany ticketu. Push zmieniający
-// head PR-a ma aktora `github`, ale fizycznie pochodzi od operatora — dlatego
-// `pr-head-changed` również liczymy jako decyzję wywołaną przez człowieka.
+// head PR-a ma aktora `github`, a blokada po /reject aktora `coordinator`, ale
+// obie fizycznie pochodzą od operatora — dlatego również liczymy je jako
+// decyzje wywołane przez człowieka.
 const HUMAN_TRANSITION_ACTORS = new Set(["human", "linear"]);
 
 function isHumanTransition(transition: LifecycleTransition): boolean {
-  return HUMAN_TRANSITION_ACTORS.has(transition.actor) || transition.reason === "pr-head-changed";
+  return HUMAN_TRANSITION_ACTORS.has(transition.actor) ||
+    transition.reason === "pr-head-changed" ||
+    transition.reason.startsWith("PLAN_REJECTED /reject ");
 }
 
 function flatText(value: unknown): string {
@@ -36,7 +39,7 @@ function cell(value: unknown): string {
 
 function clippedReason(reason: string): string {
   const text = flatText(reason).trim();
-  return text.length <= 120 ? text : `${text.slice(0, 119)}…`;
+  return text.length <= 200 ? text : `${text.slice(0, 199)}…`;
 }
 
 function usd(value: number): string {
@@ -47,15 +50,19 @@ function minutes(value: number): string {
   return `${value.toFixed(2)} min`;
 }
 
-function leadTimeMinutes(run: LifecycleRun): number {
-  const elapsed = Date.parse(run.updatedAt) - Date.parse(run.createdAt);
+function leadTimeMinutes(store: LifecycleStore, run: LifecycleRun): number {
+  const finishedAt = store.terminalTransitionAt(run.ticketId) ?? run.updatedAt;
+  const elapsed = Date.parse(finishedAt) - Date.parse(run.createdAt);
   return Number.isFinite(elapsed) ? Math.max(0, elapsed) / 60_000 : 0;
 }
 
 function finalStatus(run: LifecycleRun): string {
   if (run.status === "done" && run.errorCode === "CANCELED") return "anulowany";
   if (run.status === "done") return "done";
-  return `w toku — generacja ${Math.max(1, run.generation - 1)} porzucona`;
+  if (run.status === "blocked") {
+    return `zablokowany (${run.errorCode ?? "brak kodu"}) — generacja ${run.generation} aktywna`;
+  }
+  return `w toku — generacja ${run.generation}, etap ${run.stage}/${run.status}`;
 }
 
 function transitionState(stage: string | undefined, status: string | undefined): string {
@@ -106,9 +113,9 @@ function aggregateStages(attempts: StageAttempt[]): Map<string, StageSummary> {
   return stages;
 }
 
-function artifactLinks(root: string, ticketId: string, attempt: StageAttempt): string {
+function artifactLinks(ticketId: string, attempt: StageAttempt): string {
   if (!attempt.jobRunId) return "— brak artefaktów";
-  const dir = join(root, "runs", ticketId, attempt.jobRunId);
+  const dir = jobArtifactsDir(ticketId, attempt.jobRunId);
   try {
     const files = readdirSync(dir, { withFileTypes: true })
       .filter((entry) => entry.isFile())
@@ -133,7 +140,6 @@ function attemptError(attempt: StageAttempt): string {
 
 /** Składa pełny, tylko-do-odczytu widok historii ticketu z trwałego store. */
 export function buildRunLog(store: LifecycleStore, run: LifecycleRun): string {
-  const root = dirname(findUpFile("package.json"));
   const transitions = store.listTransitions(run.ticketId);
   const attempts = store.listAttempts(run.ticketId);
   const usage = store.totalUsage(run.ticketId);
@@ -166,9 +172,10 @@ export function buildRunLog(store: LifecycleStore, run: LifecycleRun): string {
     `| koszt łączny | ${usd(usage.usd)} |`,
     `| czas prób łącznie | ${minutes(usage.minutes)} |`,
     `| liczba generacji | ${run.generation} |`,
+    ...(run.generation > 1 ? [`| porzucone generacje | ${run.generation - 1} |`] : []),
     `| liczba przejść | ${transitions.length} |`,
     `| przejścia wywołane przez człowieka | ${humanTransitions.length} |`,
-    `| lead time | ${minutes(leadTimeMinutes(run))} |`,
+    `| lead time${run.status === "done" ? "" : " (w toku)"} | ${minutes(leadTimeMinutes(store, run))} |`,
     `| ocena /score | ${cell(score)} |`,
     "",
     "## Koszt per etap",
@@ -216,7 +223,7 @@ export function buildRunLog(store: LifecycleStore, run: LifecycleRun): string {
       attempt.durationMs === undefined ? "—" : minutes(attempt.durationMs / 60_000),
       cell(attempt.signature),
       cell(attemptError(attempt)),
-      artifactLinks(root, run.ticketId, attempt),
+      artifactLinks(run.ticketId, attempt),
     ].join(" | ")} |`);
   }
   if (attempts.length === 0) {
@@ -229,8 +236,7 @@ export function buildRunLog(store: LifecycleStore, run: LifecycleRun): string {
 /** Nadpisuje lokalny punkt wejścia do artefaktów; błąd zawsze jest fail-open. */
 export function writeRunLog(store: LifecycleStore, run: LifecycleRun): void {
   try {
-    const root = dirname(findUpFile("package.json"));
-    const dir = join(root, "runs", run.ticketId);
+    const dir = ticketRunsDir(run.ticketId);
     mkdirSync(dir, { recursive: true });
     writeFileSync(join(dir, "przebieg.md"), buildRunLog(store, run));
   } catch (error) {

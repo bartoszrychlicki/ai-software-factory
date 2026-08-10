@@ -1,7 +1,7 @@
 import { mkdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { findUpFile } from "../config/projects";
+import { runsRoot } from "../config/paths";
 
 export type LifecycleStage =
   | "plan"
@@ -218,8 +218,7 @@ const parseJson = <T>(value: unknown, fallback: T): T => {
 };
 
 export function lifecycleDbPath(): string {
-  return process.env.FACTORY_LIFECYCLE_DB ??
-    join(dirname(findUpFile("package.json")), "runs", "lifecycle.db");
+  return process.env.FACTORY_LIFECYCLE_DB ?? join(runsRoot(), "lifecycle.db");
 }
 
 /**
@@ -834,6 +833,24 @@ export class LifecycleStore {
   }
 
   /**
+   * Koniec lead time: ostatnie przejście domykające run. Dla aktywnego runu
+   * zwracamy ostatnie przejście, aby raport nie zależał od późniejszego /score.
+   */
+  terminalTransitionAt(ticketId: string): string | undefined {
+    const terminal = this.db.prepare(`
+      SELECT created_at FROM lifecycle_transitions
+      WHERE ticket_id=? AND to_status='done'
+      ORDER BY id DESC LIMIT 1
+    `).get(ticketId) as { created_at: string } | undefined;
+    if (terminal) return terminal.created_at;
+    const latest = this.db.prepare(`
+      SELECT created_at FROM lifecycle_transitions
+      WHERE ticket_id=? ORDER BY id DESC LIMIT 1
+    `).get(ticketId) as { created_at: string } | undefined;
+    return latest?.created_at;
+  }
+
+  /**
    * Próby w toku (status running) — rezerwacja budżetu przed dispatchem
    * kolejnego joba: totalUsage widzi tylko koszty ZAKOŃCZONYCH prób, więc
    * równoległy fan-out (research ×3) mógłby przekroczyć limit wielokrotnie.
@@ -901,8 +918,7 @@ export class LifecycleStore {
     files: string[];
     outcome?: string;
   } | undefined {
-    const root = process.env.FACTORY_RUNS_ROOT ??
-      join(dirname(findUpFile("package.json")), "runs");
+    const root = runsRoot();
     try {
       const raw = JSON.parse(readFileSync(join(root, ticketId, "state.json"), "utf8")) as {
         runId?: string;

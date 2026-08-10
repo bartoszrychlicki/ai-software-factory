@@ -79,6 +79,7 @@ import {
 } from "../lifecycle/signature";
 import { progressComment, type ProgressCommentContext } from "../lifecycle/progress";
 import { resolveRoute } from "../config/routing";
+import { runsRoot } from "../config/paths";
 import { authorizeScopePaths, parseScopePaths, scopeBlockedPaths } from "../execution/scope";
 import { extendedStatusName, LINEAR_STATE_MAP } from "../lifecycle/state-map";
 
@@ -1226,11 +1227,6 @@ export async function dispatchOutbox(deps: PollerDependencies): Promise<void> {
   }
 }
 
-function runsRoot(): string {
-  return process.env.FACTORY_RUNS_ROOT ??
-    join(dirname(findUpFile("package.json")), "runs");
-}
-
 function testResultPath(ticketId: string, generation: number, attempt: number): string {
   return join(runsRoot(), ticketId, `test-result-g${generation}-a${attempt}.json`);
 }
@@ -1994,7 +1990,7 @@ export async function pollOnce(deps: PollerDependencies): Promise<void> {
  */
 export function maybeBackupLifecycleDb(
   store: LifecycleStore,
-  dir = join(dirname(findUpFile("package.json")), "runs", "backups")
+  dir = join(runsRoot(), "backups")
 ): void {
   try {
     mkdirSync(dir, { recursive: true });

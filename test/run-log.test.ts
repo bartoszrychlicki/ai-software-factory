@@ -3,8 +3,16 @@ import assert from "node:assert/strict";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
+import { buildCommentContextSnapshot } from "../src/adapters/linear/comment-context";
 import type { LinearSource } from "../src/adapters/linear/client";
-import { applyDecision, sweepScores, type PollerDependencies } from "../src/app/poller";
+import {
+  applyDecision,
+  reconcileRun,
+  sweepScores,
+  type PollerDependencies,
+} from "../src/app/poller";
+import { saveArtifact } from "../src/execution/artifacts";
 import { reduceLifecycle } from "../src/lifecycle/coordinator";
 import {
   LifecycleStore,
@@ -12,7 +20,7 @@ import {
   type TicketManifestV2,
   type TransitionInput,
 } from "../src/lifecycle/store";
-import { buildRunLog } from "../src/observability/run-log";
+import { buildRunLog, writeRunLog } from "../src/observability/run-log";
 
 const manifest: TicketManifestV2 = {
   title: "Jeden log przebiegu",
@@ -24,6 +32,8 @@ const manifest: TicketManifestV2 = {
 
 interface Harness {
   root: string;
+  runsRoot: string;
+  dbPath: string;
   store: LifecycleStore;
   deps: PollerDependencies;
 }
@@ -34,10 +44,16 @@ async function withHarness(
 ): Promise<void> {
   const root = await mkdtemp(join(tmpdir(), prefix));
   const previousRoot = process.env.FACTORY_ROOT;
-  const store = new LifecycleStore(join(root, "registry.db"));
+  const previousRunsRoot = process.env.FACTORY_RUNS_ROOT;
+  const previousLifecycleDb = process.env.FACTORY_LIFECYCLE_DB;
+  const configuredRunsRoot = join(root, "runs");
+  const dbPath = join(configuredRunsRoot, "lifecycle.db");
+  process.env.FACTORY_ROOT = root;
+  process.env.FACTORY_RUNS_ROOT = configuredRunsRoot;
+  process.env.FACTORY_LIFECYCLE_DB = dbPath;
+  const store = new LifecycleStore();
   try {
     await writeFile(join(root, "package.json"), "{}");
-    process.env.FACTORY_ROOT = root;
     const source = {} as LinearSource;
     const deps: PollerDependencies = {
       store,
@@ -45,11 +61,15 @@ async function withHarness(
       sources: new Map([["harness", source]]),
       notifier: async () => {},
     };
-    await run({ root, store, deps });
+    await run({ root, runsRoot: configuredRunsRoot, dbPath, store, deps });
   } finally {
     store.close();
     if (previousRoot === undefined) delete process.env.FACTORY_ROOT;
     else process.env.FACTORY_ROOT = previousRoot;
+    if (previousRunsRoot === undefined) delete process.env.FACTORY_RUNS_ROOT;
+    else process.env.FACTORY_RUNS_ROOT = previousRunsRoot;
+    if (previousLifecycleDb === undefined) delete process.env.FACTORY_LIFECYCLE_DB;
+    else process.env.FACTORY_LIFECYCLE_DB = previousLifecycleDb;
     await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 }
@@ -62,19 +82,12 @@ function applyTransition(
   return applyDecision(deps, ticketId, { transition, commands: [] });
 }
 
-async function addArtifact(
-  root: string,
-  ticketId: string,
-  jobRunId: string,
-  name: string
-): Promise<void> {
-  const dir = join(root, "runs", ticketId, jobRunId);
-  await mkdir(dir, { recursive: true });
-  await writeFile(join(dir, name), `${jobRunId}:${name}`);
+async function addArtifact(ticketId: string, jobRunId: string, name: string): Promise<void> {
+  await saveArtifact(ticketId, jobRunId, name, `${jobRunId}:${name}`);
 }
 
 async function seedCompletedRun(harness: Harness, ticketId: string): Promise<LifecycleRun> {
-  const { root, store, deps } = harness;
+  const { store, deps } = harness;
   store.createRun(ticketId, "harness", manifest);
 
   store.startAttempt(ticketId, "plan", 1, "job-plan-g1");
@@ -88,7 +101,7 @@ async function seedCompletedRun(harness: Harness, ticketId: string): Promise<Lif
     costSource: "reported",
     durationMs: 60_000,
   });
-  await addArtifact(root, ticketId, "job-plan-g1", "plan.md");
+  await addArtifact(ticketId, "job-plan-g1", "plan.md");
   applyTransition(deps, ticketId, {
     stage: "approval",
     status: "waiting_human",
@@ -116,7 +129,7 @@ async function seedCompletedRun(harness: Harness, ticketId: string): Promise<Lif
     costSource: "reported",
     durationMs: 30_000,
   });
-  await addArtifact(root, ticketId, "job-plan-g2", "plan.md");
+  await addArtifact(ticketId, "job-plan-g2", "plan.md");
   applyTransition(deps, ticketId, {
     stage: "build",
     status: "running",
@@ -133,7 +146,7 @@ async function seedCompletedRun(harness: Harness, ticketId: string): Promise<Lif
     costSource: "estimated-time",
     durationMs: 120_000,
   });
-  await addArtifact(root, ticketId, "job-build-g2", "build-report.md");
+  await addArtifact(ticketId, "job-build-g2", "build-report.md");
   applyTransition(deps, ticketId, {
     stage: "review",
     status: "waiting_external",
@@ -150,7 +163,7 @@ async function seedCompletedRun(harness: Harness, ticketId: string): Promise<Lif
     costSource: "estimated-tokens",
     durationMs: 180_000,
   });
-  await addArtifact(root, ticketId, "job-review-g2", "review.md");
+  await addArtifact(ticketId, "job-review-g2", "review.md");
   applyTransition(deps, ticketId, {
     stage: "review",
     status: "pending",
@@ -216,9 +229,12 @@ test("koszt per etap i RAZEM zgadzają się z lifecycle_stage_attempts", async (
     }
 
     for (const [stage, value] of expected) {
+      const share = usage.usd > 0 ? value.usd / usage.usd * 100 : 0;
       assert.match(
         log,
-        new RegExp(`\\| ${stage} \\| ${value.count} \\| \\$${value.usd.toFixed(4)} \\|`)
+        new RegExp(
+          `\\| ${stage} \\| ${value.count} \\| \\$${value.usd.toFixed(4)} \\| ${share.toFixed(1)}% \\|`
+        )
       );
     }
     assert.match(
@@ -268,8 +284,9 @@ test("Canceled dostaje plik, a /replan zapisuje i później nadpisuje pełną hi
     }));
     const path = join(root, "runs", replanId, "przebieg.md");
     const afterReplan = await readFile(path, "utf8");
-    assert.match(afterReplan, /w toku — generacja 1 porzucona/);
+    assert.match(afterReplan, /- Status: w toku — generacja 2, etap plan\/running/);
     assert.match(afterReplan, /\| liczba generacji \| 2 \|/);
+    assert.match(afterReplan, /\| porzucone generacje \| 1 \|/);
     assert.match(afterReplan, /\/replan c-live/);
 
     applyTransition(deps, replanId, {
@@ -315,9 +332,84 @@ test("awaria zapisu przebiegu ostrzega, ale nie blokuje domknięcia", async () =
   });
 });
 
+test("realny saveArtifact używa FACTORY_RUNS_ROOT, a przebieg linkuje artefakt", async () => {
+  await withHarness("factory-run-log-artifact-", async ({ runsRoot, store, deps }) => {
+    const ticketId = "BAR-LOG-6";
+    const jobRunId = "job-review-shared-root";
+    store.createRun(ticketId, "harness", manifest);
+    store.startAttempt(ticketId, "review", 1, jobRunId);
+    await saveArtifact(ticketId, jobRunId, "review.md", "realny artefakt review");
+    store.finishAttempt(ticketId, "review", 1, {
+      status: "success",
+      outcome: "lgtm",
+      signature: "reviewer · model-real@high",
+      costUsd: 0.75,
+      durationMs: 15_000,
+    });
+    applyTransition(deps, ticketId, {
+      stage: "smoke",
+      status: "done",
+      actor: "coordinator",
+      reason: "done-with-real-artifact",
+    });
+
+    assert.equal(
+      await readFile(join(runsRoot, ticketId, jobRunId, "review.md"), "utf8"),
+      "realny artefakt review"
+    );
+    const log = await readFile(join(runsRoot, ticketId, "przebieg.md"), "utf8");
+    assert.match(log, /\.\/job-review-shared-root\/review\.md/);
+  });
+});
+
+test("/reject zachowuje skrócone uzasadnienie po /replan i jest decyzją człowieka", async () => {
+  await withHarness("factory-run-log-reject-", async ({ runsRoot, store, deps }) => {
+    const ticketId = "BAR-LOG-7";
+    const operatorReason = "regresja na starym imporcie X | `wariant`\n trzeba poprawić";
+    store.createRun(ticketId, "harness", manifest);
+    applyTransition(deps, ticketId, {
+      stage: "approval",
+      status: "waiting_human",
+      actor: "coordinator",
+      reason: "plan-ready",
+    });
+    applyDecision(deps, ticketId, reduceLifecycle(store.getRun(ticketId)!, {
+      type: "reject",
+      commentId: "c-reject",
+      reason: operatorReason,
+    }));
+
+    const rejected = store.getRun(ticketId)!;
+    assert.equal(rejected.errorMessage, operatorReason, "pełny powód pozostaje w stanie runu");
+    assert.match(
+      buildRunLog(store, rejected),
+      /- Status: zablokowany \(PLAN_REJECTED\) — generacja 1 aktywna/
+    );
+    const rejectTransition = store.listTransitions(ticketId).find((transition) =>
+      transition.reason.startsWith("PLAN_REJECTED /reject ")
+    );
+    assert.equal(
+      rejectTransition?.reason,
+      "PLAN_REJECTED /reject c-reject: regresja na starym imporcie X wariant trzeba poprawić"
+    );
+
+    applyDecision(deps, ticketId, reduceLifecycle(rejected, {
+      type: "replan",
+      commentId: "c-replan-after-reject",
+      reason: "uwzględnij regresję",
+      nextAttempt: 1,
+    }));
+    const log = await readFile(join(runsRoot, ticketId, "przebieg.md"), "utf8");
+    assert.match(log, /regresja na starym imporcie X wariant trzeba poprawić/);
+    assert.match(log, /\| przejścia wywołane przez człowieka \| 2 \|/);
+    assert.match(log, /## Decyzje człowieka \(2\)/);
+    assert.match(log, /\| porzucone generacje \| 1 \|/);
+  });
+});
+
 test("powody i błędy z pipe oraz nową linią nie psują tabel markdown", async () => {
   await withHarness("factory-run-log-escape-", async ({ store }) => {
-    const ticketId = "BAR-LOG-6";
+    const ticketId = "BAR-LOG-8";
     store.createRun(ticketId, "harness", manifest);
     store.transition(ticketId, {
       stage: "review",
@@ -342,16 +434,42 @@ test("powody i błędy z pipe oraz nową linią nie psują tabel markdown", asyn
   });
 });
 
-test("/score po Done nadpisuje przebieg świeżą oceną", async () => {
+test("/score po Done zachowuje terminalny lead time i nadpisuje świeżą oceną", async () => {
   await withHarness("factory-run-log-score-", async (harness) => {
-    const ticketId = "BAR-LOG-7";
+    const ticketId = "BAR-LOG-9";
     await seedCompletedRun(harness, ticketId);
-    const path = join(harness.root, "runs", ticketId, "przebieg.md");
-    assert.match(await readFile(path, "utf8"), /\| ocena \/score \| — \|/);
+    const path = join(harness.runsRoot, ticketId, "przebieg.md");
+    const clock = Date.now();
+    const createdAt = new Date(clock - 60 * 60_000).toISOString();
+    const terminalAt = new Date(clock - 30 * 60_000).toISOString();
+    const db = new DatabaseSync(harness.dbPath);
+    try {
+      db.prepare(
+        "UPDATE lifecycle_runs SET created_at=?, updated_at=? WHERE ticket_id=?"
+      ).run(createdAt, terminalAt, ticketId);
+      db.prepare(`
+        UPDATE lifecycle_transitions SET created_at=?
+        WHERE id=(
+          SELECT id FROM lifecycle_transitions
+          WHERE ticket_id=? AND to_status='done' ORDER BY id DESC LIMIT 1
+        )
+      `).run(terminalAt, ticketId);
+    } finally {
+      db.close();
+    }
+    assert.equal(harness.store.terminalTransitionAt(ticketId), terminalAt);
+    writeRunLog(harness.store, harness.store.getRun(ticketId)!);
+    const beforeScore = await readFile(path, "utf8");
+    assert.match(beforeScore, /\| lead time \| 30\.00 min \|/);
+    assert.match(beforeScore, /\| ocena \/score \| — \|/);
 
     const comments: string[] = [];
     const source = {
-      listComments: async () => [{ id: "c-score", body: "/score 4 solidnie" }],
+      listComments: async () => [{
+        id: "c-score",
+        body: "/score 4 solidnie",
+        createdAt: new Date().toISOString(),
+      }],
       comment: async (_ticket: string, body: string) => { comments.push(body); },
     } as unknown as LinearSource;
     harness.deps.sources.set("harness", source);
@@ -360,9 +478,79 @@ test("/score po Done nadpisuje przebieg świeżą oceną", async () => {
 
     assert.equal(harness.store.getRun(ticketId)?.score, 4);
     const log = await readFile(path, "utf8");
+    assert.equal(
+      log.split("\n").find((line) => line.startsWith("| lead time |")),
+      beforeScore.split("\n").find((line) => line.startsWith("| lead time |"))
+    );
     assert.match(log, /\| ocena \/score \| 4\/5 — solidnie \|/);
     assert.match(log, /## Oś czasu/);
     assert.match(log, /\.\/job-review-g2\/review\.md/);
     assert.equal(comments.length, 1);
+  });
+});
+
+test("/score aktywnego runu zapisuje przebieg bez fałszywie porzuconej generacji", async () => {
+  await withHarness("factory-run-log-active-score-", async ({ runsRoot, store, deps }) => {
+    const ticketId = "BAR-LOG-10";
+    const scoreComment = {
+      id: "c-active-score",
+      body: "/score 5 trafna diagnoza",
+      createdAt: new Date().toISOString(),
+    };
+    const ticket = {
+      id: ticketId,
+      source: "linear",
+      title: manifest.title,
+      description: manifest.description,
+      labels: manifest.labels,
+      url: manifest.url,
+      stateName: "In Progress",
+    };
+    const snapshot = buildCommentContextSnapshot(
+      ticketId,
+      ticket.title,
+      ticket.description,
+      [scoreComment]
+    );
+    store.createRun(ticketId, "harness", {
+      ...manifest,
+      inputHash: snapshot.effectiveInputHash,
+    });
+    applyTransition(deps, ticketId, {
+      stage: "approval",
+      status: "waiting_human",
+      actor: "coordinator",
+      reason: "plan-ready-active",
+    });
+
+    const acknowledgements: string[] = [];
+    const source = {
+      listComments: async () => [scoreComment],
+      comment: async (_ticket: string, body: string) => { acknowledgements.push(body); },
+      getStateName: async () => "In Progress",
+      getTicket: async () => ticket,
+    } as unknown as LinearSource;
+    deps.sources.set("harness", source);
+
+    await reconcileRun(deps, store.getRun(ticketId)!);
+
+    assert.equal(store.getRun(ticketId)?.score, 5);
+    const path = join(runsRoot, ticketId, "przebieg.md");
+    const activeLog = await readFile(path, "utf8");
+    assert.match(activeLog, /- Status: w toku — generacja 1, etap approval\/waiting_human/);
+    assert.match(activeLog, /\| lead time \(w toku\) \|/);
+    assert.match(activeLog, /\| ocena \/score \| 5\/5 — trafna diagnoza \|/);
+    assert.doesNotMatch(activeLog, /porzucon/);
+    assert.equal(acknowledgements.length, 1);
+
+    applyDecision(deps, ticketId, reduceLifecycle(store.getRun(ticketId)!, {
+      type: "replan",
+      commentId: "c-active-replan",
+      reason: "nowa generacja",
+      nextAttempt: 1,
+    }));
+    const replannedLog = await readFile(path, "utf8");
+    assert.match(replannedLog, /\| porzucone generacje \| 1 \|/);
+    assert.match(replannedLog, /- Status: w toku — generacja 2, etap plan\/running/);
   });
 });
