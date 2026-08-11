@@ -22,6 +22,12 @@ export interface BudgetLimits {
   maxUsd: number;
 }
 
+export interface PlanningBudgetLimits {
+  maxUsd: number;
+  /** Łączna liczba wykonań critique: pierwsza krytyka + ewentualne rewizje. */
+  maxCritiqueRounds: number;
+}
+
 function positiveNumber(value: string | number | undefined, fallback: number): number {
   const parsed = Number(value ?? fallback);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
@@ -43,6 +49,28 @@ export function effectiveBudget(
   return {
     maxMinutes: positiveNumber(project?.budget?.maxMinutes, defaults.maxMinutes),
     maxUsd: positiveNumber(project?.budget?.maxUsd, defaults.maxUsd),
+  };
+}
+
+/**
+ * Limit planowania nie może być szerszy niż cały ticket. Brak osobnej
+ * konfiguracji zachowuje dotychczasowy limit łączny i dwie rundy critique
+ * (pierwsza krytyka + maksymalnie jedna rewizja syntezy).
+ */
+export function effectivePlanningBudget(
+  project?: {
+    budget?: { maxMinutes?: number; maxUsd?: number };
+    planning?: { maxUsd?: number; maxCritiqueRounds?: number };
+  }
+): PlanningBudgetLimits {
+  const total = effectiveBudget(project);
+  const configuredUsd = positiveNumber(project?.planning?.maxUsd, total.maxUsd);
+  const configuredRounds = Number(project?.planning?.maxCritiqueRounds ?? 2);
+  return {
+    maxUsd: Math.min(configuredUsd, total.maxUsd),
+    maxCritiqueRounds: Number.isInteger(configuredRounds) && configuredRounds >= 1
+      ? Math.min(configuredRounds, 5)
+      : 2,
   };
 }
 

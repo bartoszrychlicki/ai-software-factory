@@ -56,6 +56,15 @@ test("buildExperimentSummary agreguje próby, koszty, first-pass i wariant proce
       status: "success", outcome: "success", costUsd: 0.7, durationMs: 240_000,
       signature: "ai-factory · claude-code@2.1 · claude-opus-5@high · researcher",
     });
+    store.startAttempt("BAR-E1", "critique", 1, "job-c1");
+    store.finishAttempt("BAR-E1", "critique", 1, {
+      status: "success", outcome: "ok", costUsd: 0, durationMs: 0,
+    });
+    store.startAttempt("BAR-E1", "build", 1, "job-build1");
+    store.finishAttempt("BAR-E1", "build", 1, {
+      status: "success", outcome: "committed", costUsd: 1.3, durationMs: 180_000,
+      signature: "ai-factory · codex@1.0 · gpt-5.6@high · builder",
+    });
     store.markCommentProcessed("BAR-E1", "c1", "retry");
     store.markCommentProcessed("BAR-E1", "c2", "replan");
     store.markCommentProcessed("BAR-E1", "c3", "approve");
@@ -78,7 +87,11 @@ test("buildExperimentSummary agreguje próby, koszty, first-pass i wariant proce
     });
     const summary = buildExperimentSummary(store, run);
     assert.equal(summary.variant, "deep");
-    assert.equal(summary.totalUsd, 3.7);
+    assert.equal(summary.totalUsd, 5);
+    assert.equal(summary.planningUsd, 3.7);
+    assert.equal(summary.buildUsd, 1.3);
+    assert.equal(summary.critiqueRounds, 1);
+    assert.equal(summary.reachedBuild, true);
     assert.equal(summary.stages.synthesis.attempts, 2);
     assert.equal(summary.stages.synthesis.firstTryOk, false);
     assert.equal(summary.stages["research-recon"].firstTryOk, true);

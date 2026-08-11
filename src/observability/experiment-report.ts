@@ -15,6 +15,8 @@ import type { ExperimentRow, ExperimentSummaryRow } from "./experiments";
 interface VariantAggregate {
   tickets: number;
   totalUsd: number;
+  planningUsd: number;
+  buildUsd: number;
   totalMinutes: number;
   leadTimeMs: number;
   testFirstPass: number;
@@ -23,6 +25,7 @@ interface VariantAggregate {
   reviewMeasured: number;
   retries: number;
   replans: number;
+  reachedBuild: number;
   scores: number[];
 }
 
@@ -68,6 +71,8 @@ function aggregate(summaries: ExperimentSummaryRow[]): Map<string, VariantAggreg
     const entry = byVariant.get(row.variant) ?? {
       tickets: 0,
       totalUsd: 0,
+      planningUsd: 0,
+      buildUsd: 0,
       totalMinutes: 0,
       leadTimeMs: 0,
       testFirstPass: 0,
@@ -76,10 +81,13 @@ function aggregate(summaries: ExperimentSummaryRow[]): Map<string, VariantAggreg
       reviewMeasured: 0,
       retries: 0,
       replans: 0,
+      reachedBuild: 0,
       scores: [],
     };
     entry.tickets += 1;
     entry.totalUsd += row.totalUsd;
+    entry.planningUsd += row.planningUsd ?? 0;
+    entry.buildUsd += row.buildUsd ?? 0;
     entry.totalMinutes += row.totalMinutes;
     entry.leadTimeMs += row.leadTimeMs;
     const test = row.stages.test;
@@ -93,6 +101,7 @@ function aggregate(summaries: ExperimentSummaryRow[]): Map<string, VariantAggreg
     }
     entry.retries += row.retries;
     entry.replans += row.replans;
+    if (row.reachedBuild ?? Boolean(row.stages.build)) entry.reachedBuild += 1;
     if (typeof row.score === "number") entry.scores.push(row.score);
     byVariant.set(row.variant, entry);
   }
@@ -114,7 +123,7 @@ export function renderReport(summaries: ExperimentSummaryRow[]): string {
   lines.push("");
   const byVariant = aggregate(summaries);
   const header = [
-    "wariant", "tickety", "śr. koszt $", "śr. minuty", "śr. lead h",
+    "wariant", "tickety", "śr. koszt $", "śr. plan $", "śr. build $", "plan→build", "śr. minuty", "śr. lead h",
     "test first-pass", "review LGTM", "retry/tkt", "replan/tkt", "śr. score",
   ];
   lines.push(`| ${header.join(" | ")} |`);
@@ -124,6 +133,9 @@ export function renderReport(summaries: ExperimentSummaryRow[]): string {
       variant,
       String(agg.tickets),
       fmtAvg(agg.totalUsd, agg.tickets),
+      fmtAvg(agg.planningUsd, agg.tickets),
+      fmtAvg(agg.buildUsd, agg.tickets),
+      fmtPct(agg.reachedBuild, agg.tickets),
       fmtAvg(agg.totalMinutes, agg.tickets, 1),
       fmtAvg(agg.leadTimeMs / 3_600_000, agg.tickets, 1),
       fmtPct(agg.testFirstPass, agg.testMeasured),

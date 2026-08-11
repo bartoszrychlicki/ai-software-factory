@@ -43,6 +43,10 @@ br-budget:
   budget:
     maxUsd: 12
     maxMinutes: 90
+  # BAR-268: planowanie ma własny bezpiecznik, żeby zachować budżet na build.
+  planning:
+    maxUsd: 6
+    maxCritiqueRounds: 2  # pierwsza krytyka + najwyżej jedna rewizja syntezy
   qa:
     # runda 1: pełna suita e2e na świeżym checkoutcie w verify (50 testów ~2 min, plikowa SQLite, zero sekretów)
     e2e: E2E_BROWSER_CHANNEL=bundled npm run e2e:local

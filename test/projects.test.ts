@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { getProject, verifyBudgetMinutes } from "../src/config/projects";
+import { effectivePlanningBudget } from "../src/observability/budget";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const committedProjectsYaml = join(here, "../projects.yaml");
@@ -63,6 +64,38 @@ test("poprawna konfiguracja normalizuje checks i wymagane GitHub checks", async 
     const project = await getProject("demo");
     assert.deepEqual(project.checks, ["npm test"]);
     assert.deepEqual(project.ci?.requiredChecks, ["quality"]);
+  });
+});
+
+test("projekt konfiguruje osobny budżet planowania i maksymalną liczbę rund krytyki", async () => {
+  await withProjectsYaml([
+    "demo:",
+    "  repo: /tmp/demo",
+    "  checks:",
+    "    - npm test",
+    "  budget:",
+    "    maxUsd: 12",
+    "    maxMinutes: 90",
+    "  planning:",
+    "    maxUsd: 6",
+    "    maxCritiqueRounds: 2",
+  ].join("\n"), async () => {
+    const project = await getProject("demo");
+    assert.deepEqual(effectivePlanningBudget(project), { maxUsd: 6, maxCritiqueRounds: 2 });
+  });
+});
+
+test("niepoprawna konfiguracja planning jest odrzucana fail-closed", async () => {
+  await withProjectsYaml([
+    "demo:",
+    "  repo: /tmp/demo",
+    "  checks:",
+    "    - npm test",
+    "  planning:",
+    "    maxUsd: -1",
+    "    maxCritiqueRounds: 0",
+  ].join("\n"), async () => {
+    await assert.rejects(getProject("demo"), /planning\.maxUsd/);
   });
 });
 

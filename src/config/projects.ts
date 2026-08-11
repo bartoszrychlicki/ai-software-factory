@@ -23,6 +23,8 @@ export interface ProjectConfig {
   progress?: ProgressLevel;
   /** Budżet per ticket-run (nadpisuje globalne defaulty FACTORY_BUDGET_*). */
   budget?: { maxMinutes?: number; maxUsd?: number };
+  /** Osobny limit fazy planowania oraz liczba pełnych rund critique. */
+  planning?: { maxUsd?: number; maxCritiqueRounds?: number };
   /**
    * Pipeline planowania: "v3" = triage → (solo | research ×3 → synteza →
    * krytyka); brak/inna wartość = klasyczny pojedynczy job planu (v2).
@@ -102,6 +104,20 @@ export async function getProject(key: string): Promise<ProjectConfig> {
   }
   project.checks = checks;
   if (project.ci) project.ci.requiredChecks = requiredChecks;
+  if (project.planning?.maxUsd !== undefined && (
+    !Number.isFinite(project.planning.maxUsd) || project.planning.maxUsd <= 0
+  )) {
+    throw new Error(`Projekt "${key}" ma niepoprawne planning.maxUsd — oczekiwana dodatnia liczba.`);
+  }
+  if (project.planning?.maxCritiqueRounds !== undefined && (
+    !Number.isInteger(project.planning.maxCritiqueRounds) ||
+    project.planning.maxCritiqueRounds < 1 ||
+    project.planning.maxCritiqueRounds > 5
+  )) {
+    throw new Error(
+      `Projekt "${key}" ma niepoprawne planning.maxCritiqueRounds — oczekiwana liczba całkowita 1-5.`
+    );
+  }
   progressLevel(project);
   return project;
 }

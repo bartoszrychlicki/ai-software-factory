@@ -22,6 +22,7 @@ import {
   stripSection,
 } from "./human-summary";
 import { authorizeScopePaths, scopeBlockedPaths } from "../execution/scope";
+import { formatCritiqueFindings } from "./verdicts";
 
 type NewCommand = Omit<
   LifecycleCommand,
@@ -37,7 +38,14 @@ export type NextAttempts = Partial<Record<AttemptStage, number>>;
 
 export type CoordinatorEvent =
   | { type: "start"; entry?: "plan" | "triage"; forcedVariant?: "solo" | "deep"; nextAttempt?: number }
-  | { type: "job-finished"; attempt: number; output: FactoryJobOutput; nextAttempts?: NextAttempts; usage?: { usd: number; minutes: number } }
+  | {
+      type: "job-finished";
+      attempt: number;
+      output: FactoryJobOutput;
+      nextAttempts?: NextAttempts;
+      usage?: { usd: number; minutes: number };
+      planning?: { maxUsd: number; maxCritiqueRounds: number };
+    }
   | { type: "approve"; commentId: string; nextAttempt?: number }
   | { type: "answer"; commentId: string; answer: string; inputHash?: string; commentContext?: string; nextAttempt?: number }
   | { type: "ops-done"; commentId: string }
@@ -209,7 +217,13 @@ function retireGenerationCommand(run: LifecycleRun, reason: string): NewCommand 
 function approvalGateComment(
   run: LifecycleRun,
   suffix: string,
-  opts: { signature?: string; usage?: { usd: number; minutes: number } } = {}
+  opts: {
+    signature?: string;
+    usage?: { usd: number; minutes: number };
+    planning?: { maxUsd: number; maxCritiqueRounds: number };
+    completedCritiqueRounds?: number;
+    planningLimitReached?: boolean;
+  } = {}
 ): NewCommand {
   const header = run.planVariant === "deep"
     ? "🧠 **Plan gotowy (deep: research ×3 → synteza → krytyka)**"
@@ -222,7 +236,7 @@ function approvalGateComment(
     ? "✅ **Krytyka planu** (niezależny silnik): bez zastrzeżeń."
     : run.critiqueVerdict === "issues"
       ? [
-          `⚠️ **Krytyka planu — uwagi (advisory, po ${run.critiqueRound ? "1 rewizji" : "0 rewizjach"}):**`,
+          `⚠️ **Krytyka planu — sklasyfikowane uwagi (po ${run.critiqueRound} rewizjach):**`,
           run.critiqueMeaning ? `> ${run.critiqueMeaning}` : "",
           run.critiqueReport ?? "",
         ].filter(Boolean).join("\n\n")
@@ -233,9 +247,22 @@ function approvalGateComment(
     ? `⚠️ **Degradacje:**\n${run.degradations.map((note) => `- ${note}`).join("\n")}`
     : "";
   const cost = opts.usage
-    ? `Koszt planowania dotychczas: $${opts.usage.usd.toFixed(2)} (${opts.usage.minutes.toFixed(1)} min sumy jobów).`
+    ? [
+        `Koszt planowania dotychczas: $${opts.usage.usd.toFixed(2)}`,
+        opts.planning ? ` / limit planowania $${opts.planning.maxUsd.toFixed(2)}` : "",
+        ` (${opts.usage.minutes.toFixed(1)} min sumy jobów).`,
+        opts.planning && run.planVariant === "deep"
+          ? ` Rundy critique: ${opts.completedCritiqueRounds ?? run.critiqueRound + 1}/${opts.planning.maxCritiqueRounds}.`
+          : "",
+      ].join("")
     : "";
   const technicalPlan = stripSection(run.plan ?? "", HUMAN_SUMMARY_HEADING);
+  const decisionPrompt = opts.planningLimitReached
+    ? [
+        "**Rekomendacja:** nie uruchamiać kolejnej automatycznej rundy planowania.",
+        "Wybierz `/approve`, aby zaakceptować plan wraz z checklistą, `/replan`, aby zlecić ręcznie nową generację planu, albo `/reject <powód>`, aby anulować tę próbę.",
+      ].join("\n\n")
+    : "Zatwierdź wyłącznie komendą `/approve` albo odrzuć: `/reject <powód>`.";
   const body = [
     header,
     summarySection,
@@ -246,7 +273,7 @@ function approvalGateComment(
     "---",
     "🔧 **Plan techniczny**",
     technicalPlan,
-    "Zatwierdź wyłącznie komendą `/approve` albo odrzuć: `/reject <powód>`.",
+    decisionPrompt,
   ].filter(Boolean).join("\n\n");
   return linearComment(run, suffix, body, "approval", opts.signature);
 }
@@ -969,7 +996,7 @@ function reduceLifecycleCore(run: LifecycleRun, event: CoordinatorEvent): Coordi
         commands: [approvalGateComment(
           { ...run, ...planPatch },
           `plan:${event.attempt}`,
-          { signature: event.output.signature, usage: event.usage }
+          { signature: event.output.signature, usage: event.usage, planning: event.planning }
         )],
       };
     }
@@ -1125,6 +1152,33 @@ function reduceLifecycleCore(run: LifecycleRun, event: CoordinatorEvent): Coordi
 
     if (event.output.kind === "synthesis") {
       assertStage(run, "synthesis", event.type);
+      if (event.output.errorCode === "PLANNING_BUDGET_EXHAUSTED" && run.plan) {
+        const degradations = [
+          ...(run.degradations ?? []),
+          `limit kosztu planowania zatrzymał kolejną syntezę: ${event.output.report}`,
+        ];
+        const gateRun = { ...run, degradations };
+        return {
+          transition: {
+            stage: "approval",
+            status: "waiting_human",
+            actor: "budget",
+            reason: "planning-budget-gate",
+            patch: { degradations },
+          },
+          commands: [approvalGateComment(
+            gateRun,
+            `plan:budget:${event.attempt}`,
+            {
+              signature: event.output.signature,
+              usage: event.usage,
+              planning: event.planning,
+              completedCritiqueRounds: run.critiqueRound,
+              planningLimitReached: true,
+            }
+          )],
+        };
+      }
       if (event.output.outcome === "questions") {
         if (run.clarifyRound >= 2) {
           return blocked(
@@ -1182,7 +1236,7 @@ function reduceLifecycleCore(run: LifecycleRun, event: CoordinatorEvent): Coordi
           "critique",
           event.nextAttempts?.critique ?? run.critiqueRound + 1,
           {},
-          run.critiqueRound ? ":r2" : ""
+          run.critiqueRound ? `:r${run.critiqueRound + 1}` : ""
         )],
       };
     }
@@ -1190,11 +1244,23 @@ function reduceLifecycleCore(run: LifecycleRun, event: CoordinatorEvent): Coordi
     if (event.output.kind === "critique") {
       assertStage(run, "critique", event.type);
       const verdict = event.output.critiqueVerdict ?? "unavailable";
-      const issues = event.output.critiqueIssues
+      const findings = event.output.critiqueFindings ?? [];
+      const issues = findings.length
+        ? formatCritiqueFindings(findings)
+        : event.output.critiqueIssues
         ?? (verdict === "issues" ? clip(event.output.report, CRITIQUE_CLIP_CHARS) : undefined);
-      if (verdict === "issues" && run.critiqueRound === 0) {
+      const hasHumanDecision = findings.some((finding) => finding.disposition === "human_decision");
+      // Brak findings to kompatybilność z jobem rozpoczętym przed wdrożeniem
+      // nowego kontraktu: historyczne `issues` zachowuje dawną, ostrożną rewizję.
+      const hasBlockingFinding = findings.length
+        ? findings.some((finding) => finding.disposition === "block_before_build")
+        : verdict === "issues";
+      const maxCritiqueRounds = event.planning?.maxCritiqueRounds ?? 2;
+      const mayRevise = run.critiqueRound + 1 < maxCritiqueRounds;
+      if (verdict === "issues" && hasBlockingFinding && !hasHumanDecision && mayRevise) {
+        const nextCritiqueRound = run.critiqueRound + 1;
         const revisionPatch = {
-          critiqueRound: 1,
+          critiqueRound: nextCritiqueRound,
           critiqueVerdict: verdict,
           critiqueReport: issues,
           // Ta sama zasada co na bramce: zdanie idzie w parze ze swoimi uwagami.
@@ -1214,14 +1280,19 @@ function reduceLifecycleCore(run: LifecycleRun, event: CoordinatorEvent): Coordi
             nextRun,
             "synthesis",
             "synthesis",
-            event.nextAttempts?.synthesis ?? 2,
+            event.nextAttempts?.synthesis ?? nextCritiqueRound + 1,
             { feedback: issues },
-            ":rev1"
+            `:rev${nextCritiqueRound}`
           )],
         };
       }
       const degradations = verdict === "unavailable"
-        ? [...(run.degradations ?? []), `krytyka planu niedostępna (${event.output.errorCode ?? "brak werdyktu"})`]
+        ? [
+            ...(run.degradations ?? []),
+            event.output.errorCode === "PLANNING_BUDGET_EXHAUSTED"
+              ? `limit kosztu planowania zatrzymał krytykę: ${event.output.report}`
+              : `krytyka planu niedostępna (${event.output.errorCode ?? "brak werdyktu"})`,
+          ]
         : run.degradations;
       const gatePatch = {
         critiqueVerdict: verdict,
@@ -1245,7 +1316,13 @@ function reduceLifecycleCore(run: LifecycleRun, event: CoordinatorEvent): Coordi
         commands: [approvalGateComment(
           { ...run, ...gatePatch },
           `plan:critique:${event.attempt}`,
-          { signature: event.output.signature, usage: event.usage }
+          {
+            signature: event.output.signature,
+            usage: event.usage,
+            planning: event.planning,
+            planningLimitReached: event.output.errorCode === "PLANNING_BUDGET_EXHAUSTED" ||
+              (verdict === "issues" && hasBlockingFinding && !mayRevise),
+          }
         )],
       };
     }

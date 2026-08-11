@@ -1,7 +1,7 @@
 import { appendFile, mkdir } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { findUpFile } from "../config/projects";
-import type { LifecycleRun, LifecycleStore } from "../lifecycle/store";
+import { isPlanningAttemptStage, type LifecycleRun, type LifecycleStore } from "../lifecycle/store";
 
 /**
  * runs/experiments.jsonl — dane eksperymentu kosztowo-jakościowego procesu.
@@ -33,6 +33,11 @@ export interface ExperimentSummaryRow {
   planEntry?: string;
   totalUsd: number;
   totalMinutes: number;
+  /** Addytywne pola BAR-268; opcjonalne dla historycznych wierszy JSONL. */
+  planningUsd?: number;
+  buildUsd?: number;
+  critiqueRounds?: number;
+  reachedBuild?: boolean;
   /** Czas od claimu tej generacji do Done (ms). */
   leadTimeMs: number;
   stages: Record<string, ExperimentStageSummary>;
@@ -104,6 +109,13 @@ export function buildExperimentSummary(
     stages[stage].minutes = Number(stages[stage].minutes.toFixed(2));
   }
   const usage = store.totalUsage(run.ticketId);
+  const attempts = store.listAttempts(run.ticketId);
+  const planningUsd = attempts
+    .filter((attempt) => isPlanningAttemptStage(attempt.stage))
+    .reduce((sum, attempt) => sum + (attempt.costUsd ?? 0), 0);
+  const buildUsd = attempts
+    .filter((attempt) => attempt.stage === "build")
+    .reduce((sum, attempt) => sum + (attempt.costUsd ?? 0), 0);
   return {
     kind: "summary",
     ticket: run.ticketId,
@@ -113,6 +125,10 @@ export function buildExperimentSummary(
     planEntry: run.planEntry,
     totalUsd: Number(usage.usd.toFixed(4)),
     totalMinutes: Number(usage.minutes.toFixed(2)),
+    planningUsd: Number(planningUsd.toFixed(4)),
+    buildUsd: Number(buildUsd.toFixed(4)),
+    critiqueRounds: (stages.critique?.attempts ?? 0),
+    reachedBuild: Boolean(stages.build),
     leadTimeMs: Math.max(0, Date.parse(run.updatedAt) - Date.parse(run.createdAt)),
     stages,
     degradations: run.degradations?.length ? run.degradations : undefined,

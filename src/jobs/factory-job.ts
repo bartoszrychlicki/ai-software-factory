@@ -18,7 +18,9 @@ import {
 } from "../lifecycle/signature";
 import { recordMetric } from "../observability/metrics";
 import {
+  critiqueFindingSchema,
   formatClarifyQuestions,
+  formatCritiqueFindings,
   parseCritiqueVerdict,
   parsePlanVerdict,
   parseReviewVerdict,
@@ -114,6 +116,8 @@ export const factoryJobOutputSchema = z.object({
   /** Brief researchu (pełny raport agenta). */
   brief: z.string().optional(),
   critiqueVerdict: z.enum(["ok", "issues", "unavailable"]).optional(),
+  /** Strukturalne findings sterujące rewizją/checklistą/bramką człowieka. */
+  critiqueFindings: z.array(critiqueFindingSchema).optional(),
   /** Skoncentrowane uwagi krytyka — feedback rewizji syntezy i sekcja bramki. */
   critiqueIssues: z.string().optional(),
   /** Jedno zdanie dla autora ticketu; tekst prezentacyjny poza kontraktem `factory`. */
@@ -1089,7 +1093,10 @@ const critiqueInstructions = [
   "3. Czy zmiany ścieżek chronionych (.github/, ops/, migracje) są jawnie zadeklarowane?",
   "4. Czy założenia planu zgadzają się ze stanem repo (nazwy, API, istniejące zachowania)?",
   "5. Czy zakres jest minimalny — bez zmian niewynikających z ticketu?",
-  "Uwagi podawaj ponumerowane, z priorytetem i konkretną poprawką.",
+  "Każdą uwagę sklasyfikuj osobno: severity, category, disposition i konkretne summary.",
+  "P0 oraz P1 data-loss/security/auth/irreversible-write = block_before_build.",
+  "P1 test-gap/implementation-detail może być builder_checklist zamiast veto.",
+  "Brak decyzji produktowej = human_decision; nie próbuj rozstrzygać jej technicznie.",
   "Dodaj przed werdyktem sekcję `## Co to znaczy dla autora` — JEDNO zdanie po ludzku, co uwagi oznaczają dla autora ticketu (np. „Plan może przejść testy, nie rozwiązując zgłoszonego problemu”).",
   verdictInstruction("critique"),
 ].join("\n");
@@ -1221,8 +1228,9 @@ async function runCritique(
         durationMs,
         critiqueVerdict,
         critiqueIssues: critiqueVerdict === "issues"
-          ? clip(verdict.issues, CRITIQUE_CLIP_CHARS)
+          ? clip(formatCritiqueFindings(verdict.findings ?? []), CRITIQUE_CLIP_CHARS)
           : undefined,
+        critiqueFindings: critiqueVerdict === "issues" ? verdict.findings : undefined,
         critiqueMeaning,
         baseSha: base.sha,
         engineFallback: engineAttempt.fallback,
@@ -1376,6 +1384,9 @@ async function runBuild(
         `# Zatwierdzony plan\n${input.plan}`,
         input.briefs?.recon
           ? `# Brief RECON (mapa kodu z researchu — pliki, wzorce, testy okolicy)\n${clip(input.briefs.recon, 16_000)}`
+          : "",
+        input.critique
+          ? `# Obowiązkowa checklista z krytyki planu\n${clip(input.critique, CRITIQUE_CLIP_CHARS)}`
           : "",
         feedback,
       ].filter(Boolean).join("\n\n"),
@@ -1593,7 +1604,7 @@ async function runReview(
             ? `# Brief ryzyk z researchu (edge case'y, strategia testów)\n${clip(input.briefs["solution-b"], 8_000)}`
             : "",
           input.critique
-            ? `# Uwagi krytyka planu (advisory — sprawdź, czy zaadresowane)\n${clip(input.critique, CRITIQUE_CLIP_CHARS)}`
+            ? `# Obowiązkowa checklista z krytyki planu — wskaż dowód realizacji albo zgłoś fix\n${clip(input.critique, CRITIQUE_CLIP_CHARS)}`
             : "",
           `# Zmiany\n${manifest.nameStatus}\n\n${manifest.diffStat}`,
         ].filter(Boolean).join("\n\n"),
