@@ -31,6 +31,11 @@ interface LinearIssue {
   team: { states: { nodes: { id: string; name: string; type: string }[] } };
 }
 
+export interface LinearIssueReference {
+  id: string;
+  projectName: string | null;
+}
+
 interface LinearProjectForCreate {
   id: string;
   name: string;
@@ -104,6 +109,19 @@ export class LinearSource implements TicketSource {
       { id: identifier }
     );
     return data.issue;
+  }
+
+  async resolveIssue(identifier: string): Promise<LinearIssueReference> {
+    const data = await this.gql<{
+      issue: { id: string; project: { name: string } | null };
+    }>(
+      `query($id: String!) { issue(id: $id) { id project { name } } }`,
+      { id: identifier }
+    );
+    return {
+      id: data.issue.id,
+      projectName: data.issue.project?.name ?? null,
+    };
   }
 
   async getTicket(identifier: string): Promise<
@@ -231,10 +249,11 @@ export class LinearSource implements TicketSource {
       );
     }
     const started = preferred ?? pickState(issue.team.states.nodes, "started", "In Progress");
-    await this.gql(
+    const result = await this.gql<{ issueUpdate: { success: boolean } | null }>(
       `mutation($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }`,
       { id: issue.id, input: { stateId: started.id } }
     );
+    this.assertMutationSuccess(result?.issueUpdate, `claim ticketu ${id}`);
   }
 
   async setStatus(id: string, status: FactoryStatus): Promise<void> {
@@ -249,10 +268,11 @@ export class LinearSource implements TicketSource {
             ? "👤 ⛔ Zablokowany"
             : undefined;
     const state = pickState(issue.team.states.nodes, STATUS_TO_STATE_TYPE[status], preferredName);
-    await this.gql(
+    const result = await this.gql<{ issueUpdate: { success: boolean } | null }>(
       `mutation($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }`,
       { id: issue.id, input: { stateId: state.id } }
     );
+    this.assertMutationSuccess(result?.issueUpdate, `zmiana statusu ticketu ${id} na ${status}`);
   }
 
   /** Issues projektu w danym stanie, z komentarzami — dla merge-watchera i adopcji sierot. */
@@ -313,14 +333,22 @@ export class LinearSource implements TicketSource {
     signature: ActionSignature = POLLER_SIGNATURE
   ): Promise<void> {
     const issue = await this.fetchIssue(id);
+    await this.commentByIssueId(issue.id, body, signature);
+  }
+
+  async commentByIssueId(
+    issueId: string,
+    body: string,
+    signature: ActionSignature = POLLER_SIGNATURE
+  ): Promise<void> {
     const signedBody = signature.profile === "orchestrator"
       ? body
       : `${signatureHeader(signature)}\n\n${body}`;
     const result = await this.gql<{ commentCreate: { success: boolean } | null }>(
       `mutation($input: CommentCreateInput!) { commentCreate(input: $input) { success } }`,
-      { input: { issueId: issue.id, body: signedBody + signatureFooter(signature) } }
+      { input: { issueId, body: signedBody + signatureFooter(signature) } }
     );
-    this.assertMutationSuccess(result?.commentCreate, `komentarz do ticketu ${id}`);
+    this.assertMutationSuccess(result?.commentCreate, `komentarz do issue ${issueId}`);
   }
 
   /** Ustawia stan po dokładnej nazwie (stany procesu fabryki). */

@@ -3,6 +3,7 @@ import { isCommandAttempt, parseCommand } from "../lifecycle/commands";
 import { MCP_SIGNATURE, type ActionSignature } from "../lifecycle/signature";
 import { LINEAR_STATE_MAP } from "../lifecycle/state-map";
 import type { LifecycleRun, LifecycleStore, StageAttempt } from "../lifecycle/store";
+import type { BreakerSnapshot } from "../observability/breaker";
 import { attemptRow, planView, runSummary } from "./projection";
 
 const DEFAULT_BUDGET_MAX_MINUTES = 45;
@@ -20,16 +21,9 @@ export interface McpLinearClient {
     stateType: string;
     projectName: string | null;
   }>;
+  resolveIssue(id: string): Promise<{ id: string; projectName: string | null }>;
   setStateByName(id: string, stateName: string): Promise<void>;
-  comment(id: string, body: string, signature?: ActionSignature): Promise<void>;
-}
-
-export interface BreakerSnapshot {
-  open: boolean;
-  reason?: string;
-  openedAt?: string;
-  cooldownMinutes: number;
-  cooldownRemainingMinutes: number;
+  commentByIssueId(issueId: string, body: string, signature?: ActionSignature): Promise<void>;
 }
 
 export type McpLifecycleReader = Pick<
@@ -129,6 +123,18 @@ function ageMinutes(updatedAt: string, now: Date): number | null {
   return Math.max(0, Math.round(((now.getTime() - timestamp) / 60_000) * 10) / 10);
 }
 
+function runIsVisible(deps: FactoryToolDependencies, run: LifecycleRun): boolean {
+  return Object.hasOwn(deps.projects, run.project);
+}
+
+function ticketNotFound(ticket: string) {
+  return {
+    found: false as const,
+    ticket,
+    message: `Brak runu fabryki dla ticketu ${ticket}`,
+  };
+}
+
 export function createFactoryTools(deps: FactoryToolDependencies) {
   return {
     async factoryProjects() {
@@ -170,7 +176,7 @@ export function createFactoryTools(deps: FactoryToolDependencies) {
                 : null,
             }
           : null,
-        activeRuns: deps.store.listActive().length,
+        activeRuns: deps.store.listActive().filter((run) => runIsVisible(deps, run)).length,
         costUsdLastHour: deps.store.usageSince(oneHourAgo),
       };
     },
@@ -178,7 +184,7 @@ export function createFactoryTools(deps: FactoryToolDependencies) {
     async queueOverview() {
       const now = deps.now();
       return {
-        runs: deps.store.listActive().map((run) => {
+        runs: deps.store.listActive().filter((run) => runIsVisible(deps, run)).map((run) => {
           const summary = runSummary(
             run,
             projectUsage(deps.store, run, deps.projects[run.project])
@@ -199,13 +205,7 @@ export function createFactoryTools(deps: FactoryToolDependencies) {
 
     async ticketStatus({ ticket }: TicketInput) {
       const run = deps.store.getRun(ticket);
-      if (!run) {
-        return {
-          found: false,
-          ticket,
-          message: `Brak runu fabryki dla ticketu ${ticket}`,
-        };
-      }
+      if (!run || !runIsVisible(deps, run)) return ticketNotFound(ticket);
       return {
         found: true,
         ...runSummary(run, projectUsage(deps.store, run, deps.projects[run.project])),
@@ -214,25 +214,13 @@ export function createFactoryTools(deps: FactoryToolDependencies) {
 
     async ticketPlan({ ticket }: TicketInput) {
       const run = deps.store.getRun(ticket);
-      if (!run) {
-        return {
-          found: false,
-          ticket,
-          message: `Brak runu fabryki dla ticketu ${ticket}`,
-        };
-      }
+      if (!run || !runIsVisible(deps, run)) return ticketNotFound(ticket);
       return { found: true, ...planView(run) };
     },
 
     async ticketAttempts(input: TicketInput & { includeReportTail?: boolean }) {
       const run = deps.store.getRun(input.ticket);
-      if (!run) {
-        return {
-          found: false,
-          ticket: input.ticket,
-          message: `Brak runu fabryki dla ticketu ${input.ticket}`,
-        };
-      }
+      if (!run || !runIsVisible(deps, run)) return ticketNotFound(input.ticket);
       const attempts: StageAttempt[] = deps.store.listAttempts(input.ticket);
       return {
         found: true,
@@ -284,9 +272,9 @@ export function createFactoryTools(deps: FactoryToolDependencies) {
       assertNotCommand(input.body);
       assertProject(deps, input.project);
       const linear = assertWriteEnabled(deps.linearFor(input.project));
-      const issue = await linear.getTicket(input.ticket);
+      const issue = await linear.resolveIssue(input.ticket);
       assertSameProject(input.project, issue.projectName, input.ticket);
-      await linear.comment(input.ticket, input.body, MCP_SIGNATURE);
+      await linear.commentByIssueId(issue.id, input.body, MCP_SIGNATURE);
       return { commented: true, ticket: input.ticket, project: input.project };
     },
   };

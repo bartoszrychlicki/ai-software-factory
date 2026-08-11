@@ -12,9 +12,9 @@ import {
 } from "../config/projects";
 import { readLocalOverride, readYamlMapping } from "../config/local-config";
 import { LifecycleStore } from "../lifecycle/store";
+import { breakerSnapshot } from "../observability/breaker";
 import {
   createFactoryTools,
-  type BreakerSnapshot,
   type FactoryToolDependencies,
 } from "./tools";
 
@@ -147,37 +147,6 @@ async function loadProjects(): Promise<Record<string, ProjectConfig>> {
     selectedKeys.map(async (key) => [key, await getProject(key)] as const)
   );
   return Object.fromEntries(entries);
-}
-
-function breakerSnapshot(): BreakerSnapshot {
-  const cooldownMinutesRaw = Number(process.env.FACTORY_CB_COOLDOWN_MIN ?? 360);
-  const cooldownMinutes = Number.isFinite(cooldownMinutesRaw) && cooldownMinutesRaw > 0
-    ? cooldownMinutesRaw
-    : 360;
-  try {
-    const path = join(dirname(findUpFile("package.json")), "runs", "circuit-breaker.json");
-    const state = JSON.parse(readFileSync(path, "utf8")) as {
-      openedAt?: string;
-      reason?: string;
-    };
-    if (!state.openedAt) {
-      return { open: false, cooldownMinutes, cooldownRemainingMinutes: 0 };
-    }
-    const ageMinutes = (Date.now() - Date.parse(state.openedAt)) / 60_000;
-    const validAge = Number.isFinite(ageMinutes) && ageMinutes >= 0;
-    const cooldownRemainingMinutes = validAge
-      ? Math.max(0, Math.ceil(cooldownMinutes - ageMinutes))
-      : cooldownMinutes;
-    return {
-      open: !validAge || ageMinutes < cooldownMinutes,
-      reason: state.reason,
-      openedAt: state.openedAt,
-      cooldownMinutes,
-      cooldownRemainingMinutes,
-    };
-  } catch {
-    return { open: false, cooldownMinutes, cooldownRemainingMinutes: 0 };
-  }
 }
 
 async function main(): Promise<void> {

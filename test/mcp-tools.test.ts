@@ -1,12 +1,19 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { LinearSource } from "../src/adapters/linear/client";
 import type { ProjectConfig } from "../src/config/projects";
 import type { LifecycleRun, StageAttempt } from "../src/lifecycle/store";
+import {
+  breakerOpen,
+  breakerSnapshot,
+  type BreakerSnapshot,
+} from "../src/observability/breaker";
 import { clip, openGate, planView } from "../src/mcp/projection";
 import {
   createFactoryTools,
-  type BreakerSnapshot,
   type FactoryToolDependencies,
   type McpLifecycleReader,
   type McpLinearClient,
@@ -73,8 +80,9 @@ class FakeLinear implements McpLinearClient {
     return { identifier: "BAR-201", url: "https://linear.app/acme/issue/BAR-201" };
   }
   async getTicket() { return { ...this.state, projectName: this.projectName }; }
+  async resolveIssue(id: string) { return { id, projectName: this.projectName }; }
   async setStateByName(id: string, state: string) { this.moved.push({ id, state }); }
-  async comment(id: string, body: string) { this.comments.push({ id, body }); }
+  async commentByIssueId(id: string, body: string) { this.comments.push({ id, body }); }
 }
 
 function deps(options: {
@@ -116,16 +124,19 @@ test("ticket_comment odrzuca komendy i przepuszcza slash wewnątrz komentarza", 
   assert.deepEqual(linear.comments, [{ id: "BAR-200", body: "patrz src/x.ts" }]);
 });
 
-test("ticket_comment podpisuje realne body mutacji jako MCP", async () => {
+test("ticket_comment rozstrzyga projekt raz i komentuje po wewnętrznym issue id", async () => {
   const originalFetch = globalThis.fetch;
-  let sentBody: string | undefined;
+  const requests: {
+    query: string;
+    variables?: { id?: string; input?: { issueId?: string; body?: string } };
+  }[] = [];
   globalThis.fetch = (async (_url, init) => {
     const request = JSON.parse(String(init?.body)) as {
       query: string;
-      variables?: { input?: { body?: string } };
+      variables?: { id?: string; input?: { issueId?: string; body?: string } };
     };
+    requests.push(request);
     if (request.query.includes("commentCreate")) {
-      sentBody = request.variables?.input?.body;
       return new Response(JSON.stringify({
         data: { commentCreate: { success: true } },
       }));
@@ -134,15 +145,7 @@ test("ticket_comment podpisuje realne body mutacji jako MCP", async () => {
       data: {
         issue: {
           id: "issue-id",
-          identifier: "BAR-200",
-          title: "MCP dla fabryki",
-          description: "",
-          url: "https://linear.app/acme/issue/BAR-200",
-          priorityLabel: null,
-          labels: { nodes: [] },
-          project: { id: "project-id", name: "harness" },
-          state: { id: "backlog-id", name: "Backlog", type: "backlog" },
-          team: { states: { nodes: [] } },
+          project: { name: "harness" },
         },
       },
     }));
@@ -154,8 +157,13 @@ test("ticket_comment podpisuje realne body mutacji jako MCP", async () => {
       ticket: "BAR-200",
       body: "Komentarz asystenta",
     });
+    assert.equal(requests.length, 2);
+    assert.equal(requests[0].variables?.id, "BAR-200");
+    assert.match(requests[0].query, /issue\(id: \$id\) \{ id project \{ name \} \}/);
+    assert.doesNotMatch(requests[0].query, /team|state|labels/);
+    assert.equal(requests[1].variables?.input?.issueId, "issue-id");
     assert.equal(
-      sentBody,
+      requests[1].variables?.input?.body,
       "Komentarz asystenta\n\n> 🖋️ ai-factory · mcp · — · orchestrator"
     );
   } finally {
@@ -233,6 +241,51 @@ test("ticket_status zwraca jawny brak runu zamiast wyjątku", async () => {
   });
 });
 
+test("LINEAR_PROJECTS ukrywa runy obcych projektów we wszystkich projekcjach", async () => {
+  const store = new FakeStore();
+  store.runs.set("BAR-200", run());
+  const hiddenRun = run({
+    ticketId: "OTHER-5",
+    project: "other",
+    plan: "tajny-plan-obcego-projektu",
+  });
+  hiddenRun.manifest.title = "tajny-tytuł-obcego-projektu";
+  store.runs.set("OTHER-5", hiddenRun);
+  store.attempts.set("OTHER-5", [{
+    ticketId: "OTHER-5",
+    stage: "build",
+    attempt: 1,
+    status: "failed",
+    report: "tajny-raport-obcego-projektu",
+    startedAt: "2026-08-10T10:00:00.000Z",
+  }]);
+  const tools = createFactoryTools(deps({ store }));
+
+  const overview = await tools.queueOverview();
+  assert.deepEqual(overview.runs.map((item) => item.ticket), ["BAR-200"]);
+  assert.equal((await tools.factoryHealth()).activeRuns, 1);
+
+  const expectedHidden = {
+    found: false,
+    ticket: "OTHER-5",
+    message: "Brak runu fabryki dla ticketu OTHER-5",
+  };
+  assert.deepEqual(await tools.ticketStatus({ ticket: "OTHER-5" }), expectedHidden);
+  assert.deepEqual(await tools.ticketPlan({ ticket: "OTHER-5" }), expectedHidden);
+  assert.deepEqual(
+    await tools.ticketAttempts({ ticket: "OTHER-5", includeReportTail: true }),
+    expectedHidden
+  );
+
+  const output = JSON.stringify([
+    overview,
+    await tools.ticketStatus({ ticket: "OTHER-5" }),
+    await tools.ticketPlan({ ticket: "OTHER-5" }),
+    await tools.ticketAttempts({ ticket: "OTHER-5", includeReportTail: true }),
+  ]);
+  assert.doesNotMatch(output, /tajny-(tytuł|plan|raport)-obcego-projektu/);
+});
+
 test("openGate odwzorowuje approval, advisory-fix, blocked i done", () => {
   assert.deepEqual(openGate(run()), {
     gate: "plan-approval",
@@ -300,6 +353,59 @@ test("factory_projects i factory_health nie ujawniają sekretu środowiska", asy
   } finally {
     if (previous === undefined) delete process.env.LINEAR_API_KEY;
     else process.env.LINEAR_API_KEY = previous;
+  }
+});
+
+test("snapshot breakera jest zgodny z breakerOpen, waliduje cooldown i nie mutuje stanu", async () => {
+  const root = await mkdtemp(join(tmpdir(), "factory-mcp-breaker-"));
+  const previousRoot = process.env.FACTORY_ROOT;
+  const previousCooldown = process.env.FACTORY_CB_COOLDOWN_MIN;
+  const path = join(root, "runs", "circuit-breaker.json");
+  try {
+    await writeFile(join(root, "package.json"), "{}");
+    await mkdir(join(root, "runs"), { recursive: true });
+    process.env.FACTORY_ROOT = root;
+    process.env.FACTORY_CB_COOLDOWN_MIN = "10";
+
+    const now = Date.now();
+    const activeState = JSON.stringify({
+      openedAt: new Date(now - 5 * 60_000).toISOString(),
+      reason: "test aktywnego breakera",
+      failStreak: 3,
+    });
+    await writeFile(path, activeState);
+    const active = await breakerSnapshot(now);
+    assert.equal(active.open, true);
+    assert.equal(active.cooldownMinutes, 10);
+    assert.equal(active.cooldownRemainingMinutes, 5);
+    assert.equal(await readFile(path, "utf8"), activeState);
+    assert.match(await breakerOpen() ?? "", /cooldown 10 min/);
+
+    const expiredState = JSON.stringify({
+      openedAt: new Date(now - 20 * 60_000).toISOString(),
+      reason: "test wygasłego breakera",
+      failStreak: 3,
+    });
+    await writeFile(path, expiredState);
+    const expired = await breakerSnapshot(now);
+    assert.equal(expired.open, false);
+    assert.equal(expired.cooldownRemainingMinutes, 0);
+    assert.equal(await readFile(path, "utf8"), expiredState);
+    assert.equal(await breakerOpen(), null);
+    assert.notEqual(await readFile(path, "utf8"), expiredState);
+
+    process.env.FACTORY_CB_COOLDOWN_MIN = "nie-liczba";
+    await writeFile(path, activeState);
+    const fallback = await breakerSnapshot(now);
+    assert.equal(fallback.cooldownMinutes, 360);
+    assert.equal(fallback.open, true);
+    assert.match(await breakerOpen() ?? "", /cooldown 360 min/);
+  } finally {
+    if (previousRoot === undefined) delete process.env.FACTORY_ROOT;
+    else process.env.FACTORY_ROOT = previousRoot;
+    if (previousCooldown === undefined) delete process.env.FACTORY_CB_COOLDOWN_MIN;
+    else process.env.FACTORY_CB_COOLDOWN_MIN = previousCooldown;
+    await rm(root, { recursive: true, force: true });
   }
 });
 
@@ -378,13 +484,17 @@ test("LinearSource.createIssue wybiera stan typu backlog i mapuje wszystkie labe
   }
 });
 
-test("LinearSource nie uznaje success:false ani pustego payloadu za zapis", async () => {
+test("LinearSource odrzuca success:false i null we wszystkich objętych mutacjach", async () => {
   const originalFetch = globalThis.fetch;
   const mutationResponses = [
     { issueUpdate: { success: false } },
     { issueUpdate: null },
     { commentCreate: { success: false } },
     { commentCreate: null },
+    { issueUpdate: { success: false } },
+    { issueUpdate: null },
+    { issueUpdate: { success: false } },
+    { issueUpdate: null },
   ];
   globalThis.fetch = (async (_url, init) => {
     const request = JSON.parse(String(init?.body)) as { query: string };
@@ -401,7 +511,11 @@ test("LinearSource nie uznaje success:false ani pustego payloadu za zapis", asyn
             labels: { nodes: [] },
             project: { id: "project-id", name: "harness" },
             state: { id: "backlog-id", name: "Backlog", type: "backlog" },
-            team: { states: { nodes: [{ id: "todo-id", name: "Todo", type: "unstarted" }] } },
+            team: { states: { nodes: [
+              { id: "todo-id", name: "Todo", type: "unstarted" },
+              { id: "progress-id", name: "In Progress", type: "started" },
+              { id: "done-id", name: "Done", type: "completed" },
+            ] } },
           },
         },
       }));
@@ -414,6 +528,10 @@ test("LinearSource nie uznaje success:false ani pustego payloadu za zapis", asyn
     await assert.rejects(linear.setStateByName("BAR-200", "Todo"), /nie potwierdził zapisu/);
     await assert.rejects(linear.comment("BAR-200", "Komentarz"), /nie potwierdził zapisu/);
     await assert.rejects(linear.comment("BAR-200", "Komentarz"), /nie potwierdził zapisu/);
+    await assert.rejects(linear.claim("BAR-200"), /nie potwierdził zapisu/);
+    await assert.rejects(linear.claim("BAR-200"), /nie potwierdził zapisu/);
+    await assert.rejects(linear.setStatus("BAR-200", "done"), /nie potwierdził zapisu/);
+    await assert.rejects(linear.setStatus("BAR-200", "done"), /nie potwierdził zapisu/);
     assert.equal(mutationResponses.length, 0);
   } finally {
     globalThis.fetch = originalFetch;
