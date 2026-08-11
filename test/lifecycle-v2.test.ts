@@ -2254,6 +2254,8 @@ test("incydent BAR-180 g2: /replan anuluje joby starej generacji, NIE zjadając 
     else process.env.FACTORY_RUNS_ROOT = previousRunsRoot;
     await rm(dir, { recursive: true, force: true });
   }
+  assert.equal(process.env.FACTORY_RUNS_ROOT, previousRunsRoot);
+  assert.equal(existsSync(join(process.cwd(), "runs", "BAR-RO1")), false);
 });
 
 test("strażnik zombie: running bez joba w outboxie blokuje z JOB_MISSING", async () => {
