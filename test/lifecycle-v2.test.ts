@@ -109,6 +109,7 @@ test("registry v2 atomowo zachowuje stan, próbę i idempotentny outbox po resta
       stage: "plan",
       attempt: 1,
       jobRunId: "job-1",
+      generation: undefined,
       inputHash: "hash-1",
       sha: "a".repeat(40),
       status: "failed",
@@ -1884,6 +1885,28 @@ test("otwarty circuit breaker zatrzymuje claim nowych ticketów i powiadamia raz
   }
 });
 
+test("read-only otwiera starszą bazę bez generation i hydratuje undefined", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "factory-readonly-attempt-generation-"));
+  const dbPath = join(dir, "registry.db");
+  try {
+    const writer = new LifecycleStore(dbPath);
+    writer.createRun("BAR-OLD-GEN", "harness", manifest);
+    writer.startAttempt("BAR-OLD-GEN", "plan", 1, "legacy-job");
+    writer.finishAttempt("BAR-OLD-GEN", "plan", 1, { status: "success" });
+    writer.close();
+
+    const legacy = new DatabaseSync(dbPath);
+    legacy.exec("ALTER TABLE lifecycle_stage_attempts DROP COLUMN generation");
+    legacy.close();
+
+    const reader = new LifecycleStore(dbPath, { readOnly: true });
+    assert.equal(reader.latestAttempt("BAR-OLD-GEN", "plan")?.generation, undefined);
+    reader.close();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("porażka fabryki nabija serię breakera, decyzja człowieka nie", async () => {
   const root = await mkdtemp(join(tmpdir(), "factory-streak-"));
   const previousRoot = process.env.FACTORY_ROOT;
@@ -1931,6 +1954,11 @@ test("porażka fabryki nabija serię breakera, decyzja człowieka nie", async ()
     applyDecision(deps, run2.ticketId, reduceLifecycle(store.getRun("BAR-CB2")!, {
       type: "reject", commentId: "c-rej", reason: "nie teraz",
     }));
+    assert.equal(
+      store.listTransitions("BAR-CB2").at(-1)?.reason,
+      "PLAN_REJECTED /reject c-rej: nie teraz"
+    );
+    assert.equal(store.getRun("BAR-CB2")?.errorCode, "PLAN_REJECTED");
     await new Promise((resolve) => setTimeout(resolve, 100));
     assert.equal(
       (JSON.parse(await readFile(breakerFile, "utf8")) as { failStreak: number }).failStreak,
@@ -1964,6 +1992,7 @@ test("detached test runner: wynik z synchronizacją main przechodzi do publish",
       sources: new Map([["harness", source as never]]),
       notifier: async () => {},
       spawnTestRunner: (input) => {
+        assert.equal(input.generation, 1);
         mkdirSync(join(root, "runs", input.ticketId), { recursive: true });
         writeFileSync(input.resultPath, JSON.stringify({
           ok: true,
@@ -2218,8 +2247,11 @@ test("incydent BAR-177: /retry po komendzie anulowanej przed dispatchem tworzy N
 
 test("incydent BAR-180 g2: /replan anuluje joby starej generacji, NIE zjadając joba nowej", async () => {
   const dir = await mkdtemp(join(tmpdir(), "factory-replan-order-"));
+  const previousRunsRoot = process.env.FACTORY_RUNS_ROOT;
   const store = new LifecycleStore(join(dir, "registry.db"));
   try {
+    // Replan retire'uje generację, więc applyDecision zapisuje przebieg.md do katalogu tymczasowego.
+    process.env.FACTORY_RUNS_ROOT = dir;
     const deps: PollerDependencies = {
       store,
       mastra: {
@@ -2247,8 +2279,12 @@ test("incydent BAR-180 g2: /replan anuluje joby starej generacji, NIE zjadając 
     assert.equal(store.hasOutstandingJob("BAR-RO1"), true, "run nowej generacji nie może rodzić się jako zombie");
   } finally {
     store.close();
+    if (previousRunsRoot === undefined) delete process.env.FACTORY_RUNS_ROOT;
+    else process.env.FACTORY_RUNS_ROOT = previousRunsRoot;
     await rm(dir, { recursive: true, force: true });
   }
+  assert.equal(process.env.FACTORY_RUNS_ROOT, previousRunsRoot);
+  assert.equal(existsSync(join(process.cwd(), "runs", "BAR-RO1")), false);
 });
 
 test("strażnik zombie: running bez joba w outboxie blokuje z JOB_MISSING", async () => {
