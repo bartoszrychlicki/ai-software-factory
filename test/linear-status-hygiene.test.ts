@@ -371,3 +371,56 @@ test("pominięcie noop zapisuje powód i oba stany w logu", async () => {
     });
   });
 });
+
+test("odrzucony zapis statusu trafia do retry outboxu i nie zatrzymuje cyklu", async () => {
+  await withHarness("factory-status-retry-", async ({ store }) => {
+    const ticketId = "BAR-HYGIENE-RETRY";
+    let statusWrites = 0;
+    let comments = 0;
+    const source = {
+      async getStateName() { return "Todo"; },
+      async setStateByName() {
+        statusWrites += 1;
+        throw new Error("Linear nie potwierdził zapisu: test statusu");
+      },
+      async listComments() { return []; },
+      async comment() { comments += 1; },
+    } as unknown as LinearSource;
+
+    store.createRun(ticketId, "harness", manifest);
+    store.transition(ticketId, {
+      stage: "build",
+      status: "running",
+      actor: "test",
+      reason: "build-running",
+      patch: { plan: "plan", planFiles: ["src/a.ts"], planDomain: "backend" },
+    });
+    const statusKey = `${ticketId}:g1:linear-status:retry`;
+    const commentKey = `${ticketId}:g1:linear-comment:after-status`;
+    store.enqueue({
+      key: statusKey,
+      ticketId,
+      kind: "linear-status",
+      stage: "build",
+      payload: { state: LINEAR_STATE_MAP.phases.build },
+    });
+    store.enqueue({
+      key: commentKey,
+      ticketId,
+      kind: "linear-comment",
+      stage: "build",
+      payload: { body: "kolejna komenda" },
+    });
+
+    await dispatchOutbox(depsFor(store, source));
+
+    assert.equal(statusWrites, 1);
+    assert.deepEqual(
+      [store.getCommand(statusKey)?.state, store.getCommand(statusKey)?.attempts],
+      ["pending", 1]
+    );
+    assert.match(store.getCommand(statusKey)?.lastError ?? "", /nie potwierdził zapisu/);
+    assert.equal(comments, 1);
+    assert.equal(store.getCommand(commentKey)?.state, "done");
+  });
+});

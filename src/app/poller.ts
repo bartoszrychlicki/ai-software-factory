@@ -80,6 +80,7 @@ import { progressComment, type ProgressCommentContext } from "../lifecycle/progr
 import { resolveRoute } from "../config/routing";
 import { authorizeScopePaths, parseScopePaths, scopeBlockedPaths } from "../execution/scope";
 import { extendedStatusName, LINEAR_STATE_MAP } from "../lifecycle/state-map";
+import { effectiveBudget } from "../observability/budget";
 
 const POLL_INTERVAL_MS = Number(process.env.FACTORY_POLL_INTERVAL_MS ?? 60_000);
 const marker = (ticketId: string) => `[linear:${ticketId}:v2]`;
@@ -503,8 +504,7 @@ async function dispatchJob(
   const project = await getProject(run.project);
   const usage = deps.store.totalUsage(run.ticketId);
   const reserved = reservedUsage(deps.store, run.ticketId);
-  const maxMinutes = project.budget?.maxMinutes ?? Number(process.env.FACTORY_BUDGET_MAX_MIN ?? 45);
-  const maxUsd = project.budget?.maxUsd ?? Number(process.env.FACTORY_BUDGET_MAX_USD ?? 3);
+  const { maxMinutes, maxUsd } = effectiveBudget(project);
   const attemptDetails = {
     inputHash: run.manifest.inputHash,
     sha: typeof command.payload.headSha === "string" ? command.payload.headSha : run.headSha,
@@ -1071,10 +1071,7 @@ async function enrichProgressBody(
     const ticket = { project: run.project, labels: run.manifest.labels };
     if (command.payload.enrich === "approve-route") {
       const route = await resolveRoute("build", ticket, run.planDomain);
-      const maxMinutes = project.budget?.maxMinutes
-        ?? Number(process.env.FACTORY_BUDGET_MAX_MIN ?? 45);
-      const maxUsd = project.budget?.maxUsd
-        ?? Number(process.env.FACTORY_BUDGET_MAX_USD ?? 3);
+      const { maxMinutes, maxUsd } = effectiveBudget(project);
       return [
         body,
         `Wykonawca: \`${route.spec}\` · budżet roli: ${JOB_BUDGET_MINUTES.build} min · ` +
@@ -1325,13 +1322,12 @@ async function dispatchTestRun(
   if (!command.externalId) {
     const project = await getProject(run.project);
     const usage = deps.store.totalUsage(run.ticketId);
+    const { maxMinutes, maxUsd } = effectiveBudget(project);
     deps.store.startAttempt(run.ticketId, "test", attempt, `local-test:${sha}:${attempt}`, {
       inputHash: run.manifest.inputHash,
       sha,
-      budgetMaxMinutes: project.budget?.maxMinutes ??
-        Number(process.env.FACTORY_BUDGET_MAX_MIN ?? 45),
-      budgetMaxUsd: project.budget?.maxUsd ??
-        Number(process.env.FACTORY_BUDGET_MAX_USD ?? 3),
+      budgetMaxMinutes: maxMinutes,
+      budgetMaxUsd: maxUsd,
       budgetUsedMinutes: usage.minutes,
       budgetUsedUsd: usage.usd,
     });
@@ -1591,6 +1587,8 @@ function enqueueUnknownCommandHint(
         reviewStatus: run.reviewStatus,
         fixRound: run.fixRound,
         mergedSha: run.mergedSha,
+        score: run.score,
+        scoredAt: run.scoredAt,
       }),
     },
   });
