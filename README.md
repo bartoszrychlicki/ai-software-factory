@@ -118,6 +118,16 @@ transition path on existing hosts; a fresh clone never creates it.
 CI runs the same baseline from repository root: clean install, doctor, tests,
 type-check and build.
 
+When a ticket finishes, is canceled, retires a generation or receives `/score`,
+the poller overwrites `runs/<ticket>/przebieg.md` with the ticket's complete
+transition timeline, human-triggered decisions, attempt costs and links to
+artifacts. The log is also refreshed when a Done ticket is claimed/reopened
+again. This is a local diagnostic artifact only; `runs/` remains ignored and
+nothing from the log is published back to Linear.
+`FACTORY_RUNS_ROOT` relocates the lifecycle database (unless
+`FACTORY_LIFECYCLE_DB` is set; that override takes precedence), database
+backups, local test results, per-job artifacts and `przebieg.md`.
+
 ## MCP server
 
 The local MCP server lets a trusted desktop or coding assistant inspect the

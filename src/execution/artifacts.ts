@@ -1,6 +1,6 @@
 import { mkdir, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
-import { findUpFile } from "../config/projects";
+import { join } from "node:path";
+import { jobArtifactsDir } from "../config/paths";
 
 /**
  * Trwały audit trail runa poza Studio: runs/<ticket>/<runId>/<plik>.
@@ -13,8 +13,7 @@ export async function saveArtifact(
   content: string | Buffer
 ): Promise<void> {
   try {
-    const root = dirname(findUpFile("package.json"));
-    const dir = join(root, "runs", ticketId, runId);
+    const dir = jobArtifactsDir(ticketId, runId);
     await mkdir(dir, { recursive: true });
     await writeFile(join(dir, name), content);
   } catch (err) {

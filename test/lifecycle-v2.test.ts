@@ -2218,8 +2218,11 @@ test("incydent BAR-177: /retry po komendzie anulowanej przed dispatchem tworzy N
 
 test("incydent BAR-180 g2: /replan anuluje joby starej generacji, NIE zjadając joba nowej", async () => {
   const dir = await mkdtemp(join(tmpdir(), "factory-replan-order-"));
+  const previousRunsRoot = process.env.FACTORY_RUNS_ROOT;
   const store = new LifecycleStore(join(dir, "registry.db"));
   try {
+    // replan retire'uje generację, więc applyDecision zapisuje przebieg.md do katalogu tymczasowego.
+    process.env.FACTORY_RUNS_ROOT = dir;
     const deps: PollerDependencies = {
       store,
       mastra: {
@@ -2247,6 +2250,8 @@ test("incydent BAR-180 g2: /replan anuluje joby starej generacji, NIE zjadając 
     assert.equal(store.hasOutstandingJob("BAR-RO1"), true, "run nowej generacji nie może rodzić się jako zombie");
   } finally {
     store.close();
+    if (previousRunsRoot === undefined) delete process.env.FACTORY_RUNS_ROOT;
+    else process.env.FACTORY_RUNS_ROOT = previousRunsRoot;
     await rm(dir, { recursive: true, force: true });
   }
 });
