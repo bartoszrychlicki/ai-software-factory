@@ -82,6 +82,16 @@ test("registry v2 atomowo zachowuje stan, próbę i idempotentny outbox po resta
     const command = store.outstandingCommands()[0];
     assert.equal(command.kind, "run-job");
     store.startAttempt(run.ticketId, "plan", 1, "job-1", {
+      generation: 1,
+      inputHash: "hash-1",
+      sha: "a".repeat(40),
+      budgetMaxMinutes: 45,
+      budgetMaxUsd: 3,
+      budgetUsedMinutes: 2,
+      budgetUsedUsd: 0.1,
+    });
+    // Restart tej samej próby bez generation nie może wyczyścić już znanej wartości.
+    store.startAttempt(run.ticketId, "plan", 1, "job-1-restarted", {
       inputHash: "hash-1",
       sha: "a".repeat(40),
       budgetMaxMinutes: 45,
@@ -108,8 +118,8 @@ test("registry v2 atomowo zachowuje stan, próbę i idempotentny outbox po resta
       ticketId: "BAR-T1",
       stage: "plan",
       attempt: 1,
-      jobRunId: "job-1",
-      generation: undefined,
+      jobRunId: "job-1-restarted",
+      generation: 1,
       inputHash: "hash-1",
       sha: "a".repeat(40),
       status: "failed",
@@ -1674,6 +1684,7 @@ test("stall lease: wiszący job Mastry kończy się JOB_STALLED i pozwala na /re
     assert.equal(canceled.length, 1);
     assert.ok(notifications.some(({ title }) => title.includes("zablokowany")));
     assert.equal(store.latestAttempt("BAR-S1", "plan")?.errorCode, "JOB_STALLED");
+    assert.equal(store.latestAttempt("BAR-S1", "plan")?.generation, 1);
     const retried = reduceLifecycle(blocked, { type: "retry", commentId: "c1", nextAttempt: 2 });
     assert.equal(retried.transition.stage, "plan");
     assert.equal(retried.commands[0]?.payload.kind, "plan");

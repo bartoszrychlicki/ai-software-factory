@@ -16,6 +16,10 @@ import type {
   LifecycleTransition,
   StageAttempt,
 } from "../lifecycle/store";
+import {
+  PLAN_REJECTED_HUMAN_REASON_PREFIX,
+  PLAN_REJECTED_REASON,
+} from "../lifecycle/transition-reasons";
 
 interface StageSummary {
   attempts: number;
@@ -35,7 +39,8 @@ export function isHumanTransition(transition: LifecycleTransition): boolean {
   return HUMAN_TRANSITION_ACTORS.has(transition.actor) ||
     transition.reason === "pr-head-changed" ||
     transition.reason === "INPUT_CHANGED_AFTER_BUILD" ||
-    transition.reason.startsWith("PLAN_REJECTED /reject ");
+    transition.reason === PLAN_REJECTED_REASON ||
+    transition.reason.startsWith(PLAN_REJECTED_HUMAN_REASON_PREFIX);
 }
 
 function flatText(value: unknown): string {
@@ -45,11 +50,6 @@ function flatText(value: unknown): string {
 function cell(value: unknown): string {
   const text = flatText(value).replace(/\|/g, "\\|").trim();
   return text || "—";
-}
-
-function clippedReason(reason: string): string {
-  const text = flatText(reason).trim();
-  return text.length <= 200 ? text : `${text.slice(0, 199)}…`;
 }
 
 function usd(value: number): string {
@@ -98,7 +98,7 @@ function renderTransitionTable(transitions: LifecycleTransition[]): string[] {
       String(transition.generation),
       cell(`${transitionState(transition.fromStage, transition.fromStatus)} → ${transitionState(transition.toStage, transition.toStatus)}`),
       cell(transition.actor),
-      cell(clippedReason(transition.reason)),
+      cell(transition.reason),
       isHumanTransition(transition) ? "👤" : "—",
     ].join(" | ")} |`);
   }
@@ -133,7 +133,8 @@ function aggregateStages(attempts: StageAttempt[]): Map<string, StageSummary> {
 function artifactLinks(
   run: LifecycleRun,
   attempt: StageAttempt,
-  retiredGenerations: number
+  retiredGenerations: number,
+  directoryCache: Map<string, string[] | undefined>
 ): string {
   if (!attempt.jobRunId) return "— brak artefaktów";
   const localTest = attempt.jobRunId.startsWith("local-test:");
@@ -144,9 +145,14 @@ function artifactLinks(
     ? ticketRunsDir(run.ticketId)
     : jobArtifactsDir(run.ticketId, attempt.jobRunId);
   try {
-    const directoryFiles = readdirSync(dir, { withFileTypes: true })
-      .filter((entry) => entry.isFile())
-      .map((entry) => entry.name);
+    let directoryFiles = directoryCache.get(dir);
+    if (!directoryCache.has(dir)) {
+      directoryFiles = readdirSync(dir, { withFileTypes: true })
+        .filter((entry) => entry.isFile())
+        .map((entry) => entry.name);
+      directoryCache.set(dir, directoryFiles);
+    }
+    if (!directoryFiles) return "— brak artefaktów";
     if (localTest) {
       const generation = attempt.generation!;
       const number = attempt.attempt;
@@ -164,7 +170,7 @@ function artifactLinks(
       if (legacyExists && legacyUnambiguous) files.push(legacyName);
 
       const links = files.map((file) =>
-        `[${cell(file)}](./${encodeURIComponent(file)})`
+        `[${cell(file)}](./${markdownUrlSegment(file)})`
       );
       if (legacyExists && !legacyUnambiguous) {
         links.push("(pominięto legacy log runnera — niejednoznaczna generacja)");
@@ -174,15 +180,20 @@ function artifactLinks(
 
     const files = directoryFiles.sort((left, right) => left.localeCompare(right));
     if (files.length === 0) return "— brak artefaktów";
-    const encodedRunId = encodeURIComponent(attempt.jobRunId);
+    const encodedRunId = markdownUrlSegment(attempt.jobRunId);
     const directoryLink = `[./${cell(attempt.jobRunId)}/](./${encodedRunId}/)`;
     const fileLinks = files.map((file) =>
-      `[${cell(file)}](./${encodedRunId}/${encodeURIComponent(file)})`
+      `[${cell(file)}](./${encodedRunId}/${markdownUrlSegment(file)})`
     );
     return [directoryLink, ...fileLinks].join("<br>");
   } catch {
+    directoryCache.set(dir, undefined);
     return "— brak artefaktów";
   }
+}
+
+function markdownUrlSegment(value: string): string {
+  return encodeURIComponent(value).replace(/\(/g, "%28").replace(/\)/g, "%29");
 }
 
 function attemptError(attempt: StageAttempt): string {
@@ -196,15 +207,12 @@ export function buildRunLog(store: LifecycleStore, run: LifecycleRun): string {
   const attempts = store.listAttempts(run.ticketId);
   const usage = store.totalUsage(run.ticketId);
   const retiredGenerations = store.countRetiredGenerations(run.ticketId);
+  const artifactDirectoryCache = new Map<string, string[] | undefined>();
   const humanTransitions = transitions.filter(isHumanTransition);
   const stages = [...aggregateStages(attempts).entries()]
     .sort(([leftStage, left], [rightStage, right]) =>
       right.usd - left.usd || leftStage.localeCompare(rightStage)
     );
-  const score = run.score === undefined
-    ? "—"
-    : `${run.score}/5${run.scoreComment ? ` — ${run.scoreComment}` : ""}`;
-
   const lines = [
     `# ${flatText(run.ticketId)} — przebieg ticketu`,
     "",
@@ -229,7 +237,6 @@ export function buildRunLog(store: LifecycleStore, run: LifecycleRun): string {
     `| liczba przejść | ${transitions.length} |`,
     `| przejścia wywołane przez człowieka | ${humanTransitions.length} |`,
     `| lead time${run.status === "done" ? "" : " (w toku)"} | ${minutes(leadTimeMinutes(store, run))} |`,
-    `| ocena /score | ${cell(score)} |`,
     "",
     "## Koszt per etap",
     "",
@@ -258,8 +265,8 @@ export function buildRunLog(store: LifecycleStore, run: LifecycleRun): string {
     "",
     "> Próby są uporządkowane po czasie rozpoczęcia. Starsze wpisy mogą nie mieć przypisanej generacji; wtedy lokalne artefakty testów są pomijane zamiast zgadywane.",
     "",
-    "| czas | etap | próba | status / outcome | koszt | czas | faktyczny podpis modelu | błąd | artefakty |",
-    "|---|---|---:|---|---|---:|---|---|---|",
+    "| czas | gen | etap | próba | status / outcome | koszt | czas | faktyczny podpis modelu | błąd | artefakty |",
+    "|---|---:|---|---:|---|---|---:|---|---|---|",
   );
 
   for (const attempt of attempts) {
@@ -269,6 +276,7 @@ export function buildRunLog(store: LifecycleStore, run: LifecycleRun): string {
       : `${usd(attempt.costUsd)}${attempt.costSource ? ` (${attempt.costSource})` : ""}`;
     lines.push(`${[
       `| ${cell(attempt.startedAt)}`,
+      attempt.generation === undefined ? "—" : String(attempt.generation),
       cell(attempt.stage),
       String(attempt.attempt),
       cell(outcome),
@@ -276,11 +284,11 @@ export function buildRunLog(store: LifecycleStore, run: LifecycleRun): string {
       attempt.durationMs === undefined ? "—" : minutes(attempt.durationMs / 60_000),
       cell(attempt.signature),
       cell(attemptError(attempt)),
-      artifactLinks(run, attempt, retiredGenerations),
+      artifactLinks(run, attempt, retiredGenerations, artifactDirectoryCache),
     ].join(" | ")} |`);
   }
   if (attempts.length === 0) {
-    lines.push("| — | — | — | — | — | — | — | — | — brak prób |");
+    lines.push("| — | — | — | — | — | — | — | — | — | — brak prób |");
   }
 
   return `${lines.join("\n")}\n`;
@@ -337,7 +345,7 @@ export function writeRunLog(
     }
     console.error(
       `Przebieg ${run.ticketId} nie zapisany:`,
-      error instanceof Error ? error.message : error
+      error
     );
   }
 }

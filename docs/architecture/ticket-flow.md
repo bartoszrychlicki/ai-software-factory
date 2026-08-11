@@ -106,6 +106,20 @@ Registry v1 jest tylko do odczytu. Import wymaga zatwierdzonego planu,
 jednoznacznego checkpointu lub jawnie wskazanego bieżącego PR-a oraz świeżego
 odczytu Lineara/GitHuba/repo przed apply.
 
+### Log przebiegu ticketu
+
+Gdy ticket kończy się jako `Done` lub `Canceled`, albo bieżąca generacja zostaje
+porzucona przez `/replan` lub zmianę wejścia przed buildem, poller atomowo
+nadpisuje `runs/<ticket>/przebieg.md`. Plik obejmuje całą historię ticketu:
+przejścia ze wskazaniem decyzji wywołanych przez człowieka, wszystkie generacje
+i próby, faktyczne sygnatury modeli, czas i koszt per etap oraz linki do lokalnych
+artefaktów. Błąd zapisu jest fail-open i nie blokuje domknięcia lifecycle.
+
+Log jest wyłącznie lokalnym artefaktem diagnostycznym; nic z niego nie jest
+publikowane do Lineara. `FACTORY_RUNS_ROOT` przenosi bazę lifecycle (chyba że
+ustawiono nadrzędne `FACTORY_LIFECYCLE_DB`), backupy, wyniki lokalnych testów,
+artefakty jobów i `przebieg.md`.
+
 ### Sprzątanie poprzedniej generacji
 
 `/replan` oraz zmiana wejścia przed buildem atomowo enqueue'ują

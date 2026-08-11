@@ -1,6 +1,6 @@
 import { readFileSync, writeFileSync, renameSync, openSync, fsyncSync, closeSync, existsSync, readdirSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { runsRoot as configuredRunsRoot } from "../config/paths";
+import { findUpFile } from "../config/projects";
 import type { DecisionKind, FactoryPhase, Gate } from "../lifecycle/operator-types";
 
 export type { DecisionKind, FactoryPhase, Gate } from "../lifecycle/operator-types";
@@ -118,7 +118,7 @@ export interface RestartCommandRecord {
 }
 
 export function runsRoot(): string {
-  return configuredRunsRoot();
+  return process.env.FACTORY_RUNS_ROOT ?? join(dirname(findUpFile("package.json")), "runs");
 }
 
 function statePath(ticketId: string): string {

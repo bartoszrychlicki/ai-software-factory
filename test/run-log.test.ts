@@ -113,7 +113,7 @@ async function seedCompletedRun(harness: Harness, ticketId: string): Promise<Lif
     costSource: "reported",
     durationMs: 60_000,
   });
-  await addArtifact(ticketId, "job-plan-g1", "plan.md");
+  await addArtifact(ticketId, "job-plan-g1", "plan(1).md");
   applyTransition(deps, ticketId, {
     stage: "approval",
     status: "waiting_human",
@@ -206,9 +206,10 @@ test("Done zapisuje pełną oś czasu wielu generacji i linki do prób", async (
     assert.match(log, /- Status: done/);
     assert.match(log, /## Oś czasu/);
     assert.match(log, /## Próby etapów/);
-    assert.match(log, /\.\/job-plan-g1\/plan\.md/);
+    assert.match(log, /\.\/job-plan-g1\/plan%281%29\.md/);
     assert.match(log, /\.\/job-build-g2\/build-report\.md/);
     assert.match(log, /\.\/job-review-g2\/review\.md/);
+    assert.match(log, /\| \d{4}-[^|]+ \| 2 \| build \| 1 \| success/);
     assert.match(log, /reviewer · model-d@xhigh/);
 
     let previousIndex = -1;
@@ -652,7 +653,7 @@ test("harness sprząta env i katalog, gdy LifecycleStore nie może wystartować"
   }
 });
 
-test("ponowny claim zamkniętego ticketu od razu odświeża przebieg", async () => {
+test("ponowny claim nie nadpisuje zamkniętego przebiegu przed kolejnym domknięciem", async () => {
   await withHarness("factory-run-log-reopen-", async (harness) => {
     const ticketId = "BAR-LOG-REOPEN";
     const binDir = join(harness.root, "bin");
@@ -721,7 +722,8 @@ test("ponowny claim zamkniętego ticketu od razu odświeża przebieg", async () 
       reason: "first-generation-done",
     });
     const path = join(harness.runsRoot, ticketId, "przebieg.md");
-    assert.match(await readFile(path, "utf8"), /- Status: done/);
+    const closedLog = await readFile(path, "utf8");
+    assert.match(closedLog, /- Status: done/);
 
     try {
       process.env.PATH = `${binDir}:${previousPath ?? ""}`;
@@ -733,9 +735,7 @@ test("ponowny claim zamkniętego ticketu od razu odświeża przebieg", async () 
 
     const reopened = await readFile(path, "utf8");
     assert.equal(harness.store.getRun(ticketId)?.generation, 2);
-    assert.match(reopened, /- Status: w toku — generacja 2, etap plan\/running/);
-    assert.match(reopened, /\| liczba generacji \| 2 \|/);
-    assert.doesNotMatch(reopened, /- Status: done/);
+    assert.equal(reopened, closedLog);
     assert.deepEqual(claims, [ticketId]);
   });
 });
@@ -824,7 +824,7 @@ test("reopen zachowuje pełny lead time i nie porzuca zakończonej generacji", a
   });
 });
 
-test("/reject zachowuje skrócone uzasadnienie po /replan i jest decyzją człowieka", async () => {
+test("/reject zachowuje pełne uzasadnienie po /replan i jest decyzją człowieka", async () => {
   await withHarness("factory-run-log-reject-", async ({ runsRoot, store, deps }) => {
     const ticketId = "BAR-LOG-7";
     const operatorReason = "regresja na starym imporcie X | `wariant`\n trzeba poprawić";
@@ -869,6 +869,28 @@ test("/reject zachowuje skrócone uzasadnienie po /replan i jest decyzją człow
   });
 });
 
+test("historyczne PLAN_REJECTED jest nadal liczone jako decyzja człowieka", async () => {
+  await withHarness("factory-run-log-legacy-reject-", async ({ store }) => {
+    const ticketId = "BAR-LOG-LEGACY-REJECT";
+    store.createRun(ticketId, "harness", manifest);
+    const blocked = store.transition(ticketId, {
+      stage: "approval",
+      status: "blocked",
+      actor: "coordinator",
+      reason: "PLAN_REJECTED",
+      patch: {
+        errorCode: "PLAN_REJECTED",
+        errorMessage: "historyczne odrzucenie planu",
+      },
+    });
+
+    const log = buildRunLog(store, blocked);
+    assert.match(log, /\| przejścia wywołane przez człowieka \| 1 \|/);
+    assert.match(log, /## Decyzje człowieka \(1\)/);
+    assert.match(log, /PLAN_REJECTED/);
+  });
+});
+
 test("powody i błędy z pipe oraz nową linią nie psują tabel markdown", async () => {
   await withHarness("factory-run-log-escape-", async ({ store }) => {
     const ticketId = "BAR-LOG-8";
@@ -877,7 +899,7 @@ test("powody i błędy z pipe oraz nową linią nie psują tabel markdown", asyn
       stage: "review",
       status: "blocked",
       actor: "human",
-      reason: "operator | split\nnext",
+      reason: `operator | split\nnext ${"długi-powód ".repeat(30)}KONIEC`,
     });
     store.startAttempt(ticketId, "review", 1, "missing-artifacts");
     store.finishAttempt(ticketId, "review", 1, {
@@ -890,13 +912,14 @@ test("powody i błędy z pipe oraz nową linią nie psują tabel markdown", asyn
 
     const log = buildRunLog(store, store.getRun(ticketId)!);
     assert.equal(log.split("operator \\| split next").length - 1, 2);
+    assert.equal(log.split("KONIEC").length - 1, 2);
     assert.match(log, /bad \\| outcome continued/);
     assert.match(log, /bad \\| pipe line/);
     assert.equal(log.split("\n").some((line) => line === "next" || line === "continued"), false);
   });
 });
 
-test("/score po Done zachowuje terminalny lead time i nadpisuje świeżą oceną", async () => {
+test("/score po Done nie nadpisuje logu poza momentami domknięcia", async () => {
   await withHarness("factory-run-log-score-", async (harness) => {
     const ticketId = "BAR-LOG-9";
     await seedCompletedRun(harness, ticketId);
@@ -923,7 +946,7 @@ test("/score po Done zachowuje terminalny lead time i nadpisuje świeżą oceną
     writeRunLog(harness.store, harness.store.getRun(ticketId)!);
     const beforeScore = await readFile(path, "utf8");
     assert.match(beforeScore, /\| lead time \| 30\.00 min \|/);
-    assert.match(beforeScore, /\| ocena \/score \| — \|/);
+    assert.doesNotMatch(beforeScore, /ocena \/score/);
 
     const comments: string[] = [];
     const source = {
@@ -940,18 +963,12 @@ test("/score po Done zachowuje terminalny lead time i nadpisuje świeżą oceną
 
     assert.equal(harness.store.getRun(ticketId)?.score, 4);
     const log = await readFile(path, "utf8");
-    assert.equal(
-      log.split("\n").find((line) => line.startsWith("| lead time |")),
-      beforeScore.split("\n").find((line) => line.startsWith("| lead time |"))
-    );
-    assert.match(log, /\| ocena \/score \| 4\/5 — solidnie \|/);
-    assert.match(log, /## Oś czasu/);
-    assert.match(log, /\.\/job-review-g2\/review\.md/);
+    assert.equal(log, beforeScore);
     assert.equal(comments.length, 1);
   });
 });
 
-test("/score aktywnego runu zapisuje przebieg bez fałszywie porzuconej generacji", async () => {
+test("/score aktywnego runu nie zapisuje przebiegu przed domknięciem lub porzuceniem generacji", async () => {
   await withHarness("factory-run-log-active-score-", async ({ runsRoot, store, deps }) => {
     const ticketId = "BAR-LOG-10";
     const scoreComment = {
@@ -1015,14 +1032,11 @@ test("/score aktywnego runu zapisuje przebieg bez fałszywie porzuconej generacj
 
     assert.equal(store.getRun(ticketId)?.score, 5);
     const activeLog = await readFile(path, "utf8");
-    const afterLead = Number(
-      activeLog.match(/\| lead time \(w toku\) \| ([\d.]+) min \|/)?.[1]
-    );
     assert.equal(beforeLead, 10);
-    assert.ok(afterLead > beforeLead, `${afterLead} powinno być większe od ${beforeLead}`);
+    assert.equal(activeLog, beforeScore);
     assert.match(activeLog, /- Status: w toku — generacja 1, etap approval\/waiting_human/);
     assert.match(activeLog, /\| lead time \(w toku\) \|/);
-    assert.match(activeLog, /\| ocena \/score \| 5\/5 — trafna diagnoza \|/);
+    assert.doesNotMatch(activeLog, /ocena \/score/);
     assert.doesNotMatch(activeLog, /porzucon/);
     assert.equal(acknowledgements.length, 1);
 

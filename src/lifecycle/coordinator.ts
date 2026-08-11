@@ -23,6 +23,11 @@ import {
 } from "./human-summary";
 import { authorizeScopePaths, scopeBlockedPaths } from "../execution/scope";
 import { formatCritiqueFindings } from "./verdicts";
+import {
+  INPUT_CHANGED_BEFORE_BUILD_REASON,
+  PLAN_REJECTED_HUMAN_REASON_PREFIX,
+  REPLAN_REASON_PREFIX,
+} from "./transition-reasons";
 
 type NewCommand = Omit<
   LifecycleCommand,
@@ -308,7 +313,7 @@ function blocked(
 
 function humanNote(value: string): string {
   const text = value.replace(/[|`]/g, "").replace(/\s+/g, " ").trim();
-  return text.length <= 200 ? text : `${text.slice(0, 199)}…`;
+  return text;
 }
 
 /**
@@ -472,7 +477,7 @@ function reduceLifecycleCore(run: LifecycleRun, event: CoordinatorEvent): Coordi
           stage: entry,
           status: "pending",
           actor: "linear",
-          reason: "input-changed-before-build",
+          reason: INPUT_CHANGED_BEFORE_BUILD_REASON,
           incrementGeneration: true,
           cancelOutstandingRunJobs: true,
           patch: { manifest, ...PLAN_RESET_PATCH },
@@ -620,7 +625,7 @@ function reduceLifecycleCore(run: LifecycleRun, event: CoordinatorEvent): Coordi
       "PLAN_REJECTED",
       reason,
       undefined,
-      `PLAN_REJECTED /reject ${event.commentId}: ${humanNote(reason)}`
+      `${PLAN_REJECTED_HUMAN_REASON_PREFIX}${event.commentId}: ${humanNote(reason)}`
     );
   }
 
@@ -641,7 +646,7 @@ function reduceLifecycleCore(run: LifecycleRun, event: CoordinatorEvent): Coordi
         stage: entry,
         status: "running",
         actor: "human",
-        reason: `/replan ${event.commentId}`,
+        reason: `${REPLAN_REASON_PREFIX}${event.commentId}`,
         incrementGeneration: true,
         cancelOutstandingRunJobs: true,
         patch: {

@@ -2,6 +2,10 @@ import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { runsRoot } from "../config/paths";
+import {
+  INPUT_CHANGED_BEFORE_BUILD_REASON,
+  REPLAN_REASON_PREFIX,
+} from "./transition-reasons";
 
 export type LifecycleStage =
   | "plan"
@@ -747,7 +751,7 @@ export class LifecycleStore {
       ) VALUES (?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?)
       ON CONFLICT(ticket_id, stage, attempt) DO UPDATE SET
         job_run_id=excluded.job_run_id,
-        generation=excluded.generation,
+        generation=COALESCE(excluded.generation, generation),
         input_hash=excluded.input_hash,
         sha=excluded.sha,
         status='running',
@@ -953,17 +957,17 @@ export class LifecycleStore {
     return first?.created_at;
   }
 
-  /**
-   * Reopen przez createRun podbija generację bez porzucenia poprzedniej, więc
-   * generation - 1 byłoby błędne. Nowy powód inkrementujący generację wymaga
-   * dopisania go do tego zapytania.
-   */
+  /** Reopen podbija generację bez porzucenia poprzedniej, więc liczymy jawne retirementy. */
   countRetiredGenerations(ticketId: string): number {
     const row = this.db.prepare(`
       SELECT COUNT(*) AS value FROM lifecycle_transitions
       WHERE ticket_id=?
-        AND (reason='input-changed-before-build' OR reason LIKE '/replan %')
-    `).get(ticketId) as { value: number };
+        AND (reason=? OR reason LIKE ?)
+    `).get(
+      ticketId,
+      INPUT_CHANGED_BEFORE_BUILD_REASON,
+      `${REPLAN_REASON_PREFIX}%`
+    ) as { value: number };
     return Number(row.value);
   }
 
