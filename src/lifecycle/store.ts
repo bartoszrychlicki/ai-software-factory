@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { findUpFile } from "../config/projects";
@@ -204,6 +204,26 @@ const parseJson = <T>(value: unknown, fallback: T): T => {
   }
 };
 
+const READ_ONLY_REQUIRED_COLUMNS = {
+  lifecycle_runs: [
+    "ticket_id", "project", "generation", "stage", "status", "manifest_json",
+    "plan", "plan_files_json", "plan_domain", "clarify_round", "approved_at",
+    "branch", "workspace_dir", "head_sha", "tested_sha", "pr_url", "merged_sha",
+    "review_status", "review_report", "smoke_status", "blocked_stage", "error_code",
+    "error_message", "feedback", "plan_entry", "plan_variant", "triage_summary",
+    "briefs_json", "research_failures_json", "critique_round", "fix_round",
+    "critique_verdict", "critique_report", "critique_meaning", "degradations_json",
+    "score", "score_comment", "scored_at", "created_at", "updated_at",
+  ],
+  lifecycle_stage_attempts: [
+    "ticket_id", "stage", "attempt", "job_run_id", "input_hash", "sha", "status",
+    "outcome", "report", "signature", "error_code", "error_message", "cost_usd",
+    "cost_source", "duration_ms", "budget_max_minutes", "budget_max_usd",
+    "budget_used_minutes", "budget_used_usd", "started_at", "finished_at",
+  ],
+  lifecycle_lease: ["id", "pid", "hostname", "heartbeat_at"],
+} as const;
+
 export function lifecycleDbPath(): string {
   return process.env.FACTORY_LIFECYCLE_DB ??
     join(dirname(findUpFile("package.json")), "runs", "lifecycle.db");
@@ -215,8 +235,26 @@ export function lifecycleDbPath(): string {
  */
 export class LifecycleStore {
   private readonly db: DatabaseSync;
+  private readonly readOnly: boolean;
 
-  constructor(path = lifecycleDbPath()) {
+  constructor(path = lifecycleDbPath(), options: { readOnly?: boolean } = {}) {
+    this.readOnly = options.readOnly ?? false;
+    if (this.readOnly) {
+      if (!existsSync(path)) {
+        throw new Error(
+          `Fabryka nie ma jeszcze rejestru lifecycle: brak pliku ${path}`
+        );
+      }
+      this.db = new DatabaseSync(path, { readOnly: true });
+      try {
+        this.db.exec("PRAGMA busy_timeout = 5000;");
+        this.assertReadableSchema();
+      } catch (error) {
+        this.db.close();
+        throw error;
+      }
+      return;
+    }
     mkdirSync(dirname(path), { recursive: true });
     this.db = new DatabaseSync(path);
     this.db.exec(`
@@ -377,7 +415,29 @@ export class LifecycleStore {
     this.db.close();
   }
 
+  private assertWritable(): void {
+    if (this.readOnly) throw new Error("LifecycleStore otwarty read-only");
+  }
+
+  private assertReadableSchema(): void {
+    const missing: string[] = [];
+    for (const [table, requiredColumns] of Object.entries(READ_ONLY_REQUIRED_COLUMNS)) {
+      const columns = this.db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
+      const available = new Set(columns.map((column) => column.name));
+      for (const column of requiredColumns) {
+        if (!available.has(column)) missing.push(`${table}.${column}`);
+      }
+    }
+    if (missing.length) {
+      throw new Error(
+        `Rejestr lifecycle ma niekompatybilny schemat (brak: ${missing.join(", ")}); ` +
+          "uruchom poller, aby wykonać migrację"
+      );
+    }
+  }
+
   private transaction<T>(fn: () => T): T {
+    this.assertWritable();
     this.db.exec("BEGIN IMMEDIATE");
     try {
       const result = fn();
@@ -390,6 +450,7 @@ export class LifecycleStore {
   }
 
   createRun(ticketId: string, project: string, manifest: TicketManifestV2): LifecycleRun {
+    this.assertWritable();
     return this.transaction(() => {
       const previous = this.getRun(ticketId);
       const timestamp = now();
@@ -548,6 +609,7 @@ export class LifecycleStore {
   enqueue(command: Omit<LifecycleCommand, "state" | "attempts" | "createdAt" | "updatedAt" | "availableAt"> & {
     availableAt?: string;
   }): void {
+    this.assertWritable();
     this.transaction(() => this.insertCommand(command, now()));
   }
 
@@ -595,6 +657,7 @@ export class LifecycleStore {
    * inkrementuje attempts) — używane przy serializacji kolizji plikowych.
    */
   deferCommand(key: string, availableAt: string): void {
+    this.assertWritable();
     this.db.prepare(`
       UPDATE lifecycle_commands SET available_at=?, updated_at=?
       WHERE idempotency_key=? AND state='pending'
@@ -613,6 +676,7 @@ export class LifecycleStore {
     state: LifecycleCommand["state"],
     options: { externalId?: string; error?: string; retryAt?: string } = {}
   ): void {
+    this.assertWritable();
     const retry = state === "pending";
     this.db.prepare(`
       UPDATE lifecycle_commands
@@ -649,6 +713,7 @@ export class LifecycleStore {
       | "budgetUsedUsd"
     > = {}
   ): StageAttempt {
+    this.assertWritable();
     const startedAt = now();
     this.db.prepare(`
       INSERT INTO lifecycle_stage_attempts (
@@ -709,6 +774,7 @@ export class LifecycleStore {
       | "durationMs"
     >
   ): void {
+    this.assertWritable();
     this.db.prepare(`
       UPDATE lifecycle_stage_attempts
       SET status=?, outcome=?, report=?, signature=?, sha=COALESCE(?, sha),
@@ -759,10 +825,28 @@ export class LifecycleStore {
   }
 
   /**
+   * Koszt zakończonych prób od podanego ISO, ograniczony do wskazanych projektów —
+   * projekcja MCP nie może ujawniać kosztu projektów spoza LINEAR_PROJECTS.
+   * Pusta lista projektów daje 0 (fail-closed), a nie sumę globalną.
+   */
+  usageSinceForProjects(iso: string, projects: string[]): number {
+    if (projects.length === 0) return 0;
+    const placeholders = projects.map(() => "?").join(", ");
+    const row = this.db.prepare(`
+      SELECT COALESCE(SUM(a.cost_usd), 0) AS usd
+      FROM lifecycle_stage_attempts a
+      JOIN lifecycle_runs r ON r.ticket_id = a.ticket_id
+      WHERE a.finished_at >= ? AND r.project IN (${placeholders})
+    `).get(iso, ...projects) as { usd: number };
+    return Number(row.usd);
+  }
+
+  /**
    * Atomowa kopia bazy na żywo: checkpoint WAL + VACUUM INTO. Ścieżka docelowa
    * nie może istnieć (SQLite odmówi nadpisania istniejącego pliku).
    */
   backupTo(path: string): void {
+    this.assertWritable();
     mkdirSync(dirname(path), { recursive: true });
     this.db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
     this.db.exec(`VACUUM INTO '${path.replace(/'/g, "''")}'`);
@@ -780,6 +864,7 @@ export class LifecycleStore {
   }
 
   claimLease(pid: number, hostname?: string): void {
+    this.assertWritable();
     this.db.prepare(`
       INSERT INTO lifecycle_lease (id, pid, hostname, heartbeat_at) VALUES (1, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
@@ -788,10 +873,12 @@ export class LifecycleStore {
   }
 
   renewLease(pid: number): void {
+    this.assertWritable();
     this.db.prepare("UPDATE lifecycle_lease SET heartbeat_at=? WHERE id=1 AND pid=?").run(now(), pid);
   }
 
   releaseLease(pid: number): void {
+    this.assertWritable();
     this.db.prepare("DELETE FROM lifecycle_lease WHERE id=1 AND pid=?").run(pid);
   }
 
@@ -827,6 +914,7 @@ export class LifecycleStore {
 
   /** Ocena jakości od człowieka (/score) — zapis przy runie, bez przejścia lifecycle. */
   setScore(ticketId: string, score: number, comment?: string): void {
+    this.assertWritable();
     this.db.prepare(`
       UPDATE lifecycle_runs SET score=?, score_comment=?, scored_at=?, updated_at=?
       WHERE ticket_id=?
@@ -863,6 +951,7 @@ export class LifecycleStore {
   }
 
   markCommentProcessed(ticketId: string, commentId: string, command?: string): void {
+    this.assertWritable();
     this.db.prepare(`
       INSERT OR IGNORE INTO lifecycle_processed_comments (
         comment_id, ticket_id, command, processed_at

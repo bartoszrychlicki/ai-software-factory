@@ -1,4 +1,5 @@
 import type { DecisionKind } from "./operator-types";
+import { openGate, type OpenGateInput } from "./gates";
 
 export type OperatorCommandKind = "retry" | "replan" | "restart" | "fix" | "score" | "scope";
 export type CommandKind = DecisionKind | OperatorCommandKind;
@@ -31,17 +32,9 @@ export interface ParsedCommand {
   payload?: string;
 }
 
-export interface UnknownCommandContext {
+export interface UnknownCommandContext extends OpenGateInput {
   firstToken: string;
-  stage: string;
-  status: string;
   blockedStage?: string;
-  errorCode?: string;
-  planDomain?: string;
-  approvedAt?: string;
-  reviewStatus?: string;
-  fixRound?: number;
-  mergedSha?: string;
 }
 
 const DECISION_COMMANDS = new Set<DecisionKind>(["start", "approve", "reject", "answer", "done"]);
@@ -94,41 +87,31 @@ export function unknownCommandHint(input: UnknownCommandContext): string {
   const [rawFirstToken = input.firstToken.trim()] = input.firstToken.trim().split(/\s+/);
   const firstToken = normalizeCommandToken(rawFirstToken);
   const prefix = `ℹ️ Nieznana komenda \`${firstToken}\`.`;
+  const projection = openGate(input);
+  const formattedCommands = projection.humanCommands
+    .map((command) => `\`${command}\``)
+    .join(", ");
 
-  if (input.status === "done") {
-    return `${prefix} Dostępne teraz: \`/score 1-5 [komentarz]\`.`;
-  }
-  if (input.status === "blocked") {
-    if (input.errorCode === "SCOPE_BLOCKED") {
-      return (
-        `${prefix} Dostępne teraz: \`/retry\`, \`/replan <powód>\`, ` +
-        "`/scope <ścieżka>`."
-      );
+  if (projection.gate === "score") {
+    if (input.stage === "merge" && input.mergedSha) {
+      return `${prefix} PR zmergowany; dostępne: ${formattedCommands}.`;
     }
-    return `${prefix} Dostępne teraz: \`/retry\`, \`/replan <powód>\`.`;
+    return `${prefix} Dostępne teraz: ${formattedCommands}.`;
   }
-  if (
-    input.stage === "approval" &&
-    input.status === "waiting_human" &&
-    input.planDomain === "ops" &&
-    input.approvedAt
-  ) {
-    return `${prefix} Dostępne teraz: \`/done\`.`;
+  if (projection.gate === "blocked") {
+    return `${prefix} Dostępne teraz: ${formattedCommands}.`;
   }
-  if (input.stage === "approval" && input.status === "waiting_human") {
-    return `${prefix} Dostępne teraz: \`/approve\`, \`/reject <powód>\`.`;
+  if (projection.gate === "ops-checklist") {
+    return `${prefix} Dostępne teraz: ${formattedCommands}.`;
   }
-  if (
-    (input.stage === "plan" || input.stage === "triage" || input.stage === "synthesis") &&
-    input.status === "waiting_human"
-  ) {
-    return `${prefix} Dostępne teraz: \`/answer <odpowiedzi>\`.`;
+  if (projection.gate === "plan-approval") {
+    return `${prefix} Dostępne teraz: ${formattedCommands}.`;
   }
-  if (input.stage === "merge" && input.status === "waiting_human") {
-    if (input.mergedSha) {
-      return `${prefix} PR zmergowany; dostępne: \`/score 1-5\`.`;
-    }
-    if (input.reviewStatus === "advisory-fix" && (input.fixRound ?? 0) < 2) {
+  if (projection.gate === "clarify") {
+    return `${prefix} Dostępne teraz: ${formattedCommands}.`;
+  }
+  if (projection.gate === "merge") {
+    if (projection.humanCommands.some((command) => command.startsWith("/fix"))) {
       return (
         `${prefix} Dostępne teraz: \`/fix [wskazówki]\` ` +
         `(poprawka ${(input.fixRound ?? 0) + 1}/2), \`/replan <powód>\`, \`/score 1-5\`.`
@@ -137,12 +120,12 @@ export function unknownCommandHint(input: UnknownCommandContext): string {
     if (input.reviewStatus === "advisory-fix") {
       return (
         `${prefix} Limit \`/fix\` wyczerpany (2/2); dostępne: ` +
-        "`/replan <powód>`, `/score 1-5`."
+        `${formattedCommands}.`
       );
     }
     return (
       `${prefix} Review: ${input.reviewStatus ?? "brak werdyktu"} — \`/fix\` niedostępny. ` +
-      "Dostępne: `/replan <powód>`, `/score 1-5`. Merge robisz w GitHubie."
+      `Dostępne: ${formattedCommands}. Merge robisz w GitHubie.`
     );
   }
   return (
