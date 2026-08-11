@@ -313,7 +313,7 @@ function blocked(
 
 function humanNote(value: string): string {
   const text = value.replace(/[|`]/g, "").replace(/\s+/g, " ").trim();
-  return text;
+  return text.length <= 200 ? text : `${text.slice(0, 199)}…`;
 }
 
 /**

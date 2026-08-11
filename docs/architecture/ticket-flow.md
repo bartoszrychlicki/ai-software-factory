@@ -108,9 +108,10 @@ odczytu Lineara/GitHuba/repo przed apply.
 
 ### Log przebiegu ticketu
 
-Gdy ticket kończy się jako `Done` lub `Canceled`, albo bieżąca generacja zostaje
-porzucona przez `/replan` lub zmianę wejścia przed buildem, poller atomowo
-nadpisuje `runs/<ticket>/przebieg.md`. Plik obejmuje całą historię ticketu:
+Gdy ticket kończy się jako `Done` lub `Canceled`, bieżąca generacja zostaje
+porzucona przez `/replan` lub zmianę wejścia przed buildem, zapisano `/score`
+albo ponownie podjęto ukończony ticket, poller atomowo nadpisuje
+`runs/<ticket>/przebieg.md`. Plik obejmuje całą historię ticketu:
 przejścia ze wskazaniem decyzji wywołanych przez człowieka, wszystkie generacje
 i próby, faktyczne sygnatury modeli, czas i koszt per etap oraz linki do lokalnych
 artefaktów. Błąd zapisu jest fail-open i nie blokuje domknięcia lifecycle.

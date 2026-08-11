@@ -52,6 +52,11 @@ function cell(value: unknown): string {
   return text || "—";
 }
 
+function clippedReason(reason: string): string {
+  const text = flatText(reason).trim();
+  return text.length <= 200 ? text : `${text.slice(0, 199)}…`;
+}
+
 function usd(value: number): string {
   return `$${value.toFixed(4)}`;
 }
@@ -98,7 +103,7 @@ function renderTransitionTable(transitions: LifecycleTransition[]): string[] {
       String(transition.generation),
       cell(`${transitionState(transition.fromStage, transition.fromStatus)} → ${transitionState(transition.toStage, transition.toStatus)}`),
       cell(transition.actor),
-      cell(transition.reason),
+      cell(clippedReason(transition.reason)),
       isHumanTransition(transition) ? "👤" : "—",
     ].join(" | ")} |`);
   }
@@ -213,6 +218,9 @@ export function buildRunLog(store: LifecycleStore, run: LifecycleRun): string {
     .sort(([leftStage, left], [rightStage, right]) =>
       right.usd - left.usd || leftStage.localeCompare(rightStage)
     );
+  const score = run.score === undefined
+    ? "—"
+    : `${run.score}/5${run.scoreComment ? ` — ${run.scoreComment}` : ""}`;
   const lines = [
     `# ${flatText(run.ticketId)} — przebieg ticketu`,
     "",
@@ -237,6 +245,7 @@ export function buildRunLog(store: LifecycleStore, run: LifecycleRun): string {
     `| liczba przejść | ${transitions.length} |`,
     `| przejścia wywołane przez człowieka | ${humanTransitions.length} |`,
     `| lead time${run.status === "done" ? "" : " (w toku)"} | ${minutes(leadTimeMinutes(store, run))} |`,
+    `| ocena /score | ${cell(score)} |`,
     "",
     "## Koszt per etap",
     "",

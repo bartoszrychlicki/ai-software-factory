@@ -1564,6 +1564,9 @@ async function recordScore(
   const parsed = parseScorePayload(payload);
   if (!parsed) return;
   deps.store.setScore(run.ticketId, parsed.value, parsed.comment);
+  // `run` to kopia sprzed oceny — przebieg musi zobaczyć świeży score.
+  const scored = deps.store.getRun(run.ticketId);
+  if (scored) writeRunLog(deps.store, scored);
   deps.store.markCommentProcessed(run.ticketId, commentId, "score");
   void appendExperimentRow({
     kind: "score",
@@ -1964,6 +1967,7 @@ async function claimReady(deps: PollerDependencies): Promise<void> {
     const tickets = (await source.listReady()).slice(0, free);
     for (const ticket of tickets) {
       const existing = deps.store.getRun(ticket.id);
+      const reopened = existing?.status === "done";
       if (existing && existing.status !== "done") {
         await source.claim(ticket.id, claimStateName(existing, extended));
         continue;
@@ -1989,6 +1993,10 @@ async function claimReady(deps: PollerDependencies): Promise<void> {
         forcedVariant: project.planPipeline === "v3" && soloForced ? "solo" : undefined,
         nextAttempt: deps.store.nextAttempt(ticket.id, entry),
       }));
+      if (reopened) {
+        const started = deps.store.getRun(ticket.id);
+        if (started) writeRunLog(deps.store, started);
+      }
     }
   }
 }

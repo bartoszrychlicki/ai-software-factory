@@ -653,7 +653,7 @@ test("harness sprząta env i katalog, gdy LifecycleStore nie może wystartować"
   }
 });
 
-test("ponowny claim nie nadpisuje zamkniętego przebiegu przed kolejnym domknięciem", async () => {
+test("ponowny claim zamkniętego ticketu od razu odświeża przebieg", async () => {
   await withHarness("factory-run-log-reopen-", async (harness) => {
     const ticketId = "BAR-LOG-REOPEN";
     const binDir = join(harness.root, "bin");
@@ -722,8 +722,7 @@ test("ponowny claim nie nadpisuje zamkniętego przebiegu przed kolejnym domknię
       reason: "first-generation-done",
     });
     const path = join(harness.runsRoot, ticketId, "przebieg.md");
-    const closedLog = await readFile(path, "utf8");
-    assert.match(closedLog, /- Status: done/);
+    assert.match(await readFile(path, "utf8"), /- Status: done/);
 
     try {
       process.env.PATH = `${binDir}:${previousPath ?? ""}`;
@@ -735,7 +734,9 @@ test("ponowny claim nie nadpisuje zamkniętego przebiegu przed kolejnym domknię
 
     const reopened = await readFile(path, "utf8");
     assert.equal(harness.store.getRun(ticketId)?.generation, 2);
-    assert.equal(reopened, closedLog);
+    assert.match(reopened, /- Status: w toku — generacja 2, etap plan\/running/);
+    assert.match(reopened, /\| liczba generacji \| 2 \|/);
+    assert.doesNotMatch(reopened, /- Status: done/);
     assert.deepEqual(claims, [ticketId]);
   });
 });
@@ -912,14 +913,15 @@ test("powody i błędy z pipe oraz nową linią nie psują tabel markdown", asyn
 
     const log = buildRunLog(store, store.getRun(ticketId)!);
     assert.equal(log.split("operator \\| split next").length - 1, 2);
-    assert.equal(log.split("KONIEC").length - 1, 2);
+    assert.doesNotMatch(log, /KONIEC/);
+    assert.equal(log.split("…").length - 1, 2);
     assert.match(log, /bad \\| outcome continued/);
     assert.match(log, /bad \\| pipe line/);
     assert.equal(log.split("\n").some((line) => line === "next" || line === "continued"), false);
   });
 });
 
-test("/score po Done nie nadpisuje logu poza momentami domknięcia", async () => {
+test("/score po Done zachowuje terminalny lead time i nadpisuje świeżą oceną", async () => {
   await withHarness("factory-run-log-score-", async (harness) => {
     const ticketId = "BAR-LOG-9";
     await seedCompletedRun(harness, ticketId);
@@ -946,7 +948,7 @@ test("/score po Done nie nadpisuje logu poza momentami domknięcia", async () =>
     writeRunLog(harness.store, harness.store.getRun(ticketId)!);
     const beforeScore = await readFile(path, "utf8");
     assert.match(beforeScore, /\| lead time \| 30\.00 min \|/);
-    assert.doesNotMatch(beforeScore, /ocena \/score/);
+    assert.match(beforeScore, /\| ocena \/score \| — \|/);
 
     const comments: string[] = [];
     const source = {
@@ -963,12 +965,18 @@ test("/score po Done nie nadpisuje logu poza momentami domknięcia", async () =>
 
     assert.equal(harness.store.getRun(ticketId)?.score, 4);
     const log = await readFile(path, "utf8");
-    assert.equal(log, beforeScore);
+    assert.equal(
+      log.split("\n").find((line) => line.startsWith("| lead time |")),
+      beforeScore.split("\n").find((line) => line.startsWith("| lead time |"))
+    );
+    assert.match(log, /\| ocena \/score \| 4\/5 — solidnie \|/);
+    assert.match(log, /## Oś czasu/);
+    assert.match(log, /\.\/job-review-g2\/review\.md/);
     assert.equal(comments.length, 1);
   });
 });
 
-test("/score aktywnego runu nie zapisuje przebiegu przed domknięciem lub porzuceniem generacji", async () => {
+test("/score aktywnego runu zapisuje przebieg bez fałszywie porzuconej generacji", async () => {
   await withHarness("factory-run-log-active-score-", async ({ runsRoot, store, deps }) => {
     const ticketId = "BAR-LOG-10";
     const scoreComment = {
@@ -1032,11 +1040,14 @@ test("/score aktywnego runu nie zapisuje przebiegu przed domknięciem lub porzuc
 
     assert.equal(store.getRun(ticketId)?.score, 5);
     const activeLog = await readFile(path, "utf8");
+    const afterLead = Number(
+      activeLog.match(/\| lead time \(w toku\) \| ([\d.]+) min \|/)?.[1]
+    );
     assert.equal(beforeLead, 10);
-    assert.equal(activeLog, beforeScore);
+    assert.ok(afterLead > beforeLead, `${afterLead} powinno być większe od ${beforeLead}`);
     assert.match(activeLog, /- Status: w toku — generacja 1, etap approval\/waiting_human/);
     assert.match(activeLog, /\| lead time \(w toku\) \|/);
-    assert.doesNotMatch(activeLog, /ocena \/score/);
+    assert.match(activeLog, /\| ocena \/score \| 5\/5 — trafna diagnoza \|/);
     assert.doesNotMatch(activeLog, /porzucon/);
     assert.equal(acknowledgements.length, 1);
 
