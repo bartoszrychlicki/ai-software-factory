@@ -180,6 +180,8 @@ test("deep path: triage → research ×3 → synteza → krytyka → bramka z pe
     assert.match(body, /block_before_build/);
     assert.match(body, /Degradacje/);
     assert.match(body, /\$4\.21/);
+    assert.match(body, /Rekomendacja/);
+    assert.match(body, /`\/replan`/);
     assert.match(body, /Triage: typ: feature/);
 
     // /approve → build dostaje brief recon w payloadzie
@@ -685,6 +687,7 @@ test("limit kosztu planowania rezerwuje następny job i kieruje istniejący plan
     const gate = store.outstandingCommands().find((command) => command.kind === "linear-comment");
     assert.match(String(gate?.payload.body), /limit planowania \$2\.00/);
     assert.match(String(gate?.payload.body), /ostatni użyteczny plan/);
+    assert.match(String(gate?.payload.body), /`\/approve`.*`\/replan`.*`\/reject/s);
   } finally {
     store.close();
     if (previousRoot === undefined) delete process.env.FACTORY_ROOT;

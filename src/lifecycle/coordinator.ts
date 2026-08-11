@@ -222,6 +222,7 @@ function approvalGateComment(
     usage?: { usd: number; minutes: number };
     planning?: { maxUsd: number; maxCritiqueRounds: number };
     completedCritiqueRounds?: number;
+    planningLimitReached?: boolean;
   } = {}
 ): NewCommand {
   const header = run.planVariant === "deep"
@@ -256,6 +257,12 @@ function approvalGateComment(
       ].join("")
     : "";
   const technicalPlan = stripSection(run.plan ?? "", HUMAN_SUMMARY_HEADING);
+  const decisionPrompt = opts.planningLimitReached
+    ? [
+        "**Rekomendacja:** nie uruchamiać kolejnej automatycznej rundy planowania.",
+        "Wybierz `/approve`, aby zaakceptować plan wraz z checklistą, `/replan`, aby zlecić ręcznie nową generację planu, albo `/reject <powód>`, aby anulować tę próbę.",
+      ].join("\n\n")
+    : "Zatwierdź wyłącznie komendą `/approve` albo odrzuć: `/reject <powód>`.";
   const body = [
     header,
     summarySection,
@@ -266,7 +273,7 @@ function approvalGateComment(
     "---",
     "🔧 **Plan techniczny**",
     technicalPlan,
-    "Zatwierdź wyłącznie komendą `/approve` albo odrzuć: `/reject <powód>`.",
+    decisionPrompt,
   ].filter(Boolean).join("\n\n");
   return linearComment(run, suffix, body, "approval", opts.signature);
 }
@@ -1167,6 +1174,7 @@ function reduceLifecycleCore(run: LifecycleRun, event: CoordinatorEvent): Coordi
               usage: event.usage,
               planning: event.planning,
               completedCritiqueRounds: run.critiqueRound,
+              planningLimitReached: true,
             }
           )],
         };
@@ -1308,7 +1316,13 @@ function reduceLifecycleCore(run: LifecycleRun, event: CoordinatorEvent): Coordi
         commands: [approvalGateComment(
           { ...run, ...gatePatch },
           `plan:critique:${event.attempt}`,
-          { signature: event.output.signature, usage: event.usage, planning: event.planning }
+          {
+            signature: event.output.signature,
+            usage: event.usage,
+            planning: event.planning,
+            planningLimitReached: event.output.errorCode === "PLANNING_BUDGET_EXHAUSTED" ||
+              (verdict === "issues" && hasBlockingFinding && !mayRevise),
+          }
         )],
       };
     }
