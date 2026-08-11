@@ -23,6 +23,13 @@ export const POLLER_SIGNATURE: ActionSignature = {
   profile: "orchestrator",
 };
 
+export const MCP_SIGNATURE: ActionSignature = {
+  agent: "ai-factory",
+  harness: "mcp",
+  model: "—",
+  profile: "orchestrator",
+};
+
 const ACTION_PROFILES = {
   planner: true,
   builder: true,

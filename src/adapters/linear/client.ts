@@ -26,8 +26,27 @@ interface LinearIssue {
   url: string;
   priorityLabel: string | null;
   labels: { nodes: { id: string; name: string }[] };
+  project: { id: string; name: string } | null;
   state: { id: string; name: string; type: string };
   team: { states: { nodes: { id: string; name: string; type: string }[] } };
+}
+
+export interface LinearIssueReference {
+  id: string;
+  projectName: string | null;
+}
+
+interface LinearProjectForCreate {
+  id: string;
+  name: string;
+  teams: {
+    nodes: {
+      id: string;
+      name: string;
+      states: { nodes: { id: string; name: string; type: string }[] };
+      labels: { nodes: { id: string; name: string }[] };
+    }[];
+  };
 }
 
 export interface LinearComment {
@@ -67,9 +86,19 @@ export class LinearSource implements TicketSource {
     return json.data as T;
   }
 
+  private assertMutationSuccess(
+    payload: { success?: boolean } | null | undefined,
+    what: string
+  ): void {
+    if (!payload || payload.success !== true) {
+      throw new Error(`Linear nie potwierdził zapisu: ${what}`);
+    }
+  }
+
   private issueFields = `
     id identifier title description url priorityLabel
     labels { nodes { id name } }
+    project { id name }
     state { id name type }
     team { states { nodes { id name type } } }
   `;
@@ -82,7 +111,22 @@ export class LinearSource implements TicketSource {
     return data.issue;
   }
 
-  async getTicket(identifier: string): Promise<Ticket & { stateName: string }> {
+  async resolveIssue(identifier: string): Promise<LinearIssueReference> {
+    const data = await this.gql<{
+      issue: { id: string; project: { name: string } | null };
+    }>(
+      `query($id: String!) { issue(id: $id) { id project { name } } }`,
+      { id: identifier }
+    );
+    return {
+      id: data.issue.id,
+      projectName: data.issue.project?.name ?? null,
+    };
+  }
+
+  async getTicket(identifier: string): Promise<
+    Ticket & { stateName: string; stateType: string; projectName: string | null }
+  > {
     const issue = await this.fetchIssue(identifier);
     return {
       id: issue.identifier,
@@ -93,7 +137,77 @@ export class LinearSource implements TicketSource {
       priority: issue.priorityLabel ?? undefined,
       url: issue.url,
       stateName: issue.state.name,
+      stateType: issue.state.type,
+      projectName: issue.project?.name ?? null,
     };
+  }
+
+  /** Zakłada ręcznie zlecony ticket zawsze w backlogu projektu, nigdy w kolejce pollera. */
+  async createIssue(input: {
+    title: string;
+    description?: string;
+    labels?: string[];
+  }): Promise<{ identifier: string; url: string }> {
+    const data = await this.gql<{ projects: { nodes: LinearProjectForCreate[] } }>(
+      `query($name: String!) {
+        projects(filter: { name: { eq: $name } }, first: 2) {
+          nodes {
+            id name
+            teams {
+              nodes {
+                id name
+                states { nodes { id name type } }
+                labels { nodes { id name } }
+              }
+            }
+          }
+        }
+      }`,
+      { name: this.project }
+    );
+    if (data.projects.nodes.length !== 1) {
+      throw new Error(
+        data.projects.nodes.length === 0
+          ? `Brak projektu "${this.project}" w Linearze`
+          : `Nazwa projektu "${this.project}" nie jest jednoznaczna w Linearze`
+      );
+    }
+    const project = data.projects.nodes[0];
+    if (project.teams.nodes.length !== 1) {
+      throw new Error(
+        `Projekt "${this.project}" musi należeć do dokładnie jednego teamu, ` +
+        `a należy do ${project.teams.nodes.length}`
+      );
+    }
+    const team = project.teams.nodes[0];
+    const requestedLabels = [...new Set(input.labels ?? [])];
+    const labelsByName = new Map(team.labels.nodes.map((label) => [label.name, label.id]));
+    const unknownLabels = requestedLabels.filter((label) => !labelsByName.has(label));
+    if (unknownLabels.length) {
+      throw new Error(`Nieznane labele w teamie "${team.name}": ${unknownLabels.join(", ")}`);
+    }
+    const backlog = pickState(team.states.nodes, "backlog");
+    const created = await this.gql<{
+      issueCreate: { success: boolean; issue: { identifier: string; url: string } | null };
+    }>(
+      `mutation($input: IssueCreateInput!) {
+        issueCreate(input: $input) { success issue { identifier url } }
+      }`,
+      {
+        input: {
+          teamId: team.id,
+          projectId: project.id,
+          stateId: backlog.id,
+          title: input.title,
+          description: input.description ?? "",
+          labelIds: requestedLabels.map((label) => labelsByName.get(label)),
+        },
+      }
+    );
+    if (!created.issueCreate.success || !created.issueCreate.issue) {
+      throw new Error(`Linear nie utworzył issue w projekcie "${this.project}"`);
+    }
+    return created.issueCreate.issue;
   }
 
   /**
@@ -135,10 +249,11 @@ export class LinearSource implements TicketSource {
       );
     }
     const started = preferred ?? pickState(issue.team.states.nodes, "started", "In Progress");
-    await this.gql(
+    const result = await this.gql<{ issueUpdate: { success: boolean } | null }>(
       `mutation($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }`,
       { id: issue.id, input: { stateId: started.id } }
     );
+    this.assertMutationSuccess(result?.issueUpdate, `claim ticketu ${id}`);
   }
 
   async setStatus(id: string, status: FactoryStatus): Promise<void> {
@@ -153,10 +268,11 @@ export class LinearSource implements TicketSource {
             ? "👤 ⛔ Zablokowany"
             : undefined;
     const state = pickState(issue.team.states.nodes, STATUS_TO_STATE_TYPE[status], preferredName);
-    await this.gql(
+    const result = await this.gql<{ issueUpdate: { success: boolean } | null }>(
       `mutation($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }`,
       { id: issue.id, input: { stateId: state.id } }
     );
+    this.assertMutationSuccess(result?.issueUpdate, `zmiana statusu ticketu ${id} na ${status}`);
   }
 
   /** Issues projektu w danym stanie, z komentarzami — dla merge-watchera i adopcji sierot. */
@@ -217,13 +333,22 @@ export class LinearSource implements TicketSource {
     signature: ActionSignature = POLLER_SIGNATURE
   ): Promise<void> {
     const issue = await this.fetchIssue(id);
+    await this.commentByIssueId(issue.id, body, signature);
+  }
+
+  async commentByIssueId(
+    issueId: string,
+    body: string,
+    signature: ActionSignature = POLLER_SIGNATURE
+  ): Promise<void> {
     const signedBody = signature.profile === "orchestrator"
       ? body
       : `${signatureHeader(signature)}\n\n${body}`;
-    await this.gql(
+    const result = await this.gql<{ commentCreate: { success: boolean } | null }>(
       `mutation($input: CommentCreateInput!) { commentCreate(input: $input) { success } }`,
-      { input: { issueId: issue.id, body: signedBody + signatureFooter(signature) } }
+      { input: { issueId, body: signedBody + signatureFooter(signature) } }
     );
+    this.assertMutationSuccess(result?.commentCreate, `komentarz do issue ${issueId}`);
   }
 
   /** Ustawia stan po dokładnej nazwie (stany procesu fabryki). */
@@ -231,10 +356,11 @@ export class LinearSource implements TicketSource {
     const issue = await this.fetchIssue(id);
     const state = issue.team.states.nodes.find((s) => s.name === stateName);
     if (!state) throw new Error(`Brak stanu "${stateName}" w teamie`);
-    await this.gql(
+    const result = await this.gql<{ issueUpdate: { success: boolean } | null }>(
       `mutation($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }`,
       { id: issue.id, input: { stateId: state.id } }
     );
+    this.assertMutationSuccess(result?.issueUpdate, `zmiana stanu ticketu ${id} na "${stateName}"`);
   }
 
   /** Aktualna nazwa stanu issue (wykrywanie aprobaty przez przeciągnięcie karty). */

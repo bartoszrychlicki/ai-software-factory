@@ -11,6 +11,7 @@
     "build": "mastra build --studio",
     "start": "FACTORY_ROOT=${FACTORY_ROOT:-$PWD} mastra start",
     "poller": "tsx src/app/poller.ts",
+    "mcp": "FACTORY_ROOT=${FACTORY_ROOT:-$PWD} tsx src/mcp/server.ts",
     "verify": "npm run doctor && npm test && npm run check && npm run build"
   },
   "keywords": [
@@ -29,6 +30,7 @@
     "fast-uri": "3.1.5"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "1.29.0",
     "@mastra/core": "1.51.0",
     "@mastra/duckdb": "1.5.1",
     "@mastra/libsql": "1.16.0",
