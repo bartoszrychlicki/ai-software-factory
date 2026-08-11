@@ -1591,6 +1591,8 @@ function enqueueUnknownCommandHint(
         reviewStatus: run.reviewStatus,
         fixRound: run.fixRound,
         mergedSha: run.mergedSha,
+        score: run.score,
+        scoredAt: run.scoredAt,
       }),
     },
   });

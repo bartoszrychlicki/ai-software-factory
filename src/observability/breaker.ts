@@ -11,7 +11,15 @@ import type { MetricRow } from "./metrics";
  */
 const BLOCKED_STREAK_LIMIT = Number(process.env.FACTORY_CB_BLOCKED_STREAK ?? 3);
 const USD_PER_HOUR_LIMIT = Number(process.env.FACTORY_CB_USD_PER_H ?? 10);
-const COOLDOWN_MIN = Number(process.env.FACTORY_CB_COOLDOWN_MIN ?? 360);
+const DEFAULT_COOLDOWN_MINUTES = 360;
+
+export interface BreakerSnapshot {
+  open: boolean;
+  reasonCode?: "blocked-streak" | "cost-per-hour" | "unknown";
+  openedAt?: string;
+  cooldownMinutes: number;
+  cooldownRemainingMinutes: number;
+}
 
 interface BreakerState {
   openedAt?: string; // ISO — obecny = bezpiecznik otwarty
@@ -40,17 +48,53 @@ async function write(path: string, state: BreakerState): Promise<void> {
   await writeFile(path, JSON.stringify(state, null, 2));
 }
 
+function cooldownMinutes(): number {
+  const configured = Number(
+    process.env.FACTORY_CB_COOLDOWN_MIN ?? DEFAULT_COOLDOWN_MINUTES
+  );
+  return Number.isFinite(configured) && configured > 0
+    ? configured
+    : DEFAULT_COOLDOWN_MINUTES;
+}
+
+function reasonCode(reason: string | undefined): NonNullable<BreakerSnapshot["reasonCode"]> {
+  if (reason?.includes("nieudane runy z rzędu")) return "blocked-streak";
+  if (reason?.startsWith("koszt $") && reason.includes("/h")) return "cost-per-hour";
+  return "unknown";
+}
+
+/** Read-only view used by diagnostics; unlike breakerOpen it never enters half-open. */
+export async function breakerSnapshot(nowMs = Date.now()): Promise<BreakerSnapshot> {
+  const cooldown = cooldownMinutes();
+  const state = await read(statePath());
+  if (!state.openedAt) {
+    return { open: false, cooldownMinutes: cooldown, cooldownRemainingMinutes: 0 };
+  }
+  const ageMinutes = (nowMs - Date.parse(state.openedAt)) / 60_000;
+  const validAge = Number.isFinite(ageMinutes) && ageMinutes >= 0;
+  return {
+    open: !validAge || ageMinutes < cooldown,
+    reasonCode: reasonCode(state.reason),
+    openedAt: state.openedAt,
+    cooldownMinutes: cooldown,
+    cooldownRemainingMinutes: validAge
+      ? Math.max(0, Math.ceil(cooldown - ageMinutes))
+      : cooldown,
+  };
+}
+
 /** Otwarty? Zwraca powód albo null. Po cooldownie sam się domyka (half-open: jedna szansa). */
 export async function breakerOpen(): Promise<string | null> {
   const path = statePath();
   const s = await read(path);
   if (!s.openedAt) return null;
+  const cooldown = cooldownMinutes();
   const ageMin = (Date.now() - Date.parse(s.openedAt)) / 60_000;
-  if (ageMin >= COOLDOWN_MIN) {
+  if (ageMin >= cooldown) {
     await write(path, { failStreak: BLOCKED_STREAK_LIMIT - 1 }); // half-open: kolejna porażka otwiera od razu
     return null;
   }
-  return `${s.reason} (otwarty ${Math.round(ageMin)} min temu, cooldown ${COOLDOWN_MIN} min; reset: usuń runs/circuit-breaker.json)`;
+  return `${s.reason} (otwarty ${Math.round(ageMin)} min temu, cooldown ${cooldown} min; reset: usuń runs/circuit-breaker.json)`;
 }
 
 export async function recordRunOutcome(success: boolean): Promise<void> {
