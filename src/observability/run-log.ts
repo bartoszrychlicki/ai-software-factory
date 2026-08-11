@@ -17,14 +17,15 @@ interface StageSummary {
 }
 
 // `human` to jawne komendy, `linear` to ręczne zmiany ticketu. Push zmieniający
-// head PR-a ma aktora `github`, a blokada po /reject aktora `coordinator`, ale
-// obie fizycznie pochodzą od operatora — dlatego również liczymy je jako
-// decyzje wywołane przez człowieka.
+// head PR-a ma aktora `github`. Blokada po /reject i zmiana treści ticketu po
+// starcie builda mają aktora `coordinator`, choć pochodzą odpowiednio od operatora
+// i autora — wszystkie liczymy jako decyzje wywołane przez człowieka.
 const HUMAN_TRANSITION_ACTORS = new Set(["human", "linear"]);
 
 function isHumanTransition(transition: LifecycleTransition): boolean {
   return HUMAN_TRANSITION_ACTORS.has(transition.actor) ||
     transition.reason === "pr-head-changed" ||
+    transition.reason === "INPUT_CHANGED_AFTER_BUILD" ||
     transition.reason.startsWith("PLAN_REJECTED /reject ");
 }
 

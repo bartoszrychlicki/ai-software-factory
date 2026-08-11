@@ -889,3 +889,44 @@ test("/score aktywnego runu zapisuje przebieg bez fałszywie porzuconej generacj
     assert.match(replannedLog, /- Status: w toku — generacja 2, etap plan\/running/);
   });
 });
+
+test("INPUT_CHANGED_AFTER_BUILD jest oznaczone i liczone jako decyzja człowieka", async () => {
+  await withHarness("factory-run-log-input-changed-after-build-", async ({ store, deps }) => {
+    const ticketId = "BAR-LOG-ICAB";
+    store.createRun(ticketId, "harness", manifest);
+    const current = applyTransition(deps, ticketId, {
+      stage: "approval",
+      status: "waiting_human",
+      actor: "coordinator",
+      reason: "plan-ready",
+    });
+    const blocked = applyTransition(deps, ticketId, {
+      stage: current.stage,
+      status: "blocked",
+      actor: "coordinator",
+      reason: "INPUT_CHANGED_AFTER_BUILD",
+      patch: {
+        errorCode: "INPUT_CHANGED_AFTER_BUILD",
+        errorMessage: "Autor zmienił wejście po rozpoczęciu builda.",
+      },
+    });
+
+    const log = buildRunLog(store, blocked);
+    assert.match(log, /\| przejścia wywołane przez człowieka \| 1 \|/);
+    assert.match(log, /## Decyzje człowieka \(1\)/);
+
+    const humanSection = log.split("## Decyzje człowieka (1)")[1].split("## Oś czasu")[0];
+    assert.match(humanSection, /INPUT_CHANGED_AFTER_BUILD/);
+    assert.equal(humanSection.split("\n").filter((line) => /^\| \d+/.test(line)).length, 1);
+
+    const timeline = log.split("## Oś czasu")[1].split("## Próby etapów")[0];
+    assert.match(
+      timeline.split("\n").find((line) => line.includes("INPUT_CHANGED_AFTER_BUILD"))!,
+      /👤 \|$/
+    );
+    assert.match(
+      timeline.split("\n").find((line) => line.includes("plan-ready"))!,
+      /— \|$/
+    );
+  });
+});
