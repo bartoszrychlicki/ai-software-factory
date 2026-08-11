@@ -73,12 +73,32 @@ const triageContractSchema = z.discriminatedUnion("verdict", [
   }).strict(),
 ]);
 
-/** Krytyka planu: advisory, fail-open do ⚠️ na bramce (nigdy nie blokuje). */
+export const critiqueFindingSchema = z.object({
+  severity: z.enum(["P0", "P1", "P2"]),
+  category: z.enum([
+    "data-loss",
+    "security",
+    "auth",
+    "irreversible-write",
+    "product-decision",
+    "test-gap",
+    "implementation-detail",
+    "scope",
+    "observability",
+    "other",
+  ]),
+  disposition: z.enum(["block_before_build", "builder_checklist", "human_decision"]),
+  summary: z.string().trim().min(1).max(2_000),
+}).strict();
+
+export type CritiqueFinding = z.infer<typeof critiqueFindingSchema>;
+
+/** Krytyka planu: strukturalne ryzyka sterują rewizją, checklistą lub bramką. */
 const critiqueContractSchema = z.discriminatedUnion("verdict", [
   z.object({ verdict: z.literal("ok") }).strict(),
   z.object({
     verdict: z.literal("issues"),
-    issues: z.string().trim().min(1),
+    findings: z.array(critiqueFindingSchema).min(1).max(20),
   }).strict(),
 ]);
 
@@ -141,8 +161,33 @@ export interface CritiqueVerdict {
   kind: "critique";
   /** unavailable = brak kontraktu; advisory — bramka dostaje ⚠️, nie blokadę. */
   verdict: "ok" | "issues" | "unavailable";
-  issues?: string;
+  findings?: CritiqueFinding[];
   source: VerdictSource;
+}
+
+const SAFETY_CATEGORIES = new Set<CritiqueFinding["category"]>([
+  "data-loss",
+  "security",
+  "auth",
+  "irreversible-write",
+]);
+
+function enforceCritiqueDisposition(finding: CritiqueFinding): CritiqueFinding {
+  if (finding.category === "product-decision") {
+    return { ...finding, disposition: "human_decision" };
+  }
+  if (finding.severity === "P0" || (
+    finding.severity === "P1" && SAFETY_CATEGORIES.has(finding.category)
+  )) {
+    return { ...finding, disposition: "block_before_build" };
+  }
+  return finding;
+}
+
+export function formatCritiqueFindings(findings: readonly CritiqueFinding[]): string {
+  return findings.map((finding, index) =>
+    `${index + 1}. **${finding.severity} · ${finding.category} · ${finding.disposition}** — ${finding.summary}`
+  ).join("\n");
 }
 
 interface ClarifyOption {
@@ -301,7 +346,7 @@ export function verdictInstruction(kind: "plan" | "verify" | "review" | "triage"
         : kind === "critique"
           ? [
               `- plan bez zastrzeżeń: {"verdict":"ok"}`,
-              `- plan wymaga poprawy: {"verdict":"issues","issues":"<konkretne, ponumerowane uwagi z priorytetem>"}`,
+              `- plan ma uwagi: {"verdict":"issues","findings":[{"severity":"P0|P1|P2","category":"data-loss|security|auth|irreversible-write|product-decision|test-gap|implementation-detail|scope|observability|other","disposition":"block_before_build|builder_checklist|human_decision","summary":"<konkretna uwaga i wymagany efekt>"}]}`,
             ]
           : [kind === "verify" ? `- werdykt: {"verdict":"pass"|"fail"}` : `- werdykt: {"verdict":"lgtm"|"fix"}`];
   const example =
@@ -389,7 +434,9 @@ export function parseCritiqueVerdict(report: string): CritiqueVerdict {
   return {
     kind: "critique",
     verdict: parsed.data.verdict,
-    issues: parsed.data.verdict === "issues" ? parsed.data.issues : undefined,
+    findings: parsed.data.verdict === "issues"
+      ? parsed.data.findings.map(enforceCritiqueDisposition)
+      : undefined,
     source: "structured",
   };
 }

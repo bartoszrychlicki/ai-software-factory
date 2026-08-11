@@ -176,22 +176,30 @@ jednego strzału jednego modelu (zastępuje zaprojektowany, niewdrożony
   `## Rozstrzygnięcia` oraz otwierające `## Podsumowanie dla człowieka`;
   pytania runda 2 (wspólny limit 2 rund na ticket).
 - **Krytyka** (8 min, silnik ≠ synteza przez `excludeEngine`+`critique.diverse`):
-  checklista adwersaryjna; `issues` → dokładnie JEDNA rewizja syntezy; drugi
-  werdykt idzie na bramkę bez pętli. Jednozdaniowe `## Co to znaczy dla autora`
-  wyjaśnia uwagi bez żargonu. Krytyka advisory — `unavailable` = ⚠️ na
-  bramce, nie blokada.
+  każde finding ma `severity`, `category` i `disposition`. Tylko
+  `block_before_build` uruchamia kolejną syntezę; `builder_checklist` idzie do
+  buildera i reviewera, a `human_decision` natychmiast kieruje plan na bramkę.
+  `planning.maxCritiqueRounds` (domyślnie 2: pierwsza krytyka + jedna rewizja)
+  zamyka pętlę. P0 oraz P1 data-loss/security/auth/irreversible-write są
+  deterministycznie wzmacniane do `block_before_build`.
+- **Budżet planowania**: `planning.maxUsd` jest sprawdzany przed startem
+  kolejnego joba razem z kosztem zakończonym, rezerwacjami jobów w toku i
+  rezerwą następnej roli. Gdy limit zatrzymuje rewizję, ostatni użyteczny plan
+  trafia do jawnej bramki człowieka; bez planu proces blokuje się fail-closed.
 - **Bramka `/approve` bez zmian mechanicznie**; komentarz ma kolejność:
   streszczenie → krytyka → degradacje → koszt planowania → pełny plan
   techniczny. Brak streszczenia jest fail-open i zapisuje
   `humanSummary: "summary-missing"` w `runs/metrics.jsonl`; nie zmienia
   werdyktu kontraktu `factory`.
-- Brief recon zasila buildera, brief ryzyk + uwagi krytyka zasilają reviewera
+- Brief recon oraz ta sama obowiązkowa checklista krytyka zasilają buildera;
+  brief ryzyk + checklista zasilają reviewera
   (wszystko clipowane — lekcja E2BIG).
 
 ## Eksperyment kosztowo-jakościowy
 
 `runs/experiments.jsonl`: wiersz `summary` przy każdym Done (wariant
-solo/deep/v2, koszty i first-pass per etap, sygnatury modeli z faktycznych
+solo/deep/v2, osobny koszt planowania i builda, liczba rund critique,
+konwersja plan→build, koszty i first-pass per etap, sygnatury modeli z faktycznych
 prób, degradacje, retry/replan, lead time) + wiersz `score` z komendy
 `/score 1-5 [komentarz]` (działa też po Done — sweep 14 dni). Raport:
 `npx tsx src/observability/experiment-report.ts`.

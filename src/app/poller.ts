@@ -38,6 +38,7 @@ import {
 import {
   LifecycleStore,
   RESEARCH_ROLES,
+  isPlanningAttemptStage,
   researchAttemptStage,
   runStageOf,
   type AttemptStage,
@@ -82,7 +83,7 @@ import { resolveRoute } from "../config/routing";
 import { runsRoot } from "../config/paths";
 import { authorizeScopePaths, parseScopePaths, scopeBlockedPaths } from "../execution/scope";
 import { extendedStatusName, LINEAR_STATE_MAP } from "../lifecycle/state-map";
-import { effectiveBudget } from "../observability/budget";
+import { effectiveBudget, effectivePlanningBudget } from "../observability/budget";
 
 const POLL_INTERVAL_MS = Number(process.env.FACTORY_POLL_INTERVAL_MS ?? 60_000);
 const marker = (ticketId: string) => `[linear:${ticketId}:v2]`;
@@ -433,7 +434,8 @@ async function handleStalledJob(
   run: LifecycleRun,
   attempt: number,
   jobRunId: string,
-  mastraStatus: string
+  mastraStatus: string,
+  planning: ReturnType<typeof effectivePlanningBudget>
 ): Promise<boolean> {
   const kind = String(command.payload.kind) as keyof typeof JOB_BUDGET_MINUTES;
   const budgetMinutes = jobBudgetMinutes(kind);
@@ -468,6 +470,7 @@ async function handleStalledJob(
       output,
       nextAttempts: followUpAttempts(deps.store, run.ticketId),
       usage: deps.store.totalUsage(run.ticketId),
+      planning,
     }),
     command.key
   );
@@ -493,12 +496,14 @@ export function jobBudgetMinutes(stage: string): number {
 
 function reservedUsage(
   store: LifecycleStore,
-  ticketId: string
+  ticketId: string,
+  planningOnly = false
 ): { usd: number; minutes: number } {
   const perMinute = Number(process.env.FACTORY_SYNTH_USD_PER_MIN ?? 0.15);
   let minutes = 0;
   let usd = 0;
   for (const attempt of store.listRunningAttempts(ticketId)) {
+    if (planningOnly && !isPlanningAttemptStage(attempt.stage)) continue;
     if (attempt.stage === "test") {
       minutes += 20; // bazowy lease detached runnera
       continue;
@@ -520,6 +525,7 @@ async function dispatchJob(
   const usage = deps.store.totalUsage(run.ticketId);
   const reserved = reservedUsage(deps.store, run.ticketId);
   const { maxMinutes, maxUsd } = effectiveBudget(project);
+  const planning = effectivePlanningBudget(project);
   const attemptDetails = {
     inputHash: run.manifest.inputHash,
     sha: typeof command.payload.headSha === "string" ? command.payload.headSha : run.headSha,
@@ -571,10 +577,60 @@ async function dispatchJob(
         output,
         nextAttempts: followUpAttempts(deps.store, run.ticketId),
         usage: deps.store.totalUsage(run.ticketId),
+        planning,
       }),
       command.key
     );
     return;
+  }
+
+  if (!command.externalId && isPlanningAttemptStage(command.stage)) {
+    const planningUsage = deps.store.planningUsage(run.ticketId);
+    const planningReserved = reservedUsage(deps.store, run.ticketId, true);
+    const perMinute = Number(process.env.FACTORY_SYNTH_USD_PER_MIN ?? 0.15);
+    const nextReservationUsd = jobBudgetMinutes(command.stage) * perMinute;
+    const projectedUsd = planningUsage.usd + planningReserved.usd + nextReservationUsd;
+    if (projectedUsd > planning.maxUsd) {
+      const report = [
+        `Limit planowania $${planning.maxUsd.toFixed(2)} nie pozwala uruchomić ${String(command.payload.kind)}.`,
+        `Zużyto $${planningUsage.usd.toFixed(2)}, joby w toku rezerwują $${planningReserved.usd.toFixed(2)}, ` +
+          `następny job wymaga rezerwy $${nextReservationUsd.toFixed(2)} (projekcja $${projectedUsd.toFixed(2)}).`,
+        "Ostatni użyteczny plan trafia do bramki człowieka; bez planu proces blokuje się fail-closed.",
+      ].join(" ");
+      const output = {
+        ...failedJobOutput(command, report),
+        errorCode: "PLANNING_BUDGET_EXHAUSTED",
+      };
+      deps.store.startAttempt(
+        run.ticketId,
+        command.stage,
+        attempt,
+        `planning-budget-blocked:${command.key}`,
+        attemptDetails
+      );
+      deps.store.finishAttempt(run.ticketId, command.stage, attempt, {
+        status: "failed",
+        outcome: output.errorCode,
+        report,
+        signature: output.signature,
+        errorCode: output.errorCode,
+        errorMessage: report,
+      });
+      applyDecision(
+        deps,
+        run.ticketId,
+        reduceLifecycle(run, {
+          type: "job-finished",
+          attempt,
+          output,
+          nextAttempts: followUpAttempts(deps.store, run.ticketId),
+          usage: deps.store.planningUsage(run.ticketId),
+          planning,
+        }),
+        command.key
+      );
+      return;
+    }
   }
 
   // Zapas NIE wymaga osobnej rezerwacji budżetu.
@@ -619,7 +675,7 @@ async function dispatchJob(
   const snapshot = await deps.mastra.getRun(jobRunId);
   const status = runStatus(snapshot);
   if (status === "pending" || status === "running") {
-    if (await handleStalledJob(deps, command, run, attempt, jobRunId, status)) return;
+    if (await handleStalledJob(deps, command, run, attempt, jobRunId, status, planning)) return;
     if (status === "pending") await deps.mastra.startRun(jobRunId, inputData);
     return;
   }
@@ -663,6 +719,7 @@ async function dispatchJob(
     output,
     nextAttempts: followUpAttempts(deps.store, run.ticketId),
     usage: deps.store.totalUsage(run.ticketId),
+    planning,
   }), command.key);
 }
 

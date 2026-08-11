@@ -1,7 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  formatCritiqueFindings,
   formatClarifyQuestions,
+  parseCritiqueVerdict,
   parsePlanVerdict,
   parseReviewVerdict,
   parseVerifyVerdict,
@@ -50,6 +52,43 @@ test("brak lub nieznany werdykt zawsze zamyka bramkę fail-closed", () => {
   assert.equal(parseVerifyVerdict("wygląda dobrze").pass, false);
   assert.equal(parseReviewVerdict(factory({ verdict: "unknown" })).needsFix, true);
   assert.equal(parseReviewVerdict(factory({ verdict: "lgtm" })).needsFix, false);
+});
+
+test("krytyka zwraca strukturalne findings i wzmacnia klasy ryzyka fail-closed", () => {
+  const critique = parseCritiqueVerdict(factory({
+    verdict: "issues",
+    findings: [
+      {
+        severity: "P1",
+        category: "security",
+        disposition: "builder_checklist",
+        summary: "Brak testu izolacji sekretów.",
+      },
+      {
+        severity: "P1",
+        category: "test-gap",
+        disposition: "builder_checklist",
+        summary: "Brak regresji dla limitu kosztu.",
+      },
+      {
+        severity: "P2",
+        category: "product-decision",
+        disposition: "builder_checklist",
+        summary: "Nie ustalono domyślnego progu.",
+      },
+    ],
+  }));
+
+  assert.equal(critique.source, "structured");
+  assert.deepEqual(
+    critique.findings?.map((finding) => finding.disposition),
+    ["block_before_build", "builder_checklist", "human_decision"],
+  );
+  assert.match(formatCritiqueFindings(critique.findings ?? []), /P1 · security · block_before_build/);
+  assert.match(formatCritiqueFindings(critique.findings ?? []), /Brak regresji dla limitu kosztu/);
+
+  const legacy = parseCritiqueVerdict(factory({ verdict: "issues", issues: "1. luźny tekst" }));
+  assert.equal(legacy.source, "missing", "nieustrukturyzowane issues nie mogą wrócić jako kontrakt krytyki");
 });
 
 test("resolveDomain stosuje label override, deklarację planu i ignoruje nieznane wartości", () => {
