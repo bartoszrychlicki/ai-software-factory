@@ -51,6 +51,7 @@ import {
   type NextAttempts,
 } from "../lifecycle/coordinator";
 import { appendExperimentRow, buildExperimentSummary } from "../observability/experiments";
+import { writeRunLog } from "../observability/run-log";
 import {
   factoryJobOutputSchema,
   JOB_BUDGET_MINUTES,
@@ -78,6 +79,7 @@ import {
 } from "../lifecycle/signature";
 import { progressComment, type ProgressCommentContext } from "../lifecycle/progress";
 import { resolveRoute } from "../config/routing";
+import { runsRoot } from "../config/paths";
 import { authorizeScopePaths, parseScopePaths, scopeBlockedPaths } from "../execution/scope";
 import { extendedStatusName, LINEAR_STATE_MAP } from "../lifecycle/state-map";
 
@@ -226,6 +228,7 @@ export function applyDecision(
   emitTransitionNotification(deps, current, updated, decision.transition.reason);
   recordBreakerOutcome(current, updated);
   recordExperimentOutcome(deps, current, updated);
+  recordRunLog(deps, current, updated);
   return updated;
 }
 
@@ -244,6 +247,17 @@ function recordExperimentOutcome(
   } catch (error) {
     console.error("Wiersz eksperymentu nie zapisany:", error instanceof Error ? error.message : error);
   }
+}
+
+function recordRunLog(
+  deps: PollerDependencies,
+  before: LifecycleRun,
+  after: LifecycleRun
+): void {
+  const closed = before.status !== "done" && after.status === "done";
+  const generationRetired = after.generation > before.generation;
+  if (!closed && !generationRetired) return;
+  writeRunLog(deps.store, after);
 }
 
 /** Decyzje człowieka nie nabijają serii breakera — tylko realne porażki fabryki. */
@@ -1213,11 +1227,6 @@ export async function dispatchOutbox(deps: PollerDependencies): Promise<void> {
   }
 }
 
-function runsRoot(): string {
-  return process.env.FACTORY_RUNS_ROOT ??
-    join(dirname(findUpFile("package.json")), "runs");
-}
-
 function testResultPath(ticketId: string, generation: number, attempt: number): string {
   return join(runsRoot(), ticketId, `test-result-g${generation}-a${attempt}.json`);
 }
@@ -1495,6 +1504,10 @@ async function recordScore(
   const parsed = parseScorePayload(payload);
   if (!parsed) return;
   deps.store.setScore(run.ticketId, parsed.value, parsed.comment);
+  // `run` to kopia sprzed oceny — przebieg musi zobaczyć świeży score,
+  // inaczej plik do końca życia ticketu pokazuje „—”. writeRunLog jest fail-open.
+  const scored = deps.store.getRun(run.ticketId);
+  if (scored) writeRunLog(deps.store, scored);
   deps.store.markCommentProcessed(run.ticketId, commentId, "score");
   void appendExperimentRow({
     kind: "score",
@@ -1893,6 +1906,7 @@ async function claimReady(deps: PollerDependencies): Promise<void> {
     const tickets = (await source.listReady()).slice(0, free);
     for (const ticket of tickets) {
       const existing = deps.store.getRun(ticket.id);
+      const reopened = existing?.status === "done";
       if (existing && existing.status !== "done") {
         await source.claim(ticket.id, claimStateName(existing, extended));
         continue;
@@ -1918,6 +1932,10 @@ async function claimReady(deps: PollerDependencies): Promise<void> {
         forcedVariant: project.planPipeline === "v3" && soloForced ? "solo" : undefined,
         nextAttempt: deps.store.nextAttempt(ticket.id, entry),
       }));
+      if (reopened) {
+        const started = deps.store.getRun(ticket.id);
+        if (started) writeRunLog(deps.store, started);
+      }
     }
   }
 }
@@ -1977,7 +1995,7 @@ export async function pollOnce(deps: PollerDependencies): Promise<void> {
  */
 export function maybeBackupLifecycleDb(
   store: LifecycleStore,
-  dir = join(dirname(findUpFile("package.json")), "runs", "backups")
+  dir = join(runsRoot(), "backups")
 ): void {
   try {
     mkdirSync(dir, { recursive: true });
