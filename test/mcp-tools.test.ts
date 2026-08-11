@@ -516,6 +516,19 @@ test("openGate odwzorowuje approval, advisory-fix, blocked i done", () => {
   });
   assert.doesNotMatch(reachableScoredHint, /\/score/);
   assert.match(reachableScoredHint, /\/replan/);
+
+  const advisoryScoredHint = unknownCommandHint({
+    firstToken: "/scroe",
+    stage: "merge",
+    status: "waiting_human",
+    reviewStatus: "advisory-fix",
+    fixRound: 0,
+    score: 4,
+  });
+  assert.match(advisoryScoredHint, /\/fix/);
+  assert.match(advisoryScoredHint, /\/replan/);
+  assert.doesNotMatch(advisoryScoredHint, /\/score/);
+  assert.match(advisoryScoredHint, /poprawka 1\/2/);
 });
 
 test("fallbacki budżetu są walidowane i wspólne dla projektów oraz statusu", async () => {

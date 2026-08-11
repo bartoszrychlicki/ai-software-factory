@@ -112,9 +112,13 @@ export function unknownCommandHint(input: UnknownCommandContext): string {
   }
   if (projection.gate === "merge") {
     if (projection.humanCommands.some((command) => command.startsWith("/fix"))) {
+      const [fixCommand, ...remainingCommands] = projection.humanCommands;
+      const formattedRemainingCommands = remainingCommands
+        .map((command) => `\`${command}\``)
+        .join(", ");
       return (
-        `${prefix} Dostępne teraz: \`/fix [wskazówki]\` ` +
-        `(poprawka ${(input.fixRound ?? 0) + 1}/2), \`/replan <powód>\`, \`/score 1-5\`.`
+        `${prefix} Dostępne teraz: \`${fixCommand}\` ` +
+        `(poprawka ${(input.fixRound ?? 0) + 1}/2), ${formattedRemainingCommands}.`
       );
     }
     if (input.reviewStatus === "advisory-fix") {
