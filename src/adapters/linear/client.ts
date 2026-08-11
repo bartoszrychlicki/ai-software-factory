@@ -113,11 +113,14 @@ export class LinearSource implements TicketSource {
 
   async resolveIssue(identifier: string): Promise<LinearIssueReference> {
     const data = await this.gql<{
-      issue: { id: string; project: { name: string } | null };
+      issue: { id: string; project: { name: string } | null } | null;
     }>(
       `query($id: String!) { issue(id: $id) { id project { name } } }`,
       { id: identifier }
     );
+    if (!data.issue) {
+      throw new Error(`Linear nie zna issue "${identifier}"`);
+    }
     return {
       id: data.issue.id,
       projectName: data.issue.project?.name ?? null,

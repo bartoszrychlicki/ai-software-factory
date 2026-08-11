@@ -16,6 +16,8 @@ export interface OpenGateInput {
   reviewStatus?: string;
   fixRound?: number;
   mergedSha?: string;
+  score?: number;
+  scoredAt?: string;
 }
 
 export interface OpenGateView {
@@ -27,6 +29,9 @@ export interface OpenGateView {
 /** Jedno źródło prawdy o otwartej bramce i komendach dostępnych wyłącznie człowiekowi. */
 export function openGate(run: OpenGateInput): OpenGateView {
   if (run.status === "done") {
+    if (run.score !== undefined || run.scoredAt !== undefined) {
+      return { gate: null, waitingOn: "factory", humanCommands: [] };
+    }
     return {
       gate: "score",
       waitingOn: "human",
@@ -69,6 +74,9 @@ export function openGate(run: OpenGateInput): OpenGateView {
   }
   if (run.stage === "merge" && run.status === "waiting_human") {
     if (run.mergedSha) {
+      if (run.score !== undefined || run.scoredAt !== undefined) {
+        return { gate: null, waitingOn: "human", humanCommands: [] };
+      }
       return {
         gate: "score",
         waitingOn: "human",

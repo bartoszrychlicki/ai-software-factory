@@ -11,6 +11,8 @@ import {
   breakerSnapshot,
   type BreakerSnapshot,
 } from "../src/observability/breaker";
+import { unknownCommandHint } from "../src/lifecycle/commands";
+import { loadDotEnv } from "../src/mcp/server";
 import { clip, openGate, planView } from "../src/mcp/projection";
 import {
   createFactoryTools,
@@ -106,10 +108,11 @@ function deps(options: {
   linearForCalls?: string[];
   allowEnqueue?: boolean;
   breaker?: BreakerSnapshot;
+  projects?: Record<string, ProjectConfig>;
 } = {}): FactoryToolDependencies {
   return {
     store: options.store ?? new FakeStore(),
-    projects: { harness: project },
+    projects: options.projects ?? { harness: project },
     linearFor: (projectKey) => {
       options.linearForCalls?.push(projectKey);
       return options.linear;
@@ -286,6 +289,40 @@ test("brak LINEAR_API_KEY blokuje tylko zapisy, nie projekcje odczytu", async ()
   );
 });
 
+test("jawnie pusty LINEAR_API_KEY nie jest uzupełniany z .env", async () => {
+  const root = await mkdtemp(join(tmpdir(), "factory-mcp-env-"));
+  const path = join(root, ".env");
+  const previousKey = process.env.LINEAR_API_KEY;
+  const previousMarker = process.env.FACTORY_MCP_ENV_MARKER;
+  try {
+    await writeFile(path, [
+      "LINEAR_API_KEY=wartosc-z-pliku",
+      "FACTORY_MCP_ENV_MARKER=uzupelnione",
+    ].join("\n"));
+    process.env.LINEAR_API_KEY = "";
+    delete process.env.FACTORY_MCP_ENV_MARKER;
+
+    loadDotEnv(path);
+
+    assert.equal(process.env.LINEAR_API_KEY, "");
+    assert.equal(process.env.FACTORY_MCP_ENV_MARKER, "uzupelnione");
+    const store = new FakeStore();
+    store.runs.set("BAR-200", run());
+    const tools = createFactoryTools(deps({ store }));
+    assert.equal((await tools.ticketStatus({ ticket: "BAR-200" })).found, true);
+    await assert.rejects(
+      tools.ticketCreate({ project: "harness", title: "Nie zapisuj" }),
+      /Brak LINEAR_API_KEY/
+    );
+  } finally {
+    if (previousKey === undefined) delete process.env.LINEAR_API_KEY;
+    else process.env.LINEAR_API_KEY = previousKey;
+    if (previousMarker === undefined) delete process.env.FACTORY_MCP_ENV_MARKER;
+    else process.env.FACTORY_MCP_ENV_MARKER = previousMarker;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("ticket_status zwraca jawny brak runu zamiast wyjątku", async () => {
   const result = await createFactoryTools(deps()).ticketStatus({ ticket: "BAR-404" });
   assert.deepEqual(result, {
@@ -397,6 +434,83 @@ test("openGate odwzorowuje approval, advisory-fix, blocked i done", () => {
     waitingOn: "human",
     humanCommands: ["/score 1-5 [komentarz]"],
   });
+  assert.deepEqual(openGate(run({ stage: "smoke", status: "done", score: 5 })), {
+    gate: null,
+    waitingOn: "factory",
+    humanCommands: [],
+  });
+  assert.deepEqual(openGate(run({
+    stage: "merge",
+    status: "waiting_human",
+    mergedSha: "a".repeat(40),
+  })), {
+    gate: "score",
+    waitingOn: "human",
+    humanCommands: ["/score 1-5"],
+  });
+  assert.deepEqual(openGate(run({
+    stage: "merge",
+    status: "waiting_human",
+    mergedSha: "a".repeat(40),
+    score: 4,
+  })), {
+    gate: null,
+    waitingOn: "human",
+    humanCommands: [],
+  });
+
+  const scoredHint = unknownCommandHint({
+    firstToken: "/scroe",
+    stage: "merge",
+    status: "waiting_human",
+    mergedSha: "a".repeat(40),
+    score: 4,
+  });
+  assert.match(scoredHint, /Żadna komenda decyzyjna nie jest teraz otwarta/);
+  assert.doesNotMatch(scoredHint, /\/score/);
+});
+
+test("fallbacki budżetu są walidowane i wspólne dla projektów oraz statusu", async () => {
+  const previousMinutes = process.env.FACTORY_BUDGET_MAX_MIN;
+  const previousUsd = process.env.FACTORY_BUDGET_MAX_USD;
+  const noBudgetProject = { ...project };
+  delete noBudgetProject.budget;
+  const store = new FakeStore();
+  store.runs.set("BAR-200", run());
+  const tools = createFactoryTools(deps({
+    store,
+    projects: { harness: noBudgetProject },
+  }));
+  try {
+    for (const invalid of ["abc", "0", "-1"]) {
+      process.env.FACTORY_BUDGET_MAX_MIN = invalid;
+      process.env.FACTORY_BUDGET_MAX_USD = invalid;
+      const projects = await tools.factoryProjects();
+      const status = await tools.ticketStatus({ ticket: "BAR-200" });
+      assert.deepEqual(projects.projects[0]?.budget, { maxMinutes: 45, maxUsd: 3 });
+      assert.equal(status.found, true);
+      if (status.found) {
+        assert.equal(status.budgetMaxMinutes, 45);
+        assert.equal(status.budgetMaxUsd, 3);
+      }
+    }
+
+    process.env.FACTORY_BUDGET_MAX_MIN = "60";
+    process.env.FACTORY_BUDGET_MAX_USD = "5.5";
+    const projects = await tools.factoryProjects();
+    const status = await tools.ticketStatus({ ticket: "BAR-200" });
+    assert.deepEqual(projects.projects[0]?.budget, { maxMinutes: 60, maxUsd: 5.5 });
+    assert.equal(status.found, true);
+    if (status.found) {
+      assert.equal(status.budgetMaxMinutes, 60);
+      assert.equal(status.budgetMaxUsd, 5.5);
+    }
+  } finally {
+    if (previousMinutes === undefined) delete process.env.FACTORY_BUDGET_MAX_MIN;
+    else process.env.FACTORY_BUDGET_MAX_MIN = previousMinutes;
+    if (previousUsd === undefined) delete process.env.FACTORY_BUDGET_MAX_USD;
+    else process.env.FACTORY_BUDGET_MAX_USD = previousUsd;
+  }
 });
 
 test("plan i raporty mają jawną flagę truncated", () => {
@@ -452,16 +566,39 @@ test("snapshot breakera jest zgodny z breakerOpen, waliduje cooldown i nie mutuj
     const now = Date.now();
     const activeState = JSON.stringify({
       openedAt: new Date(now - 5 * 60_000).toISOString(),
-      reason: "test aktywnego breakera",
+      reason: "koszt $12.34/h > limit $10/h",
       failStreak: 3,
     });
     await writeFile(path, activeState);
     const active = await breakerSnapshot(now);
     assert.equal(active.open, true);
+    assert.equal(active.reasonCode, "cost-per-hour");
     assert.equal(active.cooldownMinutes, 10);
     assert.equal(active.cooldownRemainingMinutes, 5);
     assert.equal(await readFile(path, "utf8"), activeState);
-    assert.match(await breakerOpen() ?? "", /cooldown 10 min/);
+    assert.match(await breakerOpen() ?? "", /koszt \$12\.34\/h.*cooldown 10 min/);
+
+    const health = await createFactoryTools({
+      ...deps(),
+      breaker: async () => breakerSnapshot(now),
+    }).factoryHealth();
+    const healthOutput = JSON.stringify(health.breaker);
+    assert.equal(health.breaker.reasonCode, "cost-per-hour");
+    assert.doesNotMatch(healthOutput, /\$|12\.34|limit/);
+
+    await writeFile(path, JSON.stringify({
+      openedAt: new Date(now - 5 * 60_000).toISOString(),
+      reason: "3 nieudane runy z rzędu",
+      failStreak: 3,
+    }));
+    assert.equal((await breakerSnapshot(now)).reasonCode, "blocked-streak");
+
+    await writeFile(path, JSON.stringify({
+      openedAt: new Date(now - 5 * 60_000).toISOString(),
+      reason: "nierozpoznany powód",
+      failStreak: 3,
+    }));
+    assert.equal((await breakerSnapshot(now)).reasonCode, "unknown");
 
     const expiredState = JSON.stringify({
       openedAt: new Date(now - 20 * 60_000).toISOString(),
@@ -501,6 +638,26 @@ test("ticket_create deleguje utworzenie issue w backlogu", async () => {
   });
   assert.equal(result.stateType, "backlog");
   assert.deepEqual(linear.creates, [{ title: "Nowy ticket", description: "Opis", labels: ["bug"] }]);
+});
+
+test("LinearSource.resolveIssue zwraca czytelny błąd dla nieistniejącego issue", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response(JSON.stringify({
+    data: { issue: null },
+  }))) as typeof fetch;
+  try {
+    await assert.rejects(
+      new LinearSource("test-key", "harness").resolveIssue("BAR-NIE-MA"),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.match(error.message, /Linear nie zna issue "BAR-NIE-MA"/);
+        assert.doesNotMatch(error.message, /TypeError/);
+        return true;
+      }
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("LinearSource.createIssue wybiera stan typu backlog i mapuje wszystkie labele", async () => {

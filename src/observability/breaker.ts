@@ -15,7 +15,7 @@ const DEFAULT_COOLDOWN_MINUTES = 360;
 
 export interface BreakerSnapshot {
   open: boolean;
-  reason?: string;
+  reasonCode?: "blocked-streak" | "cost-per-hour" | "unknown";
   openedAt?: string;
   cooldownMinutes: number;
   cooldownRemainingMinutes: number;
@@ -57,6 +57,12 @@ function cooldownMinutes(): number {
     : DEFAULT_COOLDOWN_MINUTES;
 }
 
+function reasonCode(reason: string | undefined): NonNullable<BreakerSnapshot["reasonCode"]> {
+  if (reason?.includes("nieudane runy z rzędu")) return "blocked-streak";
+  if (reason?.startsWith("koszt $") && reason.includes("/h")) return "cost-per-hour";
+  return "unknown";
+}
+
 /** Read-only view used by diagnostics; unlike breakerOpen it never enters half-open. */
 export async function breakerSnapshot(nowMs = Date.now()): Promise<BreakerSnapshot> {
   const cooldown = cooldownMinutes();
@@ -68,7 +74,7 @@ export async function breakerSnapshot(nowMs = Date.now()): Promise<BreakerSnapsh
   const validAge = Number.isFinite(ageMinutes) && ageMinutes >= 0;
   return {
     open: !validAge || ageMinutes < cooldown,
-    reason: state.reason,
+    reasonCode: reasonCode(state.reason),
     openedAt: state.openedAt,
     cooldownMinutes: cooldown,
     cooldownRemainingMinutes: validAge

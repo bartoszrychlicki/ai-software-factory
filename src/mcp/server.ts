@@ -119,12 +119,13 @@ export function buildFactoryMcpServer(deps: FactoryToolDependencies): McpServer 
   return server;
 }
 
-function loadDotEnv(): void {
+export function loadDotEnv(
+  path = join(dirname(fileURLToPath(import.meta.url)), "..", "..", ".env")
+): void {
   try {
-    const path = join(dirname(fileURLToPath(import.meta.url)), "..", "..", ".env");
     for (const line of readFileSync(path, "utf8").split("\n")) {
       const match = line.match(/^([A-Z0-9_]+)=(.*)$/);
-      if (match && !process.env[match[1]]) process.env[match[1]] = match[2];
+      if (match && !Object.hasOwn(process.env, match[1])) process.env[match[1]] = match[2];
     }
   } catch {
     // Env procesu jest wystarczający.
