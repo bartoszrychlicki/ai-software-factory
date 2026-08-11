@@ -124,6 +124,15 @@ waits for a human, CI or merge, and no workflow is resumed across those gates.
 The poller can restart at any stage because attempts and an idempotent outbox
 are durable.
 
+When a ticket finishes, is canceled, retires a generation or receives `/score`,
+the poller overwrites `runs/<ticket>/przebieg.md` with the ticket's complete
+transition timeline, human-triggered decisions, attempt costs and links to
+artifacts. This is a local diagnostic artifact only; `runs/` remains ignored
+and nothing from the log is published back to Linear.
+`FACTORY_RUNS_ROOT` relocates the lifecycle database (unless
+`FACTORY_LIFECYCLE_DB` is set; that override takes precedence), database
+backups, local test results, per-job artifacts and `przebieg.md`.
+
 Projects using `planPipeline: v3` extend planning with triage, three parallel
 research roles, synthesis and one critique/revision round. The human still
 approves the single resulting plan before any build begins.
