@@ -8,5 +8,13 @@ The current runtime starts in `src/app/poller.ts`, dispatches short jobs from
 `src/lifecycle/store.ts`. `src/legacy/` exists only for v1 read/migration
 compatibility and historical tests.
 
+`src/mcp/` is the local stdio projection for external assistants. It opens
+`src/lifecycle/store.ts` in its guarded read-only mode; it is never a lifecycle
+writer and never acquires the poller lease.
+
+The MCP channel is observational. Human gates and decision commands remain
+exclusively in Linear; do not add approval, rejection, answer, fix, retry,
+scope, merge or scoring capabilities to MCP comments or tools.
+
 The old 2026-07-20 handoff is archived at
 `docs/archive/claude-handoff-2026-07-20.md`; it is not runtime truth.

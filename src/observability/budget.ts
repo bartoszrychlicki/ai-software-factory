@@ -9,12 +9,41 @@ import type { MetricRow } from "./metrics";
  * kod pilnuje budżetów, agenci o nich nie decydują.
  * Globalne defaulty przez env, per projekt nadpisywane w projects.yaml (budget:).
  */
-const DEFAULT_MAX_MINUTES = Number(process.env.FACTORY_BUDGET_MAX_MIN ?? 45);
-const DEFAULT_MAX_USD = Number(process.env.FACTORY_BUDGET_MAX_USD ?? 3);
+const DEFAULT_MAX_MINUTES = 45;
+const DEFAULT_MAX_USD = 3;
 
 export interface RunUsage {
   minutes: number;
   usd: number;
+}
+
+export interface BudgetLimits {
+  maxMinutes: number;
+  maxUsd: number;
+}
+
+function positiveNumber(value: string | number | undefined, fallback: number): number {
+  const parsed = Number(value ?? fallback);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+/** Wspólne, walidowane fallbacki budżetu dla egzekwowania i projekcji MCP. */
+export function budgetDefaults(): { maxMinutes: number; maxUsd: number } {
+  return {
+    maxMinutes: positiveNumber(process.env.FACTORY_BUDGET_MAX_MIN, DEFAULT_MAX_MINUTES),
+    maxUsd: positiveNumber(process.env.FACTORY_BUDGET_MAX_USD, DEFAULT_MAX_USD),
+  };
+}
+
+/** Override projektu > poprawna dodatnia wartość env > fallback 45/3. */
+export function effectiveBudget(
+  project?: { budget?: { maxMinutes?: number; maxUsd?: number } }
+): BudgetLimits {
+  const defaults = budgetDefaults();
+  return {
+    maxMinutes: positiveNumber(project?.budget?.maxMinutes, defaults.maxMinutes),
+    maxUsd: positiveNumber(project?.budget?.maxUsd, defaults.maxUsd),
+  };
 }
 
 export async function getRunUsage(ticket: string, runId: string): Promise<RunUsage> {
@@ -45,8 +74,7 @@ export async function budgetExceeded(
   runId: string
 ): Promise<string | null> {
   const project = await getProject(ticket.project).catch(() => undefined);
-  const maxMinutes = project?.budget?.maxMinutes ?? DEFAULT_MAX_MINUTES;
-  const maxUsd = project?.budget?.maxUsd ?? DEFAULT_MAX_USD;
+  const { maxMinutes, maxUsd } = effectiveBudget(project);
   const usage = await getRunUsage(ticket.id, runId);
 
   if (usage.minutes > maxMinutes) {
