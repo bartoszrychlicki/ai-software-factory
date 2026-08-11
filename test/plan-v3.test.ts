@@ -71,6 +71,13 @@ function critiqueOutput(overrides: Partial<FactoryJobOutput> = {}): FactoryJobOu
   return { kind: "critique", outcome: "success", critiqueVerdict: "ok", ...baseOutput, ...overrides };
 }
 
+const blockingFinding = {
+  severity: "P1" as const,
+  category: "data-loss" as const,
+  disposition: "block_before_build" as const,
+  summary: "Plan nie chroni przed utratą danych.",
+};
+
 const NEXT: NextAttempts = {
   plan: 1,
   triage: 2,
@@ -136,13 +143,18 @@ test("deep path: triage → research ×3 → synteza → krytyka → bramka z pe
     run = apply(store, run, {
       type: "job-finished",
       attempt: 1,
-      output: critiqueOutput({ critiqueVerdict: "issues", critiqueIssues: "1. brak testu regresji" }),
+      output: critiqueOutput({
+        critiqueVerdict: "issues",
+        critiqueIssues: "1. brak testu regresji",
+        critiqueFindings: [blockingFinding],
+      }),
       nextAttempts: { ...NEXT, synthesis: 2 },
+      planning: { maxUsd: 6, maxCritiqueRounds: 2 },
     });
     assert.deepEqual([run.stage, run.critiqueRound], ["synthesis", 1]);
     const revision = store.outstandingCommands().find((c) => c.payload.kind === "synthesis" && c.key.includes("rev1"));
     assert.ok(revision, "rewizja syntezy powinna być w outboxie");
-    assert.match(String(revision!.payload.feedback), /brak testu regresji/);
+    assert.match(String(revision!.payload.feedback), /block_before_build/);
 
     run = apply(store, run, { type: "job-finished", attempt: 2, output: synthesisOutput(), nextAttempts: { ...NEXT, critique: 2 } });
     assert.equal(run.stage, "critique");
@@ -151,16 +163,21 @@ test("deep path: triage → research ×3 → synteza → krytyka → bramka z pe
     run = apply(store, run, {
       type: "job-finished",
       attempt: 2,
-      output: critiqueOutput({ critiqueVerdict: "issues", critiqueIssues: "2. nadal ryzyko X" }),
+      output: critiqueOutput({
+        critiqueVerdict: "issues",
+        critiqueIssues: "2. nadal ryzyko X",
+        critiqueFindings: [blockingFinding],
+      }),
       nextAttempts: NEXT,
       usage: { usd: 4.21, minutes: 31.5 },
+      planning: { maxUsd: 6, maxCritiqueRounds: 2 },
     });
     assert.deepEqual([run.stage, run.status, run.critiqueVerdict], ["approval", "waiting_human", "issues"]);
     const gateComment = store.outstandingCommands().find((c) => c.kind === "linear-comment");
     const body = String(gateComment!.payload.body);
     assert.match(body, /Plan gotowy \(deep/);
-    assert.match(body, /Krytyka planu — uwagi/);
-    assert.match(body, /nadal ryzyko X/);
+    assert.match(body, /Krytyka planu — sklasyfikowane uwagi/);
+    assert.match(body, /block_before_build/);
     assert.match(body, /Degradacje/);
     assert.match(body, /\$4\.21/);
     assert.match(body, /Triage: typ: feature/);
@@ -169,6 +186,7 @@ test("deep path: triage → research ×3 → synteza → krytyka → bramka z pe
     run = apply(store, run, { type: "approve", commentId: "c-approve", nextAttempt: 1 });
     const buildCommand = store.outstandingCommands().find((c) => c.payload.kind === "build");
     assert.equal((buildCommand!.payload.briefs as Record<string, string>).recon, "brief-recon");
+    assert.match(String(buildCommand!.payload.critique), /block_before_build/);
 
     // review (po CI) dostaje uwagi krytyka
     const ciRun: LifecycleRun = {
@@ -182,11 +200,98 @@ test("deep path: triage → research ×3 → synteza → krytyka → bramka z pe
     const reviewDecision = reduceLifecycle(ciRun, {
       type: "ci-result", outcome: "pass", sha: ciRun.headSha!, report: "quality", nextReviewAttempt: 1,
     });
-    assert.match(String(reviewDecision.commands[0].payload.critique), /nadal ryzyko X/);
+    assert.match(String(reviewDecision.commands[0].payload.critique), /block_before_build/);
   } finally {
     store.close();
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test("P1 builder_checklist i human_decision idą od razu do człowieka bez kosztownej rewizji", () => {
+  const run: LifecycleRun = {
+    ticketId: "BAR-V1-POLICY",
+    project: "br-budget",
+    generation: 1,
+    stage: "critique",
+    status: "running",
+    manifest,
+    plan: "plan",
+    planFiles: ["src/a.ts"],
+    clarifyRound: 0,
+    critiqueRound: 0,
+    fixRound: 0,
+    planVariant: "deep",
+    createdAt: "x",
+    updatedAt: "x",
+  };
+  const checklist = reduceLifecycle(run, {
+    type: "job-finished",
+    attempt: 1,
+    output: critiqueOutput({
+      critiqueVerdict: "issues",
+      critiqueFindings: [{
+        severity: "P1",
+        category: "test-gap",
+        disposition: "builder_checklist",
+        summary: "Builder ma dodać regresję limitu kosztu.",
+      }],
+      critiqueIssues: "checklista",
+    }),
+    planning: { maxUsd: 6, maxCritiqueRounds: 2 },
+  });
+  assert.deepEqual([checklist.transition.stage, checklist.transition.status], ["approval", "waiting_human"]);
+  assert.equal(checklist.commands.some((command) => command.payload.kind === "synthesis"), false);
+  assert.match(String(checklist.commands[0].payload.body), /builder_checklist/);
+
+  const human = reduceLifecycle(run, {
+    type: "job-finished",
+    attempt: 1,
+    output: critiqueOutput({
+      critiqueVerdict: "issues",
+      critiqueFindings: [{
+        severity: "P1",
+        category: "product-decision",
+        disposition: "human_decision",
+        summary: "Autor musi wybrać próg kosztu.",
+      }],
+      critiqueIssues: "decyzja",
+    }),
+    planning: { maxUsd: 6, maxCritiqueRounds: 2 },
+  });
+  assert.deepEqual([human.transition.stage, human.transition.status], ["approval", "waiting_human"]);
+  assert.match(String(human.commands[0].payload.body), /Autor musi wybrać próg kosztu/);
+});
+
+test("konfigurowalny limit critique numeruje kolejne rewizje bez zapętlenia", () => {
+  const run: LifecycleRun = {
+    ticketId: "BAR-V1-ROUNDS",
+    project: "br-budget",
+    generation: 1,
+    stage: "critique",
+    status: "running",
+    manifest,
+    plan: "plan po pierwszej rewizji",
+    planFiles: ["src/a.ts"],
+    clarifyRound: 0,
+    critiqueRound: 1,
+    fixRound: 0,
+    planVariant: "deep",
+    createdAt: "x",
+    updatedAt: "x",
+  };
+  const decision = reduceLifecycle(run, {
+    type: "job-finished",
+    attempt: 2,
+    output: critiqueOutput({
+      critiqueVerdict: "issues",
+      critiqueFindings: [blockingFinding],
+    }),
+    planning: { maxUsd: 6, maxCritiqueRounds: 3 },
+  });
+
+  assert.equal(decision.transition.patch?.critiqueRound, 2);
+  assert.match(decision.commands[0].key, /rev2/);
+  assert.equal(decision.commands[0].payload.attempt, 3);
 });
 
 test("krytyka ok → bramka bez rewizji; krytyka niedostępna → bramka z ⚠️ degradacją", () => {
@@ -511,6 +616,83 @@ test("rezerwacja budżetu: job w toku blokuje start kolejnego przy limicie (fan-
   }
 });
 
+test("limit kosztu planowania rezerwuje następny job i kieruje istniejący plan do bramki człowieka", async () => {
+  const root = await mkdtemp(join(tmpdir(), "factory-v3-plan-budget-"));
+  const previousRoot = process.env.FACTORY_ROOT;
+  const store = new LifecycleStore(join(root, "registry.db"));
+  try {
+    await writeFile(join(root, "package.json"), "{}");
+    await writeFile(join(root, "projects.yaml"), [
+      "harness:",
+      `  repo: ${JSON.stringify(root)}`,
+      "  checks:",
+      "    - \"true\"",
+      "  budget:",
+      "    maxUsd: 12",
+      "    maxMinutes: 90",
+      "  planning:",
+      "    maxUsd: 2",
+      "    maxCritiqueRounds: 2",
+    ].join("\n"));
+    process.env.FACTORY_ROOT = root;
+    const deps: PollerDependencies = {
+      store,
+      mastra: {
+        async getRun() { throw new Error("limit planowania powinien zablokować dispatch przed Mastrą"); },
+      } as unknown as PollerDependencies["mastra"],
+      sources: new Map([["harness", {
+        async setStateByName() {},
+        async listComments() { return []; },
+        async comment() {},
+      } as never]]),
+      notifier: async () => {},
+    };
+    store.createRun("BAR-PLAN-BUDGET", "harness", manifest);
+    store.transition("BAR-PLAN-BUDGET", {
+      stage: "synthesis",
+      status: "running",
+      actor: "test",
+      reason: "revision",
+      patch: {
+        plan: "ostatni użyteczny plan",
+        planFiles: ["src/a.ts"],
+        planVariant: "deep",
+        critiqueRound: 1,
+        critiqueVerdict: "issues",
+        critiqueReport: "- P1 · data-loss · block_before_build: ryzyko",
+      },
+    });
+    store.startAttempt("BAR-PLAN-BUDGET", "critique", 1, "job-finished");
+    store.finishAttempt("BAR-PLAN-BUDGET", "critique", 1, {
+      status: "success",
+      outcome: "issues",
+      costUsd: 1.5,
+      durationMs: 60_000,
+    });
+    store.enqueue({
+      key: "BAR-PLAN-BUDGET:g1:job:synthesis:synthesis:a2:rev1",
+      ticketId: "BAR-PLAN-BUDGET",
+      kind: "run-job",
+      stage: "synthesis",
+      payload: { kind: "synthesis", attempt: 2 },
+    });
+
+    await dispatchOutbox(deps);
+
+    const current = store.getRun("BAR-PLAN-BUDGET");
+    assert.deepEqual([current?.stage, current?.status], ["approval", "waiting_human"]);
+    assert.equal(store.latestAttempt("BAR-PLAN-BUDGET", "synthesis")?.errorCode, "PLANNING_BUDGET_EXHAUSTED");
+    const gate = store.outstandingCommands().find((command) => command.kind === "linear-comment");
+    assert.match(String(gate?.payload.body), /limit planowania \$2\.00/);
+    assert.match(String(gate?.payload.body), /ostatni użyteczny plan/);
+  } finally {
+    store.close();
+    if (previousRoot === undefined) delete process.env.FACTORY_ROOT;
+    else process.env.FACTORY_ROOT = previousRoot;
+    await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  }
+});
+
 test("komendy /score: ścisła walidacja i parsowanie payloadu", () => {
   assert.deepEqual(parseCommand("/score 4 solidny plan"), { kind: "score", payload: "4 solidny plan" });
   assert.deepEqual(parseCommand("/score 5"), { kind: "score", payload: "5" });
@@ -549,12 +731,12 @@ test("incydent BAR-180: etykieta przed JSON-em w bloku factory nie gubi werdyktu
   // Dokładna reprodukcja outputu sol@xhigh (krytyka).
   const codex = [
     "```factory",
-    'Plan wymaga poprawy: {"verdict":"issues","issues":"1. [KRYTYCZNY] Brakuje src/lib/stats.ts"}',
+    'Plan wymaga poprawy: {"verdict":"issues","findings":[{"severity":"P1","category":"test-gap","disposition":"builder_checklist","summary":"[KRYTYCZNY] Brakuje src/lib/stats.ts"}]}',
     "```",
   ].join("\n");
   const critique = parseCritiqueVerdict(codex);
   assert.deepEqual([critique.verdict, critique.source], ["issues", "structured"]);
-  assert.match(critique.issues ?? "", /KRYTYCZNY/);
+  assert.match(critique.findings?.[0]?.summary ?? "", /KRYTYCZNY/);
 
   // Fail-closed zostaje: brak poprawnego obiektu w bloku = missing,
   // JSON poza blokiem factory dalej się nie liczy.
@@ -580,16 +762,16 @@ test("incydent BAR-180: etykieta przed JSON-em w bloku factory nie gubi werdyktu
   // Przy zagnieżdżeniu wygrywa obiekt zewnętrzny (domyka się później).
   const nested = [
     "```factory",
-    '{"verdict":"issues","issues":"zewnętrzny"} tekst {"meta":{"verdict":"ok"}}',
+    '{"verdict":"issues","findings":[{"severity":"P2","category":"other","disposition":"builder_checklist","summary":"zewnętrzny"}]} tekst {"meta":{"verdict":"ok"}}',
     "```",
   ].join("\n");
   assert.equal(parseCritiqueVerdict(nested).verdict, "unavailable"); // ostatni obiekt nie pasuje do kontraktu — fail-closed
   const nestedValid = [
     "```factory",
-    'nota {"verdict":"issues","issues":"całość"}',
+    'nota {"verdict":"issues","findings":[{"severity":"P2","category":"other","disposition":"builder_checklist","summary":"całość"}]}',
     "```",
   ].join("\n");
-  assert.equal(parseCritiqueVerdict(nestedValid).issues, "całość");
+  assert.equal(parseCritiqueVerdict(nestedValid).findings?.[0]?.summary, "całość");
 });
 
 test("kontrakty triage i krytyki parsują się fail-closed", () => {
@@ -607,8 +789,8 @@ test("kontrakty triage i krytyki parsują się fail-closed", () => {
   assert.equal(questions.questions, "1. A czy B?");
   assert.equal(parseTriageVerdict("bez bloku").source, "missing");
 
-  const issues = parseCritiqueVerdict('```factory\n{"verdict":"issues","issues":"1. brak testów"}\n```');
-  assert.deepEqual([issues.verdict, issues.issues], ["issues", "1. brak testów"]);
+  const issues = parseCritiqueVerdict('```factory\n{"verdict":"issues","findings":[{"severity":"P1","category":"test-gap","disposition":"builder_checklist","summary":"brak testów"}]}\n```');
+  assert.deepEqual([issues.verdict, issues.findings?.[0]?.summary], ["issues", "brak testów"]);
   assert.equal(parseCritiqueVerdict("bez bloku").verdict, "unavailable");
   assert.equal(parseCritiqueVerdict('```factory\n{"verdict":"ok"}\n```').verdict, "ok");
 });
@@ -720,7 +902,10 @@ test("factoryJob: triage, research, synteza i krytyka działają jako bezstanowe
     const critiqueEngine: EngineAdapter = {
       name: "fake",
       async run() {
-        return { ok: true, report: '```factory\n{"verdict":"issues","issues":"1. brak testów"}\n```' };
+        return {
+          ok: true,
+          report: '```factory\n{"verdict":"issues","findings":[{"severity":"P1","category":"test-gap","disposition":"builder_checklist","summary":"brak testów"}]}\n```',
+        };
       },
     };
     const critique = await executeFactoryJobInput(
@@ -729,7 +914,34 @@ test("factoryJob: triage, research, synteza i krytyka działają jako bezstanowe
       undefined,
       fakeRuntime(critiqueEngine, repo)
     );
-    assert.deepEqual([critique.critiqueVerdict, critique.critiqueIssues], ["issues", "1. brak testów"]);
+    assert.deepEqual([critique.critiqueVerdict, critique.critiqueFindings?.[0]?.category], ["issues", "test-gap"]);
+    assert.match(critique.critiqueIssues ?? "", /builder_checklist/);
+
+    let buildContext = "";
+    const buildEngine: EngineAdapter = {
+      name: "fake",
+      async run(input) {
+        buildContext = input.context;
+        await writeFile(join(input.workspace, "fixture.txt"), "zmienione przez buildera\n");
+        return { ok: true, report: "wdrożono checklistę" };
+      },
+    };
+    const build = await executeFactoryJobInput(
+      {
+        kind: "build",
+        attempt: 1,
+        ticket,
+        plan: "plan",
+        planFiles: ["fixture.txt"],
+        critique: critique.critiqueIssues,
+      },
+      "job-b1",
+      undefined,
+      fakeRuntime(buildEngine, repo),
+    );
+    assert.equal(build.outcome, "success");
+    assert.match(buildContext, /Obowiązkowa checklista z krytyki planu/);
+    assert.match(buildContext, /brak testów/);
 
     // routing krytyki pada (np. brak dywersyfikacji) → advisory unavailable, nie throw
     const failingRoute: FactoryJobRuntime = {

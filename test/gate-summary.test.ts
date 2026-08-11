@@ -330,7 +330,7 @@ test("synteza wymaga pięciu bloków, zapisuje summary-present, a krytyka ekstra
             "nie rozwiązując problemu autora.",
             "",
             "```factory",
-            '{"verdict":"issues","issues":"1. Brak definicji gotowości."}',
+            '{"verdict":"issues","findings":[{"severity":"P1","category":"test-gap","disposition":"builder_checklist","summary":"Brak definicji gotowości."}]}',
             "```",
           ].join("\n"),
         };
@@ -394,13 +394,13 @@ test("sekcje po ludzku nie zmieniają ścisłych kontraktów planu i krytyki", (
     "Plan może przejść testy, nie rozwiązując problemu.",
     "",
     "```factory",
-    '{"verdict":"issues","issues":"1. Brak definicji gotowości."}',
+    '{"verdict":"issues","findings":[{"severity":"P1","category":"test-gap","disposition":"builder_checklist","summary":"Brak definicji gotowości."}]}',
     "```",
   ].join("\n");
   const critique = parseCritiqueVerdict(critiqueReport);
   assert.deepEqual(
-    [critique.source, critique.verdict, critique.issues],
-    ["structured", "issues", "1. Brak definicji gotowości."]
+    [critique.source, critique.verdict, critique.findings?.[0]?.summary],
+    ["structured", "issues", "Brak definicji gotowości."]
   );
   assert.equal(
     parseCritiqueVerdict("## Co to znaczy dla autora\n\nPlan ma ryzyko.").source,

@@ -60,6 +60,11 @@ export function runStageOf(stage: AttemptStage): LifecycleStage {
   return stage.startsWith("research-") ? "research" : (stage as LifecycleStage);
 }
 
+export function isPlanningAttemptStage(stage: string): boolean {
+  return stage === "plan" || stage === "triage" || stage === "synthesis" ||
+    stage === "critique" || stage.startsWith("research-");
+}
+
 export interface TicketManifestV2 {
   title: string;
   description: string;
@@ -889,6 +894,17 @@ export class LifecycleStore {
       FROM lifecycle_stage_attempts WHERE ticket_id=?
     `).get(ticketId) as { usd: number; duration_ms: number };
     return { usd: Number(row.usd), minutes: Number(row.duration_ms) / 60_000 };
+  }
+
+  planningUsage(ticketId: string): { usd: number; minutes: number } {
+    const attempts = this.listAttempts(ticketId).filter((attempt) => isPlanningAttemptStage(attempt.stage));
+    return attempts.reduce(
+      (usage, attempt) => ({
+        usd: usage.usd + (attempt.costUsd ?? 0),
+        minutes: usage.minutes + (attempt.durationMs ?? 0) / 60_000,
+      }),
+      { usd: 0, minutes: 0 }
+    );
   }
 
   /** Wszystkie próby ticketu (chronologicznie) — wejście wiersza eksperymentu. */

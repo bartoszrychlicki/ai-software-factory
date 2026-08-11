@@ -4,7 +4,7 @@ import { MCP_SIGNATURE, type ActionSignature } from "../lifecycle/signature";
 import { LINEAR_STATE_MAP } from "../lifecycle/state-map";
 import type { LifecycleRun, LifecycleStore, StageAttempt } from "../lifecycle/store";
 import type { BreakerSnapshot } from "../observability/breaker";
-import { effectiveBudget } from "../observability/budget";
+import { effectiveBudget, effectivePlanningBudget } from "../observability/budget";
 import { attemptRow, planView, runSummary } from "./projection";
 
 const LEASE_STALE_MS = 90_000;
@@ -159,6 +159,7 @@ export function createFactoryTools(deps: FactoryToolDependencies) {
             github: project.github,
             planPipeline: project.planPipeline ?? "v2",
             budget: effectiveBudget(project),
+            planning: effectivePlanningBudget(project),
             maxConcurrentTickets: project.max_concurrent_tickets,
             statuses: project.statuses ?? "standard",
             progress: project.progress ?? "milestones",

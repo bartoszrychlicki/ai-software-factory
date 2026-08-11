@@ -202,8 +202,11 @@ The poller can restart at any stage because attempts and an idempotent outbox
 are durable.
 
 Projects using `planPipeline: v3` extend planning with triage, three parallel
-research roles, synthesis and one critique/revision round. The human still
-approves the single resulting plan before any build begins.
+research roles, synthesis and structured critique. `planning.maxUsd` reserves
+budget for implementation before another planning job starts, while
+`planning.maxCritiqueRounds` caps the critique/synthesis loop. Findings are
+classified as a safety blocker, mandatory builder checklist or human decision.
+The human still approves the single resulting plan before any build begins.
 
 Operator commands are explicit: `/approve`, `/reject`, `/answer`, `/retry`,
 `/fix`, `/replan`, `/done` and `/score`. Moving a card alone is not interpreted
