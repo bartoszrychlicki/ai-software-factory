@@ -256,14 +256,15 @@ function blocked(
   stage: LifecycleStage,
   code: string,
   message: string,
-  signature?: string
+  signature?: string,
+  transitionReason?: string
 ): CoordinatorDecision {
   return {
     transition: {
       stage,
       status: "blocked",
       actor: "coordinator",
-      reason: code,
+      reason: transitionReason ?? code,
       patch: { blockedStage: stage, errorCode: code, errorMessage: message },
     },
     commands: [
@@ -276,6 +277,11 @@ function blocked(
       ),
     ],
   };
+}
+
+function humanNote(value: string): string {
+  const text = value.replace(/[|`]/g, "").replace(/\s+/g, " ").trim();
+  return text.length <= 200 ? text : `${text.slice(0, 199)}…`;
 }
 
 /**
@@ -580,7 +586,15 @@ function reduceLifecycleCore(run: LifecycleRun, event: CoordinatorEvent): Coordi
 
   if (event.type === "reject") {
     assertStage(run, "approval", event.type);
-    return blocked(run, "approval", "PLAN_REJECTED", event.reason || "Plan odrzucony bez powodu.");
+    const reason = event.reason || "Plan odrzucony bez powodu.";
+    return blocked(
+      run,
+      "approval",
+      "PLAN_REJECTED",
+      reason,
+      undefined,
+      `PLAN_REJECTED /reject ${event.commentId}: ${humanNote(reason)}`
+    );
   }
 
   if (event.type === "replan") {
