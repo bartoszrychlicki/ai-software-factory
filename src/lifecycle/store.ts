@@ -218,7 +218,8 @@ const parseJson = <T>(value: unknown, fallback: T): T => {
 };
 
 export function lifecycleDbPath(): string {
-  return process.env.FACTORY_LIFECYCLE_DB ?? join(runsRoot(), "lifecycle.db");
+  const configured = process.env.FACTORY_LIFECYCLE_DB?.trim();
+  return configured ? configured : join(runsRoot(), "lifecycle.db");
 }
 
 /**
@@ -830,6 +831,29 @@ export class LifecycleStore {
       SELECT * FROM lifecycle_transitions
       WHERE ticket_id=? ORDER BY id
     `).all(ticketId) as Record<string, unknown>[]).map((row) => this.hydrateTransition(row));
+  }
+
+  /** Początek lead time musi przeżyć reopen, który zeruje created_at runa. */
+  firstTransitionAt(ticketId: string): string | undefined {
+    const first = this.db.prepare(`
+      SELECT created_at FROM lifecycle_transitions
+      WHERE ticket_id=? ORDER BY id ASC LIMIT 1
+    `).get(ticketId) as { created_at: string } | undefined;
+    return first?.created_at;
+  }
+
+  /**
+   * Reopen przez createRun podbija generację bez porzucenia poprzedniej, więc
+   * generation - 1 byłoby błędne. Nowy powód inkrementujący generację wymaga
+   * dopisania go do tego zapytania.
+   */
+  countRetiredGenerations(ticketId: string): number {
+    const row = this.db.prepare(`
+      SELECT COUNT(*) AS value FROM lifecycle_transitions
+      WHERE ticket_id=?
+        AND (reason='input-changed-before-build' OR reason LIKE '/replan %')
+    `).get(ticketId) as { value: number };
+    return Number(row.value);
   }
 
   /**

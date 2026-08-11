@@ -54,7 +54,12 @@ function leadTimeMinutes(store: LifecycleStore, run: LifecycleRun): number {
   const finishedAt = run.status === "done"
     ? (store.terminalTransitionAt(run.ticketId) ?? run.updatedAt)
     : run.updatedAt;
-  const elapsed = Date.parse(finishedAt) - Date.parse(run.createdAt);
+  const runStartedAt = Date.parse(run.createdAt);
+  const persistedStartedAt = Date.parse(store.firstTransitionAt(run.ticketId) ?? "");
+  const startedAt = Number.isFinite(persistedStartedAt) && persistedStartedAt < runStartedAt
+    ? persistedStartedAt
+    : runStartedAt;
+  const elapsed = Date.parse(finishedAt) - startedAt;
   return Number.isFinite(elapsed) ? Math.max(0, elapsed) / 60_000 : 0;
 }
 
@@ -160,6 +165,7 @@ export function buildRunLog(store: LifecycleStore, run: LifecycleRun): string {
   const transitions = store.listTransitions(run.ticketId);
   const attempts = store.listAttempts(run.ticketId);
   const usage = store.totalUsage(run.ticketId);
+  const retiredGenerations = store.countRetiredGenerations(run.ticketId);
   const humanTransitions = transitions.filter(isHumanTransition);
   const stages = [...aggregateStages(attempts).entries()]
     .sort(([leftStage, left], [rightStage, right]) =>
@@ -189,7 +195,7 @@ export function buildRunLog(store: LifecycleStore, run: LifecycleRun): string {
     `| koszt łączny | ${usd(usage.usd)} |`,
     `| czas prób łącznie | ${minutes(usage.minutes)} |`,
     `| liczba generacji | ${run.generation} |`,
-    ...(run.generation > 1 ? [`| porzucone generacje | ${run.generation - 1} |`] : []),
+    ...(retiredGenerations > 0 ? [`| porzucone generacje | ${retiredGenerations} |`] : []),
     `| liczba przejść | ${transitions.length} |`,
     `| przejścia wywołane przez człowieka | ${humanTransitions.length} |`,
     `| lead time${run.status === "done" ? "" : " (w toku)"} | ${minutes(leadTimeMinutes(store, run))} |`,

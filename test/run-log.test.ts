@@ -17,6 +17,7 @@ import { saveArtifact } from "../src/execution/artifacts";
 import { runsRoot } from "../src/config/paths";
 import { reduceLifecycle } from "../src/lifecycle/coordinator";
 import {
+  lifecycleDbPath,
   LifecycleStore,
   type LifecycleRun,
   type TicketManifestV2,
@@ -415,6 +416,20 @@ test("pusty FACTORY_RUNS_ROOT używa katalogu runs obok package.json", async () 
   });
 });
 
+test("lifecycleDbPath trimuje FACTORY_LIFECYCLE_DB", async () => {
+  await withHarness("factory-run-log-db-path-", async ({ root, runsRoot: configuredRunsRoot }) => {
+    process.env.FACTORY_LIFECYCLE_DB = "";
+    assert.equal(lifecycleDbPath(), join(configuredRunsRoot, "lifecycle.db"));
+
+    process.env.FACTORY_LIFECYCLE_DB = "  \t  ";
+    assert.equal(lifecycleDbPath(), join(configuredRunsRoot, "lifecycle.db"));
+
+    const override = join(root, "custom-lifecycle.db");
+    process.env.FACTORY_LIFECYCLE_DB = `  ${override}  `;
+    assert.equal(lifecycleDbPath(), override);
+  });
+});
+
 test("harness sprząta env i katalog, gdy LifecycleStore nie może wystartować", async () => {
   const originalRoot = process.env.FACTORY_ROOT;
   const originalRunsRoot = process.env.FACTORY_RUNS_ROOT;
@@ -541,6 +556,90 @@ test("ponowny claim zamkniętego ticketu od razu odświeża przebieg", async () 
     assert.match(reopened, /\| liczba generacji \| 2 \|/);
     assert.doesNotMatch(reopened, /- Status: done/);
     assert.deepEqual(claims, [ticketId]);
+  });
+});
+
+test("reopen zachowuje pełny lead time i nie porzuca zakończonej generacji", async () => {
+  await withHarness("factory-run-log-reopen-lead-time-", async (harness) => {
+    const ticketId = "BAR-LOG-REOPEN-LEAD-TIME";
+    harness.store.createRun(ticketId, "harness", manifest);
+    applyDecision(
+      harness.deps,
+      ticketId,
+      reduceLifecycle(harness.store.getRun(ticketId)!, { type: "start", nextAttempt: 1 })
+    );
+    applyTransition(harness.deps, ticketId, {
+      stage: "smoke",
+      status: "done",
+      actor: "coordinator",
+      reason: "first-generation-done",
+    });
+
+    const clock = Date.now();
+    const firstTransitionAt = new Date(clock - 120 * 60_000).toISOString();
+    const firstTerminalAt = new Date(clock - 90 * 60_000).toISOString();
+    const firstActiveEndAt = new Date(clock - 30 * 60_000).toISOString();
+    const db = new DatabaseSync(harness.dbPath);
+    try {
+      db.prepare(`
+        UPDATE lifecycle_transitions SET created_at=?
+        WHERE id=(
+          SELECT id FROM lifecycle_transitions
+          WHERE ticket_id=? ORDER BY id ASC LIMIT 1
+        )
+      `).run(firstTransitionAt, ticketId);
+      db.prepare(`
+        UPDATE lifecycle_transitions SET created_at=?
+        WHERE id=(
+          SELECT id FROM lifecycle_transitions
+          WHERE ticket_id=? AND to_status='done' ORDER BY id DESC LIMIT 1
+        )
+      `).run(firstTerminalAt, ticketId);
+      db.prepare(
+        "UPDATE lifecycle_runs SET created_at=?, updated_at=? WHERE ticket_id=?"
+      ).run(firstTransitionAt, firstTerminalAt, ticketId);
+    } finally {
+      db.close();
+    }
+
+    harness.store.createRun(ticketId, "harness", manifest);
+    applyDecision(
+      harness.deps,
+      ticketId,
+      reduceLifecycle(harness.store.getRun(ticketId)!, { type: "start", nextAttempt: 2 })
+    );
+
+    const reopenedDb = new DatabaseSync(harness.dbPath);
+    try {
+      reopenedDb.prepare(
+        "UPDATE lifecycle_runs SET updated_at=? WHERE ticket_id=?"
+      ).run(firstActiveEndAt, ticketId);
+    } finally {
+      reopenedDb.close();
+    }
+
+    const path = join(harness.runsRoot, ticketId, "przebieg.md");
+    writeRunLog(harness.store, harness.store.getRun(ticketId)!);
+    const reopened = await readFile(path, "utf8");
+    const reopenedLead = Number(
+      reopened.match(/\| lead time \(w toku\) \| ([\d.]+) min \|/)?.[1]
+    );
+    assert.match(reopened, /\| liczba generacji \| 2 \|/);
+    assert.doesNotMatch(reopened, /porzucone generacje/);
+    assert.ok(reopenedLead >= 90, `${reopenedLead} powinno obejmować pierwszą generację`);
+
+    applyTransition(harness.deps, ticketId, {
+      stage: "approval",
+      status: "waiting_human",
+      actor: "coordinator",
+      reason: "second-generation-plan-ready",
+    });
+    writeRunLog(harness.store, harness.store.getRun(ticketId)!);
+    const advanced = await readFile(path, "utf8");
+    const advancedLead = Number(
+      advanced.match(/\| lead time \(w toku\) \| ([\d.]+) min \|/)?.[1]
+    );
+    assert.ok(advancedLead > reopenedLead, `${advancedLead} powinno być większe od ${reopenedLead}`);
   });
 });
 
