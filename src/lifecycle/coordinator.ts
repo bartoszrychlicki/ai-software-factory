@@ -23,6 +23,11 @@ import {
 } from "./human-summary";
 import { authorizeScopePaths, scopeBlockedPaths } from "../execution/scope";
 import { formatCritiqueFindings } from "./verdicts";
+import {
+  INPUT_CHANGED_BEFORE_BUILD_REASON,
+  PLAN_REJECTED_HUMAN_REASON_PREFIX,
+  REPLAN_REASON_PREFIX,
+} from "./transition-reasons";
 
 type NewCommand = Omit<
   LifecycleCommand,
@@ -283,14 +288,15 @@ function blocked(
   stage: LifecycleStage,
   code: string,
   message: string,
-  signature?: string
+  signature?: string,
+  transitionReason?: string
 ): CoordinatorDecision {
   return {
     transition: {
       stage,
       status: "blocked",
       actor: "coordinator",
-      reason: code,
+      reason: transitionReason ?? code,
       patch: { blockedStage: stage, errorCode: code, errorMessage: message },
     },
     commands: [
@@ -303,6 +309,11 @@ function blocked(
       ),
     ],
   };
+}
+
+function humanNote(value: string): string {
+  const text = value.replace(/[|`]/g, "").replace(/\s+/g, " ").trim();
+  return text.length <= 200 ? text : `${text.slice(0, 199)}…`;
 }
 
 /**
@@ -466,7 +477,7 @@ function reduceLifecycleCore(run: LifecycleRun, event: CoordinatorEvent): Coordi
           stage: entry,
           status: "pending",
           actor: "linear",
-          reason: "input-changed-before-build",
+          reason: INPUT_CHANGED_BEFORE_BUILD_REASON,
           incrementGeneration: true,
           cancelOutstandingRunJobs: true,
           patch: { manifest, ...PLAN_RESET_PATCH },
@@ -607,7 +618,15 @@ function reduceLifecycleCore(run: LifecycleRun, event: CoordinatorEvent): Coordi
 
   if (event.type === "reject") {
     assertStage(run, "approval", event.type);
-    return blocked(run, "approval", "PLAN_REJECTED", event.reason || "Plan odrzucony bez powodu.");
+    const reason = event.reason || "Plan odrzucony bez powodu.";
+    return blocked(
+      run,
+      "approval",
+      "PLAN_REJECTED",
+      reason,
+      undefined,
+      `${PLAN_REJECTED_HUMAN_REASON_PREFIX}${event.commentId}: ${humanNote(reason)}`
+    );
   }
 
   if (event.type === "replan") {
@@ -627,7 +646,7 @@ function reduceLifecycleCore(run: LifecycleRun, event: CoordinatorEvent): Coordi
         stage: entry,
         status: "running",
         actor: "human",
-        reason: `/replan ${event.commentId}`,
+        reason: `${REPLAN_REASON_PREFIX}${event.commentId}`,
         incrementGeneration: true,
         cancelOutstandingRunJobs: true,
         patch: {

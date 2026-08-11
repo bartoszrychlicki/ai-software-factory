@@ -118,6 +118,9 @@ transition path on existing hosts; a fresh clone never creates it.
 CI runs the same baseline from repository root: clean install, doctor, tests,
 type-check and build.
 
+The durable lifecycle and per-ticket diagnostic log are described in
+[`docs/architecture/ticket-flow.md`](docs/architecture/ticket-flow.md).
+
 ## MCP server
 
 The local MCP server lets a trusted desktop or coding assistant inspect the

@@ -1,7 +1,11 @@
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { findUpFile } from "../config/projects";
+import { runsRoot } from "../config/paths";
+import {
+  INPUT_CHANGED_BEFORE_BUILD_REASON,
+  REPLAN_REASON_PREFIX,
+} from "./transition-reasons";
 
 export type LifecycleStage =
   | "plan"
@@ -160,6 +164,8 @@ export interface StageAttempt {
   stage: AttemptStage;
   attempt: number;
   jobRunId?: string;
+  /** Generacja runu, jeśli była znana w chwili zapisu próby. */
+  generation?: number;
   inputHash?: string;
   sha?: string;
   status: "pending" | "running" | "success" | "failed" | "canceled";
@@ -178,6 +184,19 @@ export interface StageAttempt {
   budgetUsedUsd?: number;
   startedAt: string;
   finishedAt?: string;
+}
+
+export interface LifecycleTransition {
+  id: number;
+  ticketId: string;
+  generation: number;
+  fromStage?: LifecycleStage;
+  fromStatus?: LifecycleStatus;
+  toStage: LifecycleStage;
+  toStatus: LifecycleStatus;
+  actor: string;
+  reason: string;
+  createdAt: string;
 }
 
 export interface TransitionInput {
@@ -221,6 +240,7 @@ const READ_ONLY_REQUIRED_COLUMNS = {
     "score", "score_comment", "scored_at", "created_at", "updated_at",
   ],
   lifecycle_stage_attempts: [
+    // `generation` jest addytywna: starsza baza MCP ma pozostać czytelna bez migracji.
     "ticket_id", "stage", "attempt", "job_run_id", "input_hash", "sha", "status",
     "outcome", "report", "signature", "error_code", "error_message", "cost_usd",
     "cost_source", "duration_ms", "budget_max_minutes", "budget_max_usd",
@@ -230,8 +250,8 @@ const READ_ONLY_REQUIRED_COLUMNS = {
 } as const;
 
 export function lifecycleDbPath(): string {
-  return process.env.FACTORY_LIFECYCLE_DB ??
-    join(dirname(findUpFile("package.json")), "runs", "lifecycle.db");
+  const configured = process.env.FACTORY_LIFECYCLE_DB?.trim();
+  return configured ? configured : join(runsRoot(), "lifecycle.db");
 }
 
 /**
@@ -333,6 +353,7 @@ export class LifecycleStore {
         stage TEXT NOT NULL,
         attempt INTEGER NOT NULL,
         job_run_id TEXT UNIQUE,
+        generation INTEGER,
         input_hash TEXT,
         sha TEXT,
         status TEXT NOT NULL,
@@ -372,6 +393,7 @@ export class LifecycleStore {
       name: string;
     }[];
     const attemptMigrations: Record<string, string> = {
+      generation: "INTEGER",
       signature: "TEXT",
       input_hash: "TEXT",
       sha: "TEXT",
@@ -710,6 +732,7 @@ export class LifecycleStore {
     jobRunId: string,
     details: Pick<
       StageAttempt,
+      | "generation"
       | "inputHash"
       | "sha"
       | "budgetMaxMinutes"
@@ -722,12 +745,13 @@ export class LifecycleStore {
     const startedAt = now();
     this.db.prepare(`
       INSERT INTO lifecycle_stage_attempts (
-        ticket_id, stage, attempt, job_run_id, input_hash, sha, status,
+        ticket_id, stage, attempt, job_run_id, generation, input_hash, sha, status,
         budget_max_minutes, budget_max_usd, budget_used_minutes, budget_used_usd,
         started_at
-      ) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?)
       ON CONFLICT(ticket_id, stage, attempt) DO UPDATE SET
         job_run_id=excluded.job_run_id,
+        generation=COALESCE(excluded.generation, generation),
         input_hash=excluded.input_hash,
         sha=excluded.sha,
         status='running',
@@ -742,6 +766,7 @@ export class LifecycleStore {
       stage,
       attempt,
       jobRunId,
+      details.generation ?? null,
       details.inputHash ?? null,
       details.sha ?? null,
       details.budgetMaxMinutes ?? null,
@@ -915,6 +940,47 @@ export class LifecycleStore {
     `).all(ticketId) as Record<string, unknown>[]).map((row) => this.hydrateAttempt(row));
   }
 
+  /** Pełna oś czasu ticketu; id rozstrzyga przejścia zapisane w tej samej milisekundzie. */
+  listTransitions(ticketId: string): LifecycleTransition[] {
+    return (this.db.prepare(`
+      SELECT * FROM lifecycle_transitions
+      WHERE ticket_id=? ORDER BY id
+    `).all(ticketId) as Record<string, unknown>[]).map((row) => this.hydrateTransition(row));
+  }
+
+  /** Początek lead time musi przeżyć reopen, który zeruje created_at runa. */
+  firstTransitionAt(ticketId: string): string | undefined {
+    const first = this.db.prepare(`
+      SELECT created_at FROM lifecycle_transitions
+      WHERE ticket_id=? ORDER BY id ASC LIMIT 1
+    `).get(ticketId) as { created_at: string } | undefined;
+    return first?.created_at;
+  }
+
+  /** Reopen podbija generację bez porzucenia poprzedniej, więc liczymy jawne retirementy. */
+  countRetiredGenerations(ticketId: string): number {
+    const row = this.db.prepare(`
+      SELECT COUNT(*) AS value FROM lifecycle_transitions
+      WHERE ticket_id=?
+        AND (reason=? OR reason LIKE ?)
+    `).get(
+      ticketId,
+      INPUT_CHANGED_BEFORE_BUILD_REASON,
+      `${REPLAN_REASON_PREFIX}%`
+    ) as { value: number };
+    return Number(row.value);
+  }
+
+  /** Koniec lead time: ostatnie przejście domykające run statusem done. */
+  terminalTransitionAt(ticketId: string): string | undefined {
+    const terminal = this.db.prepare(`
+      SELECT created_at FROM lifecycle_transitions
+      WHERE ticket_id=? AND to_status='done'
+      ORDER BY id DESC LIMIT 1
+    `).get(ticketId) as { created_at: string } | undefined;
+    return terminal?.created_at;
+  }
+
   /**
    * Próby w toku (status running) — rezerwacja budżetu przed dispatchem
    * kolejnego joba: totalUsage widzi tylko koszty ZAKOŃCZONYCH prób, więc
@@ -985,8 +1051,7 @@ export class LifecycleStore {
     files: string[];
     outcome?: string;
   } | undefined {
-    const root = process.env.FACTORY_RUNS_ROOT ??
-      join(dirname(findUpFile("package.json")), "runs");
+    const root = runsRoot();
     try {
       const raw = JSON.parse(readFileSync(join(root, ticketId, "state.json"), "utf8")) as {
         runId?: string;
@@ -1166,6 +1231,7 @@ export class LifecycleStore {
       stage: String(row.stage) as AttemptStage,
       attempt: Number(row.attempt),
       jobRunId: row.job_run_id == null ? undefined : String(row.job_run_id),
+      generation: row.generation == null ? undefined : Number(row.generation),
       inputHash: row.input_hash == null ? undefined : String(row.input_hash),
       sha: row.sha == null ? undefined : String(row.sha),
       status: String(row.status) as StageAttempt["status"],
@@ -1183,6 +1249,21 @@ export class LifecycleStore {
       budgetUsedUsd: row.budget_used_usd == null ? undefined : Number(row.budget_used_usd),
       startedAt: String(row.started_at),
       finishedAt: row.finished_at == null ? undefined : String(row.finished_at),
+    };
+  }
+
+  private hydrateTransition(row: Record<string, unknown>): LifecycleTransition {
+    return {
+      id: Number(row.id),
+      ticketId: String(row.ticket_id),
+      generation: Number(row.generation),
+      fromStage: row.from_stage == null ? undefined : String(row.from_stage) as LifecycleStage,
+      fromStatus: row.from_status == null ? undefined : String(row.from_status) as LifecycleStatus,
+      toStage: String(row.to_stage) as LifecycleStage,
+      toStatus: String(row.to_status) as LifecycleStatus,
+      actor: String(row.actor),
+      reason: String(row.reason),
+      createdAt: String(row.created_at),
     };
   }
 }
